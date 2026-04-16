@@ -1023,7 +1023,16 @@ class AppState:
 # ==========================================
 # Flask App
 # ==========================================
-app = Flask(__name__)
+if getattr(sys, 'frozen', False):
+    _flask_base = sys._MEIPASS
+else:
+    _flask_base = os.path.dirname(os.path.abspath(__file__))
+
+app = Flask(
+    __name__,
+    template_folder=os.path.join(_flask_base, 'templates'),
+    static_folder=os.path.join(_flask_base, 'static'),
+)
 state = AppState()
 
 

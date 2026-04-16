@@ -39,7 +39,6 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Global state
-selenium_driver = None
 tray_icon = None
 should_quit = False
 mutex_handle = None
@@ -85,127 +84,76 @@ def wait_for_server(host, port, timeout=30):
 
 def start_flask_server(port):
     from app import app, init_app
-    app.template_folder = os.path.join(BASE_DIR, "templates")
-    app.static_folder = os.path.join(BASE_DIR, "static")
     threading.Thread(target=init_app, daemon=True).start()
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True, use_reloader=False)
 
 
 # ==========================================
-# Browser (Selenium / Subprocess)
-# Separate user-data-dir so it opens as a standalone app window,
-# not a tab in the user's existing Chrome.
+# Browser — always opens as standalone app window
 # ==========================================
-# Chrome profile: next to the EXE (or script), not inside _MEIPASS
 if getattr(sys, 'frozen', False):
     _app_root = os.path.dirname(sys.executable)
 else:
     _app_root = os.path.dirname(os.path.abspath(__file__))
-APP_PROFILE_DIR = os.path.join(_app_root, ".chrome_profile")
+APP_PROFILE_DIR = os.path.join(_app_root, ".nb_profile")
 
+_BROWSER_ARGS = [
+    "--window-size=1500,920",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-extensions",
+    "--disable-infobars",
+    "--disable-application-cache",
+    "--disk-cache-size=0",
+]
 
-def open_with_selenium(url):
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options as ChromeOptions
-
-        os.makedirs(APP_PROFILE_DIR, exist_ok=True)
-
-        options = ChromeOptions()
-        options.add_argument(f"--app={url}")
-        options.add_argument(f"--user-data-dir={APP_PROFILE_DIR}")
-        options.add_argument("--window-size=1500,920")
-        options.add_argument("--disable-extensions")
-        options.add_argument("--disable-infobars")
-        options.add_argument("--no-first-run")
-        options.add_argument("--no-default-browser-check")
-        options.add_argument("--disable-application-cache")
-        options.add_argument("--disk-cache-size=0")
-        options.add_argument("--aggressive-cache-discard")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-
-        try:
-            driver = webdriver.Chrome(options=options)
-            print("  Opened in Chrome (app mode)")
-            return driver
-        except Exception:
-            pass
-
-        try:
-            from selenium.webdriver.edge.options import Options as EdgeOptions
-            edge_opts = EdgeOptions()
-            edge_opts.add_argument(f"--app={url}")
-            edge_opts.add_argument(f"--user-data-dir={APP_PROFILE_DIR}")
-            edge_opts.add_argument("--window-size=1500,920")
-            edge_opts.add_argument("--disable-extensions")
-            edge_opts.add_argument("--disable-infobars")
-            edge_opts.add_argument("--no-first-run")
-            edge_opts.add_argument("--no-default-browser-check")
-            edge_opts.add_argument("--disable-application-cache")
-            edge_opts.add_argument("--disk-cache-size=0")
-            edge_opts.add_argument("--aggressive-cache-discard")
-            edge_opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-            driver = webdriver.Edge(options=edge_opts)
-            print("  Opened in Edge (app mode)")
-            return driver
-        except Exception:
-            pass
-
-    except ImportError:
-        pass
-    return None
-
-
-def open_with_subprocess(url):
-    os.makedirs(APP_PROFILE_DIR, exist_ok=True)
-    chrome_paths = [
+def _find_chrome_or_edge():
+    """Find Chrome or Edge executable."""
+    candidates = [
         os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
         os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
         os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
-    ]
-    edge_paths = [
         os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
         os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
     ]
-    for path in chrome_paths + edge_paths:
-        if os.path.exists(path):
-            try:
-                subprocess.Popen([
-                    path, f"--app={url}",
-                    f"--user-data-dir={APP_PROFILE_DIR}",
-                    "--window-size=1500,920",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-application-cache",
-                    "--disk-cache-size=0",
-                ])
-                print(f"  Opened with: {os.path.basename(path)} (app mode)")
-                return True
-            except Exception:
-                continue
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def open_app_window(url):
+    """Open Chrome/Edge in app mode as a standalone window (no tabs, no address bar)."""
+    os.makedirs(APP_PROFILE_DIR, exist_ok=True)
+    browser = _find_chrome_or_edge()
+    if browser:
+        cmd = [browser, f"--app={url}", f"--user-data-dir={APP_PROFILE_DIR}"] + _BROWSER_ARGS
+        proc = subprocess.Popen(cmd)
+        print(f"  Opened: {os.path.basename(browser)} (app mode, PID {proc.pid})")
+        return proc
+    # Fallback
     import webbrowser
     webbrowser.open(url)
-    print("  Opened in default browser")
-    return True
+    print("  Opened in default browser (fallback)")
+    return None
+
+
+browser_proc = None
 
 
 def open_browser():
-    global selenium_driver
-    driver = open_with_selenium(APP_URL)
-    if driver:
-        selenium_driver = driver
-    else:
-        open_with_subprocess(APP_URL)
+    global browser_proc
+    browser_proc = open_app_window(APP_URL)
 
 
 def close_browser():
-    global selenium_driver
-    if selenium_driver:
+    global browser_proc
+    if browser_proc:
         try:
-            selenium_driver.quit()
+            browser_proc.terminate()
         except Exception:
             pass
-        selenium_driver = None
+        browser_proc = None
 
 
 # ==========================================
@@ -226,13 +174,9 @@ def create_tray_icon_image():
 
 
 def on_tray_open(icon, item):
-    global selenium_driver
-    if selenium_driver:
-        try:
-            _ = selenium_driver.title
-            return  # already open
-        except Exception:
-            selenium_driver = None
+    global browser_proc
+    if browser_proc and browser_proc.poll() is None:
+        return  # already open
     threading.Thread(target=open_browser, daemon=True).start()
 
 
@@ -259,7 +203,7 @@ def setup_tray():
 # Main
 # ==========================================
 def main():
-    global should_quit, selenium_driver
+    global should_quit, browser_proc
 
     print("=" * 50)
     print("  NanoBanana Web - AI Image Studio")
@@ -322,25 +266,20 @@ def main():
     # --- Main loop ---
     try:
         while not should_quit:
-            if selenium_driver:
-                try:
-                    _ = selenium_driver.title
-                    time.sleep(1)
-                except Exception:
-                    # Browser window closed → minimize to tray
-                    selenium_driver = None
-                    print("  Browser closed. Running in system tray...")
-                    if tray_icon:
-                        try:
-                            tray_icon.notify(
-                                "NanoBanana is running in the system tray.\n"
-                                "Double-click the tray icon to reopen.",
-                                "NanoBanana"
-                            )
-                        except Exception:
-                            pass
-            else:
-                time.sleep(1)
+            if browser_proc and browser_proc.poll() is not None:
+                # Browser window closed -> minimize to tray
+                browser_proc = None
+                print("  Browser closed. Running in system tray...")
+                if tray_icon:
+                    try:
+                        tray_icon.notify(
+                            "NanoBanana is running in the system tray.\n"
+                            "Double-click the tray icon to reopen.",
+                            "NanoBanana"
+                        )
+                    except Exception:
+                        pass
+            time.sleep(1)
     except KeyboardInterrupt:
         print("\n  Shutting down...")
         should_quit = True

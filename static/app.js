@@ -126,7 +126,8 @@ async function api(url, opts = {}) {
 async function loadVersion() {
   try {
     const d = await api("/api/version");
-    document.getElementById("versionLabel").textContent = d.version || "unknown";
+    const ver = (d.version || "unknown").replace(/^v/, "").replace(/-/g, ".");
+    document.getElementById("versionLabel").textContent = ver;
   } catch (e) {
     document.getElementById("versionLabel").textContent = "offline";
   }

@@ -398,6 +398,10 @@ async function refreshGallery() {
     const img = document.createElement("img"); img.className = "card-img";
     img.src = `/api/gallery/thumb?path=${encodeURIComponent(item.filepath)}&size=${getThumbSize()}`;
     img.loading = "lazy";
+    // Set aspect ratio from generation settings
+    const ar = item.aspect || "16:9";
+    const [aw, ah] = ar.split(":").map(Number);
+    if (aw && ah) img.style.aspectRatio = `${aw}/${ah}`;
     card.appendChild(img);
 
     const body = document.createElement("div"); body.className = "card-body";

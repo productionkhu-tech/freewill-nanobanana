@@ -270,11 +270,7 @@ textarea.prompt-box { min-height:82px; }
 .card:hover { border-color:var(--surface3); }
 .card.selected { border:2px solid var(--accent); }
 
-.card-img { width:100%; object-fit:contain; display:block; background:#111; border-radius:8px 8px 0 0; }
-.gallery-grid.cols-1 .card-img { max-height:500px; }
-.gallery-grid.cols-2 .card-img { max-height:320px; }
-.gallery-grid.cols-4 .card-img { max-height:200px; }
-.gallery-grid.cols-8 .card-img { max-height:140px; }
+.card-img { width:100%; object-fit:cover; display:block; background:var(--surface2); }
 .card-body { padding:10px 12px; }
 .card-filename {
   font-size:11px; font-weight:bold; color:var(--text); margin-bottom:4px;
@@ -314,7 +310,7 @@ textarea.prompt-box { min-height:82px; }
 /* 8-col compact: preview only */
 .gallery-grid.cols-8 .card-body { display:none; }
 .gallery-grid.cols-8 .card { border-radius:6px; }
-.gallery-grid.cols-8 .card-img { max-height:180px; }
+.gallery-grid.cols-8 .card-img { aspect-ratio:1/1 !important; }
 /* 4-col: smaller */
 .gallery-grid.cols-4 .card-filename { font-size:10px; }
 .gallery-grid.cols-4 .card-meta { font-size:8px; margin-bottom:4px; }
@@ -391,7 +387,7 @@ footer {
 /* SKELETON CARDS                              */
 /* ═══════════════════════════════════════════ */
 .skeleton { background:var(--surface); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
-.skeleton .skel-img { width:100%; height:200px; background:var(--surface2); animation:pulse 1.5s ease-in-out infinite; }
+.skeleton .skel-img { width:100%; aspect-ratio:16/9; background:var(--surface2); animation:pulse 1.5s ease-in-out infinite; }
 .skeleton .skel-line { height:10px; background:var(--surface2); border-radius:999px; margin:6px 12px; animation:pulse 1.5s ease-in-out infinite .2s; }
 .skeleton .skel-chips { display:flex; gap:6px; padding:0 12px 12px; }
 .skeleton .skel-chip { height:22px; border-radius:999px; background:var(--surface2); animation:pulse 1.5s ease-in-out infinite .4s; }

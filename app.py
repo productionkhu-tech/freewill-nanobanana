@@ -1027,20 +1027,24 @@ app = Flask(__name__)
 state = AppState()
 
 
+def _read_version():
+    try:
+        vf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
+        with open(vf, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return "unknown"
+
+
 @app.route("/")
 def index():
-    return render_template("index.html")
+    html = render_template("index.html")
+    return html.replace("__VERSION__", _read_version())
 
 
 @app.route("/api/version")
 def api_version():
-    try:
-        vf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
-        with open(vf, "r") as f:
-            ver = f.read().strip()
-    except Exception:
-        ver = "unknown"
-    return jsonify({"version": ver})
+    return jsonify({"version": _read_version()})
 
 
 @app.route("/api/status")

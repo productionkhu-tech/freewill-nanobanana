@@ -23,6 +23,9 @@ NanoBanana_Output/
 *.swp
 *.swo
 
+# Chrome app profile (auto-created)
+.chrome_profile/
+
 # OS
 .DS_Store
 Thumbs.db

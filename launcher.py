@@ -84,22 +84,32 @@ def start_flask_server(port):
 
 # ==========================================
 # Browser (Selenium / Subprocess)
+# Separate user-data-dir so it opens as a standalone app window,
+# not a tab in the user's existing Chrome.
 # ==========================================
+APP_PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".chrome_profile")
+
+
 def open_with_selenium(url):
     try:
         from selenium import webdriver
         from selenium.webdriver.chrome.options import Options as ChromeOptions
 
+        os.makedirs(APP_PROFILE_DIR, exist_ok=True)
+
         options = ChromeOptions()
         options.add_argument(f"--app={url}")
+        options.add_argument(f"--user-data-dir={APP_PROFILE_DIR}")
         options.add_argument("--window-size=1500,920")
         options.add_argument("--disable-extensions")
         options.add_argument("--disable-infobars")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
 
         try:
             driver = webdriver.Chrome(options=options)
-            print("  Opened in Chrome (Selenium)")
+            print("  Opened in Chrome (app mode)")
             return driver
         except Exception:
             pass
@@ -108,12 +118,15 @@ def open_with_selenium(url):
             from selenium.webdriver.edge.options import Options as EdgeOptions
             edge_opts = EdgeOptions()
             edge_opts.add_argument(f"--app={url}")
+            edge_opts.add_argument(f"--user-data-dir={APP_PROFILE_DIR}")
             edge_opts.add_argument("--window-size=1500,920")
             edge_opts.add_argument("--disable-extensions")
             edge_opts.add_argument("--disable-infobars")
+            edge_opts.add_argument("--no-first-run")
+            edge_opts.add_argument("--no-default-browser-check")
             edge_opts.add_experimental_option("excludeSwitches", ["enable-automation"])
             driver = webdriver.Edge(options=edge_opts)
-            print("  Opened in Edge (Selenium)")
+            print("  Opened in Edge (app mode)")
             return driver
         except Exception:
             pass
@@ -124,6 +137,7 @@ def open_with_selenium(url):
 
 
 def open_with_subprocess(url):
+    os.makedirs(APP_PROFILE_DIR, exist_ok=True)
     chrome_paths = [
         os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
         os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
@@ -136,8 +150,14 @@ def open_with_subprocess(url):
     for path in chrome_paths + edge_paths:
         if os.path.exists(path):
             try:
-                subprocess.Popen([path, f"--app={url}", "--window-size=1500,920"])
-                print(f"  Opened with: {os.path.basename(path)}")
+                subprocess.Popen([
+                    path, f"--app={url}",
+                    f"--user-data-dir={APP_PROFILE_DIR}",
+                    "--window-size=1500,920",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ])
+                print(f"  Opened with: {os.path.basename(path)} (app mode)")
                 return True
             except Exception:
                 continue

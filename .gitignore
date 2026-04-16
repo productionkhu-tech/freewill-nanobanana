@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.env
+*.env
+*.log
+*.tmp
+*.lock
+
+# Credentials — NEVER commit
+service_account*.json
+credentials*.json
+
+# User output
+NanoBanana_Output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NanoBanana</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<!-- HEADER -->
+<header id="header">
+  <button id="toggleSidebar" class="btn-pill small">Hide Panel</button>
+  <div class="header-right">
+    <div class="api-status">
+      <span id="vertexDot" class="dot disconnected"></span><span class="status-label">Vertex</span>
+      <span id="studioDot" class="dot disconnected"></span><span class="status-label">Studio</span>
+    </div>
+    <button id="topGenBtn" class="btn-accent" onclick="generate()">Generate</button>
+  </div>
+</header>
+
+<!-- MAIN -->
+<div id="main">
+  <!-- SIDEBAR -->
+  <aside id="sidebar">
+    <div class="sidebar-scroll">
+      <!-- Model -->
+      <div class="section-title">Model</div>
+      <select id="modelSelect" onchange="onModelChange()">
+        <option value="gemini-2.5-flash-image">gemini-2.5-flash-image</option>
+        <option value="gemini-3-pro-image-preview" selected>gemini-3-pro-image-preview</option>
+        <option value="gemini-3.1-flash-image-preview">gemini-3.1-flash-image-preview</option>
+      </select>
+      <div class="hint">10 RPM limit &mdash; auto-throttled to ~8 RPM</div>
+
+      <!-- Fixed Prompt -->
+      <div class="section-title">Prompt</div>
+      <label class="field-label">Fixed Prompt</label>
+      <textarea id="fixedPrompt" class="prompt-box" rows="3" placeholder="Shared across all generations..."></textarea>
+
+      <!-- Prompt Sections -->
+      <div id="promptControls" class="btn-row">
+        <button class="btn-sm" onclick="addPromptSection()">+ Prompt</button>
+        <button class="btn-sm" id="removePromptBtn" onclick="removePromptSection()">- Prompt</button>
+        <button class="btn-sm warm" onclick="resetSetup()">Reset Setup</button>
+      </div>
+      <div id="promptSections"></div>
+
+      <!-- Reference Images -->
+      <div class="section-title">Reference Images</div>
+      <div class="hint">Add images for editing/mixing. Use [Image N] tags in the prompt.</div>
+      <div id="refArea" class="ref-area" ondrop="onRefDrop(event)" ondragover="event.preventDefault()" ondragenter="onRefDragEnter(event)" ondragleave="onRefDragLeave(event)">
+        <div id="refGrid" class="ref-grid"></div>
+        <div id="refEmpty" class="ref-empty">No reference images</div>
+      </div>
+      <div class="btn-row">
+        <button class="btn-sm" onclick="browseRefImages()">+ Add Image</button>
+        <button class="btn-sm" onclick="clearRefs(true)">Clear All</button>
+        <button class="btn-sm" onclick="pasteClipboardRef()">Paste</button>
+      </div>
+      <div class="hint" id="refLimitHint">3rd-gen models support up to 14 reference images.</div>
+
+      <!-- Settings -->
+      <div class="section-title">Settings</div>
+      <div class="settings-grid">
+        <div>
+          <label class="field-label">Aspect Ratio</label>
+          <select id="aspectSelect">
+            <option>1:1</option><option>2:3</option><option>3:2</option>
+            <option>3:4</option><option>4:3</option><option>4:5</option>
+            <option>5:4</option><option>9:16</option><option selected>16:9</option><option>21:9</option>
+          </select>
+        </div>
+        <div>
+          <label class="field-label">Resolution</label>
+          <select id="resolutionSelect">
+            <option>512px</option><option>1K</option><option>2K</option><option selected>4K</option>
+          </select>
+        </div>
+        <div>
+          <label class="field-label">Count</label>
+          <select id="countSelect">
+            <option>1</option><option>2</option><option>3</option><option>4</option>
+            <option>5</option><option>6</option><option>7</option><option>8</option>
+            <option>9</option><option>10</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Save Folder -->
+      <div class="section-title">Save Folder</div>
+      <div class="folder-row">
+        <input type="text" id="folderInput" readonly>
+        <button class="btn-sm" onclick="browseFolder()">Browse</button>
+      </div>
+
+      <!-- Project -->
+      <div class="btn-row">
+        <button class="btn-sm" onclick="saveProject()">Save Project</button>
+        <button class="btn-sm" onclick="loadProject()">Load Project</button>
+      </div>
+
+      <!-- File Naming -->
+      <div class="section-title">File Naming</div>
+      <label class="switch-row">
+        <input type="checkbox" id="namingSwitch" onchange="updateNamingControls()">
+        <span>Custom naming</span>
+      </label>
+      <div id="namingGrid" class="naming-grid disabled">
+        <div><label class="field-label">Prefix</label><input type="text" id="namingPrefix" value="S010" placeholder="S010"></div>
+        <div><label class="field-label">Delimiter</label><input type="text" id="namingDelimiter" value="C010" placeholder="C010"></div>
+        <div><label class="field-label">Index Prefix</label><input type="text" id="namingIndexPrefix" value="I" placeholder="I"></div>
+        <div>
+          <label class="field-label">Padding</label>
+          <select id="namingPadding"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select>
+        </div>
+      </div>
+
+      <!-- Actions -->
+      <button id="genBtn" class="btn-generate" onclick="generate()">Generate</button>
+      <button id="stopBtn" class="btn-stop" onclick="stopGenerate()" disabled>Stop</button>
+
+      <!-- Progress -->
+      <div class="progress-wrap">
+        <div class="progress-bar"><div id="progressFill" class="progress-fill"></div></div>
+        <div id="progressLabel" class="hint">Ready</div>
+      </div>
+
+      <!-- Log -->
+      <div class="section-title">Log</div>
+      <div id="logBox" class="log-box"></div>
+    </div>
+  </aside>
+
+  <!-- GALLERY -->
+  <main id="gallery">
+    <div class="gallery-header">
+      <span class="gallery-title">Generated Images</span>
+      <div class="gallery-actions">
+        <input type="text" id="gallerySearch" placeholder="Search prompts..." oninput="filterGallery()">
+        <button id="favFilterBtn" class="btn-icon" onclick="toggleFavFilter()" title="Favorites only">&#9733;</button>
+        <div class="layout-btns">
+          <button class="layout-btn active" data-cols="2" onclick="setColumns(2)">2</button>
+          <button class="layout-btn" data-cols="4" onclick="setColumns(4)">4</button>
+          <button class="layout-btn" data-cols="8" onclick="setColumns(8)">8</button>
+        </div>
+        <span id="countBadge" class="count-badge">0 images</span>
+      </div>
+    </div>
+    <div id="galleryGrid" class="gallery-grid cols-2">
+      <div id="emptyState" class="empty-state">No images yet<br>Configure prompt and click Generate</div>
+    </div>
+  </main>
+</div>
+
+<!-- FOOTER -->
+<footer id="footer">
+  <span id="statusLabel">Ready</span>
+  <span class="version" id="versionLabel">Loading...</span>
+</footer>
+
+<!-- TOAST -->
+<div id="toast" class="toast hidden"></div>
+
+<!-- IMAGE VIEWER MODAL -->
+<div id="viewerModal" class="modal hidden">
+  <div class="modal-header">
+    <span id="viewerTitle"></span>
+    <div class="viewer-nav">
+      <button onclick="navigateViewer(-1)">&larr;</button>
+      <button onclick="navigateViewer(1)">&rarr;</button>
+      <span class="hint">Wheel to zoom &bull; Drag to pan &bull; Esc to close</span>
+    </div>
+    <button class="close-btn" onclick="closeViewer()">&times;</button>
+  </div>
+  <canvas id="viewerCanvas"></canvas>
+  <div class="viewer-footer">
+    <label class="field-label">Prompt</label>
+    <div id="viewerPrompt" class="viewer-prompt"></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

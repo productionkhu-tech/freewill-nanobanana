@@ -395,41 +395,78 @@ async function refreshGallery() {
     card.className = "card" + (selectedPaths.includes(item.filepath) ? " selected" : "");
     card.dataset.path = item.filepath;
 
+    // --- Media frame with image ---
+    const frame = document.createElement("div"); frame.className = "media-frame";
     const img = document.createElement("img"); img.className = "card-img";
     img.src = `/api/gallery/thumb?path=${encodeURIComponent(item.filepath)}&size=${getThumbSize()}`;
     img.loading = "lazy";
-    card.appendChild(img);
+    frame.appendChild(img);
+    card.appendChild(frame);
 
+    // --- Card body ---
     const body = document.createElement("div"); body.className = "card-body";
-    const fname = document.createElement("div"); fname.className = "card-filename";
-    fname.title = item.filename; fname.textContent = item.filename; body.appendChild(fname);
 
-    const meta = document.createElement("div"); meta.className = "card-meta";
+    // Info row: filename (left) + elapsed time + API badge (right)
+    const infoRow = document.createElement("div"); infoRow.className = "card-info-row";
+    const fname = document.createElement("div"); fname.className = "card-filename";
+    fname.title = item.filename; fname.textContent = item.filename;
+    infoRow.appendChild(fname);
+    const infoRight = document.createElement("div"); infoRight.className = "card-info-right";
+    const elapsed = document.createElement("span");
+    elapsed.textContent = `${item.elapsed_sec || 0}s`;
+    infoRight.appendChild(elapsed);
+    const badge = document.createElement("span");
     const bc = item.api_used === "vertex" ? "vertex" : "studio";
-    const bl = item.api_used === "vertex" ? "V" : "S";
-    meta.innerHTML = `${item.elapsed_sec}s <span class="api-badge ${bc}">${bl}</span>`
-      + (item.resolution ? ` &bull; ${item.resolution}` : "") + (item.aspect ? ` &bull; ${item.aspect}` : "");
+    const bl = item.api_used === "vertex" ? "[V]" : "[S]";
+    badge.className = "api-badge " + bc; badge.textContent = bl;
+    infoRight.appendChild(badge);
+    infoRow.appendChild(infoRight);
+    body.appendChild(infoRow);
+
+    // Meta row: resolution, aspect, timestamp
+    const meta = document.createElement("div"); meta.className = "card-meta";
+    const parts = [];
+    if (item.resolution) parts.push(item.resolution);
+    if (item.aspect) parts.push(item.aspect);
+    if (item.timestamp) {
+      const d = new Date(item.timestamp * 1000);
+      parts.push(d.toLocaleString("ko-KR", {month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}));
+    }
+    meta.textContent = parts.join(" \u2022 ");
     body.appendChild(meta);
 
-    const acts = document.createElement("div"); acts.className = "card-actions";
-    const mk = (text, cls, fn) => { const b = document.createElement("button"); b.className="card-btn "+cls; b.innerHTML=text; b.addEventListener("click",(e)=>{e.stopPropagation();fn();}); return b; };
-    const favBtn = mk("&#9733;","fav"+(item.favorite?" active":""),()=>toggleFav(item.filepath,favBtn));
-    acts.appendChild(favBtn);
-    acts.appendChild(mk("Ref","ref-btn-card",()=>useAsRef(item.filepath)));
-    acts.appendChild(mk("Explorer","explorer-btn",()=>openInExplorer(item.filepath)));
-    acts.appendChild(mk("Prompt","prompt-btn",()=>showPromptPopup(item.prompt)));
-    acts.appendChild(mk("Load","load-btn",()=>loadSetup(item.filepath)));
-    acts.appendChild(mk("Copy","copy-btn",()=>copyToClipboard(item.filepath)));
-    acts.appendChild(mk("Del","del",()=>deleteImage(item.filepath)));
-    body.appendChild(acts); card.appendChild(body);
+    // Helper to create a button
+    const mk = (text, cls, fn) => {
+      const b = document.createElement("button");
+      b.className = "card-btn " + cls; b.innerHTML = text;
+      b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
+      return b;
+    };
+
+    // Top action row: Favorite | Explorer | Delete (3 equal columns)
+    const topRow = document.createElement("div"); topRow.className = "card-actions-top";
+    const favBtn = mk("\u2605 Favorite", "fav" + (item.favorite ? " active" : ""), () => toggleFav(item.filepath, favBtn));
+    topRow.appendChild(favBtn);
+    topRow.appendChild(mk("Explorer", "explorer-btn", () => openInExplorer(item.filepath)));
+    topRow.appendChild(mk("Delete", "del", () => deleteImage(item.filepath)));
+    body.appendChild(topRow);
+
+    // Bottom action row: Prompt | Use as Ref | Load (3 equal columns)
+    const botRow = document.createElement("div"); botRow.className = "card-actions-bottom";
+    botRow.appendChild(mk("Prompt", "prompt-btn", () => showPromptPopup(item.prompt)));
+    botRow.appendChild(mk("Use as Ref", "ref-btn-card", () => useAsRef(item.filepath)));
+    botRow.appendChild(mk("Load", "load-btn", () => loadSetup(item.filepath)));
+    body.appendChild(botRow);
+
+    card.appendChild(body);
 
     // Single click = select, Double click = viewer
     card.addEventListener("click", (e) => {
-      if (e.target.closest(".card-actions")) return;
+      if (e.target.closest(".card-actions-top") || e.target.closest(".card-actions-bottom")) return;
       selectCard(item.filepath, e);
     });
     card.addEventListener("dblclick", (e) => {
-      if (e.target.closest(".card-actions")) return;
+      if (e.target.closest(".card-actions-top") || e.target.closest(".card-actions-bottom")) return;
       openViewer(item.filepath);
     });
     grid.appendChild(card);

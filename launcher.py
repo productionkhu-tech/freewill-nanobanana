@@ -9,11 +9,24 @@ NanoBanana Launcher
 
 import os
 import sys
+
+# PyInstaller: ensure _MEIPASS is in PATH so DLLs like libffi-8.dll can be found
+if getattr(sys, 'frozen', False):
+    os.environ['PATH'] = sys._MEIPASS + os.pathsep + os.environ.get('PATH', '')
+
 import time
 import threading
 import subprocess
 import socket
-import ctypes
+
+# These imports are here so PyInstaller includes them in the frozen bundle.
+# They are actually used by app.py which is loaded at runtime.
+import flask  # noqa: F401
+import jinja2  # noqa: F401
+import markupsafe  # noqa: F401
+import werkzeug  # noqa: F401
+from google import genai  # noqa: F401
+from PIL import Image  # noqa: F401
 
 PORT = 5656
 APP_URL = f"http://127.0.0.1:{PORT}"
@@ -36,16 +49,8 @@ mutex_handle = None
 # Duplicate Instance Prevention
 # ==========================================
 def acquire_mutex():
-    """Windows named mutex — auto-released on process exit/crash."""
-    global mutex_handle
-    if sys.platform != "win32":
-        return True
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    mutex_handle = kernel32.CreateMutexW(None, True, MUTEX_NAME)
-    last_error = ctypes.get_last_error()
-    if last_error == 183:  # ERROR_ALREADY_EXISTS
-        return False
-    return True
+    """Check duplicate via port binding - no ctypes needed."""
+    return not is_port_in_use(PORT)
 
 
 def is_port_in_use(port):
@@ -79,11 +84,7 @@ def wait_for_server(host, port, timeout=30):
 
 
 def start_flask_server(port):
-    if BASE_DIR not in sys.path:
-        sys.path.insert(0, BASE_DIR)
-
     from app import app, init_app
-    # Set Flask template/static dirs for PyInstaller
     app.template_folder = os.path.join(BASE_DIR, "templates")
     app.static_folder = os.path.join(BASE_DIR, "static")
     threading.Thread(target=init_app, daemon=True).start()
@@ -253,7 +254,7 @@ def main():
     global should_quit
 
     print("=" * 50)
-    print("  NanoBanana Web — AI Image Studio")
+    print("  NanoBanana Web - AI Image Studio")
     print("=" * 50)
 
     # --- Duplicate instance check ---
@@ -272,7 +273,7 @@ def main():
     try:
         from updater import run_update_check
         if run_update_check():
-            # Updated — restart process
+            # Updated - restart process
             os.execv(sys.executable, [sys.executable] + sys.argv)
     except Exception as e:
         print(f"  Update check error: {e}")

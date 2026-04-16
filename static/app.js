@@ -493,6 +493,10 @@ async function refreshGallery() {
   const search = document.getElementById("gallerySearch").value.toLowerCase();
 
   grid.querySelectorAll(".card").forEach(c => c.remove());
+  // Clean up stale skeletons if generation is done
+  if (!isGenerating) {
+    grid.querySelectorAll(".skeleton").forEach(s => s.remove());
+  }
 
   let items = d.items;
   if (favoritesOnly) items = items.filter(it => it.favorite);

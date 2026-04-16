@@ -1535,11 +1535,17 @@ def browse_project():
     try:
         from tkinter import filedialog
         root = _make_dialog_root()
+        # Default to NanoBanana JSON project folder
+        project_dir = state.get_project_save_dir()
+        if not os.path.isdir(project_dir):
+            project_dir = os.path.join(os.path.expanduser("~/Desktop"), "NanoBanana_Output")
+        if not os.path.isdir(project_dir):
+            project_dir = state.output_dir
         fp = filedialog.askopenfilename(
             parent=root,
             title="Load Project",
             filetypes=[("JSON Project", "*.json"), ("All Files", "*.*")],
-            initialdir=state.output_dir,
+            initialdir=project_dir,
         )
         root.destroy()
         if fp:

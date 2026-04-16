@@ -56,7 +56,6 @@
       <div class="btn-row">
         <button class="btn-sm" onclick="browseRefImages()">+ Add Image</button>
         <button class="btn-sm" onclick="clearRefs(true)">Clear All</button>
-        <button class="btn-sm" onclick="pasteClipboardRef()">Paste</button>
       </div>
       <div class="hint" id="refLimitHint">3rd-gen models support up to 14 reference images.</div>
 
@@ -102,10 +101,13 @@
 
       <!-- File Naming -->
       <div class="section-title">File Naming</div>
-      <label class="switch-row">
-        <input type="checkbox" id="namingSwitch" onchange="updateNamingControls()">
+      <label class="toggle-row">
+        <div class="toggle" id="namingToggle" onclick="toggleNaming()">
+          <div class="toggle-thumb"></div>
+        </div>
         <span>Custom naming</span>
       </label>
+      <input type="checkbox" id="namingSwitch" style="display:none" onchange="updateNamingControls()">
       <div id="namingGrid" class="naming-grid disabled">
         <div><label class="field-label">Prefix</label><input type="text" id="namingPrefix" value="S010" placeholder="S010"></div>
         <div><label class="field-label">Delimiter</label><input type="text" id="namingDelimiter" value="C010" placeholder="C010"></div>

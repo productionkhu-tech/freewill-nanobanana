@@ -304,8 +304,18 @@ document.addEventListener("mousedown", (e) => { if (mentionMenu && !mentionMenu.
 // ==========================================
 // Naming Controls
 // ==========================================
+function toggleNaming() {
+  const cb = document.getElementById("namingSwitch");
+  cb.checked = !cb.checked;
+  updateNamingControls();
+  saveSettings();
+}
+
 function updateNamingControls() {
-  document.getElementById("namingGrid").classList.toggle("disabled", !document.getElementById("namingSwitch").checked);
+  const on = document.getElementById("namingSwitch").checked;
+  document.getElementById("namingGrid").classList.toggle("disabled", !on);
+  const tog = document.getElementById("namingToggle");
+  if (tog) tog.classList.toggle("active", on);
 }
 
 // ==========================================

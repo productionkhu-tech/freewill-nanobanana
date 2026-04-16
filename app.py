@@ -1155,13 +1155,11 @@ def browse_replace_ref():
     if idx < 0 or idx >= len(state.ref_images):
         return jsonify({"ok": False, "error": "Invalid index"})
     try:
-        import tkinter as tk
         from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
+        root = _make_dialog_root()
         initial = state.output_dir if os.path.isdir(state.output_dir) else os.path.expanduser("~")
         fp = filedialog.askopenfilename(
+            parent=root,
             title=f"Replace Reference Image {idx + 1}",
             filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.webp;*.bmp"), ("All Files", "*.*")],
             initialdir=initial,
@@ -1461,17 +1459,34 @@ def upload_project():
     return jsonify({"ok": ok, "message": msg})
 
 
-# --- Browse folder (uses tkinter dialog on server) ---
+# --- File dialog helper: force to foreground on Windows ---
+def _make_dialog_root():
+    """Create a tkinter root that forces the file dialog to appear on top of Chrome."""
+    import tkinter as tk
+    root = tk.Tk()
+    root.overrideredirect(True)
+    root.geometry("0x0+0+0")
+    root.attributes("-topmost", True)
+    root.update()
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            hwnd = root.winfo_id()
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+    root.focus_force()
+    return root
+
+
+# --- Browse folder ---
 @app.route("/api/browse-folder", methods=["POST"])
 def browse_folder():
     try:
-        import tkinter as tk
         from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
+        root = _make_dialog_root()
         initial = state.output_dir if os.path.isdir(state.output_dir) else os.path.expanduser("~")
-        folder = filedialog.askdirectory(title="Select Output Folder", initialdir=initial)
+        folder = filedialog.askdirectory(parent=root, title="Select Output Folder", initialdir=initial)
         root.destroy()
         if folder:
             state.output_dir = folder
@@ -1485,13 +1500,11 @@ def browse_folder():
 @app.route("/api/browse-files", methods=["POST"])
 def browse_files():
     try:
-        import tkinter as tk
         from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
+        root = _make_dialog_root()
         initial = state.output_dir if os.path.isdir(state.output_dir) else os.path.expanduser("~")
         paths = filedialog.askopenfilenames(
+            parent=root,
             title="Select Reference Images",
             filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp")],
             initialdir=initial,
@@ -1509,12 +1522,10 @@ def browse_files():
 @app.route("/api/browse-project", methods=["POST"])
 def browse_project():
     try:
-        import tkinter as tk
         from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
+        root = _make_dialog_root()
         fp = filedialog.askopenfilename(
+            parent=root,
             title="Load Project",
             filetypes=[("JSON Project", "*.json"), ("All Files", "*.*")],
             initialdir=state.output_dir,
@@ -1531,12 +1542,10 @@ def browse_project():
 @app.route("/api/save-project-as", methods=["POST"])
 def save_project_as():
     try:
-        import tkinter as tk
         from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
+        root = _make_dialog_root()
         fp = filedialog.asksaveasfilename(
+            parent=root,
             title="Save Project",
             defaultextension=".json",
             initialdir=state.output_dir,

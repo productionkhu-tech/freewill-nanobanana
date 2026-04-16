@@ -251,7 +251,7 @@ def setup_tray():
 # Main
 # ==========================================
 def main():
-    global should_quit
+    global should_quit, selenium_driver
 
     print("=" * 50)
     print("  NanoBanana Web - AI Image Studio")

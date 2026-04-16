@@ -1028,12 +1028,19 @@ state = AppState()
 
 
 def _read_version():
-    try:
-        vf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
-        with open(vf, "r") as f:
-            return f.read().strip()
-    except Exception:
-        return "unknown"
+    # Try multiple locations: frozen (PyInstaller) and dev
+    candidates = [
+        os.path.join(getattr(sys, '_MEIPASS', ''), "VERSION"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"),
+        os.path.join(os.getcwd(), "VERSION"),
+    ]
+    for vf in candidates:
+        try:
+            with open(vf, "r") as f:
+                return f.read().strip()
+        except Exception:
+            continue
+    return "unknown"
 
 
 @app.route("/")

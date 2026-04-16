@@ -19,6 +19,12 @@ PORT = 5656
 APP_URL = f"http://127.0.0.1:{PORT}"
 MUTEX_NAME = "NanoBanana_SingleInstance_Mutex"
 
+# PyInstaller: resolve base directory for bundled files
+if getattr(sys, 'frozen', False):
+    BASE_DIR = sys._MEIPASS
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Global state
 selenium_driver = None
 tray_icon = None
@@ -73,11 +79,13 @@ def wait_for_server(host, port, timeout=30):
 
 
 def start_flask_server(port):
-    project_dir = os.path.dirname(os.path.abspath(__file__))
-    if project_dir not in sys.path:
-        sys.path.insert(0, project_dir)
+    if BASE_DIR not in sys.path:
+        sys.path.insert(0, BASE_DIR)
 
     from app import app, init_app
+    # Set Flask template/static dirs for PyInstaller
+    app.template_folder = os.path.join(BASE_DIR, "templates")
+    app.static_folder = os.path.join(BASE_DIR, "static")
     threading.Thread(target=init_app, daemon=True).start()
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True, use_reloader=False)
 
@@ -87,7 +95,12 @@ def start_flask_server(port):
 # Separate user-data-dir so it opens as a standalone app window,
 # not a tab in the user's existing Chrome.
 # ==========================================
-APP_PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".chrome_profile")
+# Chrome profile: next to the EXE (or script), not inside _MEIPASS
+if getattr(sys, 'frozen', False):
+    _app_root = os.path.dirname(sys.executable)
+else:
+    _app_root = os.path.dirname(os.path.abspath(__file__))
+APP_PROFILE_DIR = os.path.join(_app_root, ".chrome_profile")
 
 
 def open_with_selenium(url):

@@ -1036,6 +1036,14 @@ app = Flask(
 state = AppState()
 
 
+@app.after_request
+def add_no_cache(response):
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
 def _read_version():
     # Try multiple locations: frozen (PyInstaller) and dev
     candidates = [

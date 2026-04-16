@@ -140,6 +140,7 @@
         <input type="text" id="gallerySearch" placeholder="Search prompts..." oninput="filterGallery()">
         <button id="favFilterBtn" class="btn-icon" onclick="toggleFavFilter()" title="Favorites only">&#9733;</button>
         <div class="layout-btns">
+          <button class="layout-btn" data-cols="1" onclick="setColumns(1)">1</button>
           <button class="layout-btn active" data-cols="2" onclick="setColumns(2)">2</button>
           <button class="layout-btn" data-cols="4" onclick="setColumns(4)">4</button>
           <button class="layout-btn" data-cols="8" onclick="setColumns(8)">8</button>
@@ -161,6 +162,21 @@
 
 <!-- TOAST -->
 <div id="toast" class="toast hidden"></div>
+
+<!-- RECENT PROJECTS MODAL -->
+<div id="projectsModal" class="projects-modal hidden">
+  <div class="projects-dialog">
+    <div class="projects-dialog-header">
+      <h2>Open a recent project?</h2>
+      <p>Choose a recent JSON project or start with a blank workspace.</p>
+    </div>
+    <div class="projects-dialog-body" id="projectsList"></div>
+    <div class="projects-dialog-footer">
+      <button class="btn-sm" onclick="loadProjectFromBrowser()">Open Other JSON</button>
+      <button class="btn-sm" onclick="closeProjectsModal()">Start Fresh</button>
+    </div>
+  </div>
+</div>
 
 <!-- IMAGE VIEWER MODAL -->
 <div id="viewerModal" class="modal hidden">

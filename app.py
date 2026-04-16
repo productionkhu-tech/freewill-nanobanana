@@ -1148,6 +1148,50 @@ def upload_refs():
     return jsonify({"ok": True, "added": added})
 
 
+@app.route("/api/browse-replace-ref", methods=["POST"])
+def browse_replace_ref():
+    d = request.json or {}
+    idx = d.get("index", -1)
+    if idx < 0 or idx >= len(state.ref_images):
+        return jsonify({"ok": False, "error": "Invalid index"})
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        initial = state.output_dir if os.path.isdir(state.output_dir) else os.path.expanduser("~")
+        fp = filedialog.askopenfilename(
+            title=f"Replace Reference Image {idx + 1}",
+            filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.webp;*.bmp"), ("All Files", "*.*")],
+            initialdir=initial,
+        )
+        root.destroy()
+        if not fp:
+            return jsonify({"ok": False})
+        # Replace the ref at index
+        try:
+            with Image.open(fp) as img:
+                pil = img.convert("RGB")
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)[:80]})
+        old_path = state.ref_path_list[idx]
+        old_img = state.ref_images[idx]
+        state.ref_images[idx] = pil
+        state.ref_path_list[idx] = fp
+        try:
+            old_img.close()
+        except Exception:
+            pass
+        if old_path != fp:
+            state.cleanup_temp_ref_path(old_path)
+        state.project_dirty = True
+        state.log(f"Replaced ref {idx + 1}: {os.path.basename(fp)}")
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:80]})
+
+
 @app.route("/api/refs/add-path", methods=["POST"])
 def add_ref_path():
     d = request.json or {}

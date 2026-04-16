@@ -1,59 +1,127 @@
-// NanoBanana Web — Frontend JavaScript
+// NanoBanana Web — Frontend JavaScript (Full Feature Parity)
 "use strict";
 
 let galleryColumns = 2;
 let favoritesOnly = false;
 let selectedPaths = [];
+let selectionAnchor = null;
 let viewerPath = null;
 let viewerState = null;
 let pollTimer = null;
 let logPollTimer = null;
 let promptSectionCount = 0;
+let mentionMenu = null;
+let mentionTarget = null;
+let refCount = 0;
+let allGalleryPaths = []; // ordered paths for shift-select & viewer nav
+let isGenerating = false;
 
 // ==========================================
 // Init
 // ==========================================
-document.addEventListener("DOMContentLoaded", () => {
-  loadSettings();
+document.addEventListener("DOMContentLoaded", async () => {
+  await loadSettings();
   loadVersion();
   refreshRefs();
-  refreshGallery();
+  await refreshGallery();
   startPolling();
-  addPromptSection();
   setupKeyboardShortcuts();
+  setupClipboardPaste();
+  setupFixedPromptMention();
+  // Show recent projects if gallery is empty
+  checkRecentProjects();
 });
 
+// ==========================================
+// Keyboard Shortcuts (matching original desktop)
+// ==========================================
 function setupKeyboardShortcuts() {
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !document.getElementById("viewerModal").classList.contains("hidden")) {
-      closeViewer();
+    // Escape: close mention menu → close viewer
+    if (e.key === "Escape") {
+      if (mentionMenu) { closeMentionMenu(); return; }
+      if (!document.getElementById("viewerModal").classList.contains("hidden")) {
+        closeViewer(); return;
+      }
       return;
     }
-    const tag = document.activeElement?.tagName;
-    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
 
+    // Ctrl+Enter / Ctrl+NumpadEnter: generate (works even in text fields)
+    if (e.ctrlKey && e.key === "Enter") {
+      e.preventDefault(); generate(); return;
+    }
+
+    const tag = document.activeElement?.tagName;
+    const isText = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+
+    // Ctrl+C: copy selected image (not in text fields)
+    if (e.ctrlKey && (e.key === "c" || e.key === "C") && !isText) {
+      if (selectedPaths.length === 1) { copyToClipboard(selectedPaths[0]); e.preventDefault(); }
+      return;
+    }
+
+    // Ctrl+A: select all gallery
+    if (e.ctrlKey && (e.key === "a" || e.key === "A") && !isText) {
+      selectAll(); e.preventDefault(); return;
+    }
+
+    if (isText) return;
+
+    // Delete: delete selected
     if (e.key === "Delete") { deleteSelected(); e.preventDefault(); }
+    // F: toggle favorite
     if (e.key === "f" || e.key === "F") { favSelected(); e.preventDefault(); }
-    if (e.ctrlKey && (e.key === "a" || e.key === "A")) { selectAll(); e.preventDefault(); }
+    // Arrow keys: viewer navigation
     if (e.key === "ArrowLeft") { navigateViewer(-1); e.preventDefault(); }
     if (e.key === "ArrowRight") { navigateViewer(1); e.preventDefault(); }
   });
 }
 
 // ==========================================
-// API Helpers
+// Clipboard Paste → Reference Image (Ctrl+V)
+// ==========================================
+function setupClipboardPaste() {
+  document.addEventListener("paste", async (e) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    let hasImage = false;
+    for (const item of items) {
+      if (item.type.startsWith("image/")) { hasImage = true; break; }
+    }
+    if (!hasImage) return;
+    e.preventDefault();
+    for (const item of items) {
+      if (item.type.startsWith("image/")) {
+        const blob = item.getAsFile();
+        if (!blob) continue;
+        const form = new FormData();
+        form.append("files", blob, `clipboard_${Date.now()}.png`);
+        const d = await api("/api/refs/upload", { method: "POST", body: form });
+        if (d.added > 0) { refreshRefs(); showToast("Pasted image as reference", "success"); }
+        return;
+      }
+    }
+  });
+}
+
+// ==========================================
+// API Helper
 // ==========================================
 async function api(url, opts = {}) {
   if (opts.body && typeof opts.body === "object" && !(opts.body instanceof FormData)) {
     opts.headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
     opts.body = JSON.stringify(opts.body);
   }
-  const r = await fetch(url, opts);
-  return r.json();
+  try {
+    const r = await fetch(url, opts);
+    return r.json();
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 }
 
 // ==========================================
-// Settings
+// Version
 // ==========================================
 async function loadVersion() {
   try {
@@ -64,8 +132,12 @@ async function loadVersion() {
   }
 }
 
+// ==========================================
+// Settings
+// ==========================================
 async function loadSettings() {
   const d = await api("/api/settings");
+  if (!d.model) return;
   document.getElementById("modelSelect").value = d.model;
   document.getElementById("aspectSelect").value = d.aspect;
   document.getElementById("resolutionSelect").value = d.resolution;
@@ -91,8 +163,6 @@ async function loadSettings() {
   } else {
     addPromptSection("");
   }
-
-  // Load API status
   refreshApiStatus();
 }
 
@@ -127,11 +197,9 @@ function onModelChange() {
 
 function updateRefLimitHint(model) {
   const hint = document.getElementById("refLimitHint");
-  if (model === "gemini-2.5-flash-image") {
-    hint.textContent = "Flash model supports up to 3 reference images.";
-  } else {
-    hint.textContent = "3rd-gen models support up to 14 reference images.";
-  }
+  hint.textContent = model === "gemini-2.5-flash-image"
+    ? "Flash model supports up to 3 reference images."
+    : "3rd-gen models support up to 14 reference images.";
 }
 
 // ==========================================
@@ -142,11 +210,31 @@ function addPromptSection(initialText = "") {
   const container = document.getElementById("promptSections");
   const div = document.createElement("div");
   div.className = "prompt-section";
-  div.innerHTML = `<label class="field-label">Prompt ${promptSectionCount}</label>
-    <textarea class="prompt-box prompt-section-box" rows="4" placeholder="Describe the image..."></textarea>`;
-  div.querySelector("textarea").value = initialText;
+
+  const label = document.createElement("label");
+  label.className = "field-label";
+  label.textContent = `Prompt ${promptSectionCount}`;
+  div.appendChild(label);
+
+  const ta = document.createElement("textarea");
+  ta.className = "prompt-box prompt-section-box";
+  ta.rows = 4;
+  ta.placeholder = "Describe the image... Type @ to insert [Image N] tag";
+  ta.value = initialText;
+  ta.addEventListener("input", (e) => onPromptInput(e, ta));
+  ta.addEventListener("keydown", (e) => onPromptKeydown(e, ta));
+  div.appendChild(ta);
+
   container.appendChild(div);
   updateRemovePromptBtn();
+}
+
+function setupFixedPromptMention() {
+  const fp = document.getElementById("fixedPrompt");
+  if (fp) {
+    fp.addEventListener("input", (e) => onPromptInput(e, fp));
+    fp.addEventListener("keydown", (e) => onPromptKeydown(e, fp));
+  }
 }
 
 function removePromptSection() {
@@ -154,7 +242,6 @@ function removePromptSection() {
   if (container.children.length <= 1) return;
   container.removeChild(container.lastElementChild);
   promptSectionCount = container.children.length;
-  // Relabel
   container.querySelectorAll(".field-label").forEach((lbl, i) => lbl.textContent = `Prompt ${i + 1}`);
   updateRemovePromptBtn();
   saveSettings();
@@ -164,7 +251,7 @@ function updateRemovePromptBtn() {
   const btn = document.getElementById("removePromptBtn");
   const count = document.getElementById("promptSections").children.length;
   btn.disabled = count < 2;
-  btn.style.opacity = count < 2 ? "0.5" : "1";
+  btn.style.opacity = count < 2 ? "0.4" : "1";
 }
 
 function resetSetup() {
@@ -180,13 +267,106 @@ function resetSetup() {
 }
 
 // ==========================================
+// @Mention System for [Image N] tags
+// ==========================================
+function onPromptInput(e, textarea) {
+  const pos = textarea.selectionStart;
+  if (pos > 0 && textarea.value[pos - 1] === "@" && refCount > 0) {
+    showMentionMenu(textarea, pos);
+  } else if (mentionMenu) {
+    const before = textarea.value.substring(0, pos);
+    if (before.lastIndexOf("@") === -1) closeMentionMenu();
+  }
+}
+
+function onPromptKeydown(e, textarea) {
+  // Tab navigation between prompt boxes
+  if (e.key === "Tab" && !mentionMenu) {
+    e.preventDefault();
+    const boxes = [...document.querySelectorAll(".prompt-section-box")];
+    const fp = document.getElementById("fixedPrompt");
+    const all = fp ? [fp, ...boxes] : boxes;
+    const idx = all.indexOf(textarea);
+    const next = e.shiftKey ? (idx - 1 + all.length) % all.length : (idx + 1) % all.length;
+    all[next]?.focus();
+    return;
+  }
+  if (!mentionMenu) return;
+  if (e.key === "ArrowDown") { e.preventDefault(); navigateMention(1); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); navigateMention(-1); }
+  else if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); insertMention(); }
+  else if (e.key === "Escape") { e.preventDefault(); closeMentionMenu(); }
+}
+
+function showMentionMenu(textarea, cursorPos) {
+  closeMentionMenu();
+  if (refCount <= 0) return;
+  mentionTarget = { textarea, cursorPos };
+  mentionMenu = document.createElement("div");
+  mentionMenu.className = "mention-menu";
+  mentionMenu.dataset.selected = "0";
+
+  for (let i = 0; i < refCount; i++) {
+    const btn = document.createElement("button");
+    btn.className = "mention-item" + (i === 0 ? " active" : "");
+    btn.textContent = `Image ${i + 1}`;
+    btn.dataset.index = i;
+    btn.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      mentionMenu.dataset.selected = String(i);
+      insertMention();
+    });
+    mentionMenu.appendChild(btn);
+  }
+
+  const rect = textarea.getBoundingClientRect();
+  mentionMenu.style.left = `${rect.left + 20}px`;
+  mentionMenu.style.bottom = `${window.innerHeight - rect.top + 4}px`;
+  mentionMenu.style.top = "auto";
+  document.body.appendChild(mentionMenu);
+}
+
+function navigateMention(dir) {
+  if (!mentionMenu) return;
+  const items = mentionMenu.querySelectorAll(".mention-item");
+  let sel = parseInt(mentionMenu.dataset.selected || "0");
+  items[sel]?.classList.remove("active");
+  sel = (sel + dir + items.length) % items.length;
+  items[sel]?.classList.add("active");
+  mentionMenu.dataset.selected = String(sel);
+}
+
+function insertMention() {
+  if (!mentionMenu || !mentionTarget) return;
+  const sel = parseInt(mentionMenu.dataset.selected || "0");
+  const tag = `[Image ${sel + 1}]`;
+  const ta = mentionTarget.textarea;
+  const pos = mentionTarget.cursorPos;
+  const before = ta.value.substring(0, pos - 1);
+  const after = ta.value.substring(pos);
+  ta.value = before + tag + " " + after;
+  ta.selectionStart = ta.selectionEnd = pos - 1 + tag.length + 1;
+  ta.focus();
+  closeMentionMenu();
+}
+
+function closeMentionMenu() {
+  if (mentionMenu?.parentNode) mentionMenu.parentNode.removeChild(mentionMenu);
+  mentionMenu = null;
+  mentionTarget = null;
+}
+
+document.addEventListener("mousedown", (e) => {
+  if (mentionMenu && !mentionMenu.contains(e.target)) closeMentionMenu();
+});
+
+// ==========================================
 // Naming Controls
 // ==========================================
 function updateNamingControls() {
   const enabled = document.getElementById("namingSwitch").checked;
   const grid = document.getElementById("namingGrid");
-  if (enabled) grid.classList.remove("disabled");
-  else grid.classList.add("disabled");
+  grid.classList.toggle("disabled", !enabled);
 }
 
 // ==========================================
@@ -194,6 +374,7 @@ function updateNamingControls() {
 // ==========================================
 async function refreshRefs() {
   const d = await api("/api/refs");
+  refCount = d.count || 0;
   const grid = document.getElementById("refGrid");
   const empty = document.getElementById("refEmpty");
   grid.innerHTML = "";
@@ -207,22 +388,59 @@ async function refreshRefs() {
   d.refs.forEach((ref, i) => {
     const cell = document.createElement("div");
     cell.className = "ref-cell";
-    cell.innerHTML = `
-      <img src="/api/refs/thumb/${i}?t=${Date.now()}" alt="ref ${i+1}">
-      <div class="ref-actions">
-        <button class="ref-btn pin ${ref.pinned ? 'pinned' : ''}" onclick="togglePin(${i})" title="Pin">${ref.pinned ? '📌' : '📎'}</button>
-        <button class="ref-btn" onclick="removeRef(${i})" title="Remove">✕</button>
-      </div>`;
+
+    // [Image N] label
+    const label = document.createElement("div");
+    label.className = "ref-label";
+    label.textContent = `[Image ${i + 1}]`;
+    cell.appendChild(label);
+
+    const img = document.createElement("img");
+    img.src = `/api/refs/thumb/${i}?t=${Date.now()}`;
+    img.alt = `ref ${i + 1}`;
+    cell.appendChild(img);
+
+    const actions = document.createElement("div");
+    actions.className = "ref-actions";
+
+    // Pin button
+    const pinBtn = document.createElement("button");
+    pinBtn.className = `ref-btn pin${ref.pinned ? " pinned" : ""}`;
+    pinBtn.textContent = ref.pinned ? "Pinned" : "Pin";
+    pinBtn.title = ref.pinned ? "Unpin" : "Pin";
+    pinBtn.addEventListener("click", () => togglePin(i));
+    actions.appendChild(pinBtn);
+
+    // Change button
+    const changeBtn = document.createElement("button");
+    changeBtn.className = "ref-btn change";
+    changeBtn.textContent = "Change";
+    changeBtn.title = "Replace this image";
+    changeBtn.addEventListener("click", () => replaceRef(i));
+    actions.appendChild(changeBtn);
+
+    // Remove button
+    const removeBtn = document.createElement("button");
+    removeBtn.className = "ref-btn";
+    removeBtn.textContent = "\u2715";
+    removeBtn.title = "Remove";
+    removeBtn.addEventListener("click", () => removeRef(i));
+    actions.appendChild(removeBtn);
+
+    cell.appendChild(actions);
     grid.appendChild(cell);
   });
 }
 
 async function browseRefImages() {
   const d = await api("/api/browse-files", { method: "POST" });
-  if (d.ok && d.added > 0) {
-    refreshRefs();
-    showToast(`Added ${d.added} image(s)`, "success");
-  }
+  if (d.ok && d.added > 0) { refreshRefs(); showToast(`Added ${d.added} image(s)`, "success"); }
+}
+
+async function replaceRef(idx) {
+  // Use file browse to replace a single ref
+  const d = await api("/api/browse-replace-ref", { method: "POST", body: { index: idx } });
+  if (d.ok) { refreshRefs(); showToast("Reference replaced", "success"); }
 }
 
 async function removeRef(idx) {
@@ -242,38 +460,25 @@ async function clearRefs(preservePinned = true) {
 
 async function pasteClipboardRef() {
   const d = await api("/api/refs/paste", { method: "POST" });
-  if (d.ok) {
-    refreshRefs();
-    showToast(d.message, "success");
-  } else {
-    showToast(d.message || "No image in clipboard", "warn");
-  }
+  if (d.ok) { refreshRefs(); showToast(d.message, "success"); }
+  else showToast(d.message || "No image in clipboard. Try Ctrl+V.", "warn");
 }
 
-function onRefDragEnter(e) {
-  e.preventDefault();
-  document.getElementById("refArea").classList.add("dragover");
-}
-function onRefDragLeave(e) {
-  document.getElementById("refArea").classList.remove("dragover");
-}
+function onRefDragEnter(e) { e.preventDefault(); document.getElementById("refArea").classList.add("dragover"); }
+function onRefDragLeave(e) { document.getElementById("refArea").classList.remove("dragover"); }
 async function onRefDrop(e) {
   e.preventDefault();
   document.getElementById("refArea").classList.remove("dragover");
   const files = e.dataTransfer?.files;
   if (!files || files.length === 0) return;
-
   const form = new FormData();
   for (const f of files) {
     const ext = f.name.split(".").pop().toLowerCase();
-    if (["png","jpg","jpeg","webp","bmp"].includes(ext)) form.append("files", f);
+    if (["png", "jpg", "jpeg", "webp", "bmp"].includes(ext)) form.append("files", f);
   }
   if ([...form.entries()].length === 0) { showToast("No supported images", "warn"); return; }
   const d = await api("/api/refs/upload", { method: "POST", body: form });
-  if (d.added > 0) {
-    refreshRefs();
-    showToast(`Added ${d.added} image(s)`, "success");
-  }
+  if (d.added > 0) { refreshRefs(); showToast(`Added ${d.added} image(s)`, "success"); }
 }
 
 // ==========================================
@@ -281,11 +486,11 @@ async function onRefDrop(e) {
 // ==========================================
 async function refreshGallery() {
   const d = await api("/api/gallery");
+  if (!d.items) return;
   const grid = document.getElementById("galleryGrid");
   const empty = document.getElementById("emptyState");
   const search = document.getElementById("gallerySearch").value.toLowerCase();
 
-  // Remove non-skeleton children
   grid.querySelectorAll(".card").forEach(c => c.remove());
 
   let items = d.items;
@@ -294,16 +499,10 @@ async function refreshGallery() {
     (it.prompt || "").toLowerCase().includes(search) || (it.filename || "").toLowerCase().includes(search)
   );
 
+  allGalleryPaths = items.map(it => it.filepath);
+
   if (items.length === 0 && !grid.querySelector(".skeleton")) {
-    if (!empty) {
-      const e = document.createElement("div");
-      e.id = "emptyState";
-      e.className = "empty-state";
-      e.innerHTML = "No images yet<br>Configure prompt and click Generate";
-      grid.appendChild(e);
-    } else {
-      empty.style.display = "block";
-    }
+    if (empty) empty.style.display = "block";
   } else {
     if (empty) empty.style.display = "none";
   }
@@ -314,28 +513,60 @@ async function refreshGallery() {
     const card = document.createElement("div");
     card.className = "card" + (selectedPaths.includes(item.filepath) ? " selected" : "");
     card.dataset.path = item.filepath;
+
+    // Image
+    const img = document.createElement("img");
+    img.className = "card-img";
+    img.src = `/api/gallery/thumb?path=${encodeURIComponent(item.filepath)}&size=${getThumbSize()}`;
+    img.loading = "lazy";
+    img.addEventListener("click", () => openViewer(item.filepath));
+    card.appendChild(img);
+
+    // Body
+    const body = document.createElement("div");
+    body.className = "card-body";
+
+    const fname = document.createElement("div");
+    fname.className = "card-filename";
+    fname.title = item.filename;
+    fname.textContent = item.filename;
+    body.appendChild(fname);
+
+    const meta = document.createElement("div");
+    meta.className = "card-meta";
+    const apiBadgeClass = item.api_used === "vertex" ? "vertex" : "studio";
     const apiLabel = item.api_used === "vertex" ? "V" : "S";
-    card.innerHTML = `
-      <img class="card-img" src="/api/gallery/thumb?path=${encodeURIComponent(item.filepath)}&size=${getThumbSize()}"
-           loading="lazy" onclick="openViewer('${escHtml(item.filepath)}')" alt="">
-      <div class="card-body">
-        <div class="card-filename" title="${escHtml(item.filename)}">${escHtml(item.filename)}</div>
-        <div class="card-meta">
-          ${item.elapsed_sec}s <span class="api-badge">${apiLabel}</span>
-          ${item.resolution ? ' &bull; ' + item.resolution : ''} ${item.aspect ? ' &bull; ' + item.aspect : ''}
-        </div>
-        <div class="card-actions">
-          <button class="card-btn fav ${item.favorite ? 'active' : ''}" onclick="event.stopPropagation();toggleFav('${escHtml(item.filepath)}',this)">&#9733;</button>
-          <button class="card-btn" onclick="event.stopPropagation();useAsRef('${escHtml(item.filepath)}')">Use as Ref</button>
-          <button class="card-btn" onclick="event.stopPropagation();openInExplorer('${escHtml(item.filepath)}')">Explorer</button>
-          <button class="card-btn" onclick="event.stopPropagation();showPromptPopup('${escHtml(item.filepath)}','${escHtml(item.prompt)}')">Prompt</button>
-          <button class="card-btn" onclick="event.stopPropagation();loadSetup('${escHtml(item.filepath)}')">Load Setup</button>
-          <button class="card-btn" onclick="event.stopPropagation();copyToClipboard('${escHtml(item.filepath)}')">Copy</button>
-          <button class="card-btn del" onclick="event.stopPropagation();deleteImage('${escHtml(item.filepath)}')">Delete</button>
-        </div>
-      </div>`;
+    meta.innerHTML = `${item.elapsed_sec}s <span class="api-badge ${apiBadgeClass}">${apiLabel}</span>`
+      + (item.resolution ? ` &bull; ${item.resolution}` : "")
+      + (item.aspect ? ` &bull; ${item.aspect}` : "");
+    body.appendChild(meta);
+
+    // Actions row
+    const actions = document.createElement("div");
+    actions.className = "card-actions";
+
+    const makeBtn = (text, cls, handler) => {
+      const b = document.createElement("button");
+      b.className = "card-btn " + cls;
+      b.innerHTML = text;
+      b.addEventListener("click", (e) => { e.stopPropagation(); handler(); });
+      return b;
+    };
+
+    const favBtn = makeBtn("&#9733;", "fav" + (item.favorite ? " active" : ""), () => toggleFav(item.filepath, favBtn));
+    actions.appendChild(favBtn);
+    actions.appendChild(makeBtn("Ref", "ref-btn-card", () => useAsRef(item.filepath)));
+    actions.appendChild(makeBtn("Explorer", "explorer-btn", () => openInExplorer(item.filepath)));
+    actions.appendChild(makeBtn("Prompt", "prompt-btn", () => showPromptPopup(item.prompt)));
+    actions.appendChild(makeBtn("Load", "load-btn", () => loadSetup(item.filepath)));
+    actions.appendChild(makeBtn("Copy", "copy-btn", () => copyToClipboard(item.filepath)));
+    actions.appendChild(makeBtn("Del", "del", () => deleteImage(item.filepath)));
+    body.appendChild(actions);
+    card.appendChild(body);
+
+    // Click: select with Ctrl/Shift support
     card.addEventListener("click", (e) => {
-      if (e.target.closest(".card-actions")) return;
+      if (e.target.closest(".card-actions") || e.target.tagName === "IMG") return;
       selectCard(item.filepath, e);
     });
     grid.appendChild(card);
@@ -343,21 +574,17 @@ async function refreshGallery() {
 }
 
 function getThumbSize() {
+  if (galleryColumns <= 1) return 920;
   if (galleryColumns <= 2) return 560;
   if (galleryColumns <= 4) return 320;
   return 180;
-}
-
-function escHtml(s) {
-  return (s || "").replace(/'/g, "\\'").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 }
 
 function filterGallery() { refreshGallery(); }
 
 function toggleFavFilter() {
   favoritesOnly = !favoritesOnly;
-  const btn = document.getElementById("favFilterBtn");
-  btn.classList.toggle("active", favoritesOnly);
+  document.getElementById("favFilterBtn").classList.toggle("active", favoritesOnly);
   refreshGallery();
 }
 
@@ -369,50 +596,84 @@ function setColumns(n) {
 }
 
 function updateColumnsUI() {
-  const grid = document.getElementById("galleryGrid");
-  grid.className = `gallery-grid cols-${galleryColumns}`;
+  document.getElementById("galleryGrid").className = `gallery-grid cols-${galleryColumns}`;
   document.querySelectorAll(".layout-btn").forEach(b => {
     b.classList.toggle("active", parseInt(b.dataset.cols) === galleryColumns);
   });
 }
 
+// ==========================================
+// Gallery Selection (Ctrl+Click, Shift+Click)
+// ==========================================
 function selectCard(filepath, e) {
-  if (e && e.ctrlKey) {
+  if (e?.shiftKey && selectionAnchor) {
+    // Shift+Click: range select
+    const startIdx = allGalleryPaths.indexOf(selectionAnchor);
+    const endIdx = allGalleryPaths.indexOf(filepath);
+    if (startIdx >= 0 && endIdx >= 0) {
+      const lo = Math.min(startIdx, endIdx);
+      const hi = Math.max(startIdx, endIdx);
+      selectedPaths = allGalleryPaths.slice(lo, hi + 1);
+    }
+  } else if (e?.ctrlKey) {
+    // Ctrl+Click: toggle single
     if (selectedPaths.includes(filepath)) {
       selectedPaths = selectedPaths.filter(p => p !== filepath);
     } else {
       selectedPaths.push(filepath);
     }
+    selectionAnchor = filepath;
   } else {
+    // Normal click: single select
     selectedPaths = [filepath];
+    selectionAnchor = filepath;
   }
+  updateSelectionUI();
+}
+
+function selectAll() {
+  selectedPaths = [...allGalleryPaths];
+  updateSelectionUI();
+}
+
+function updateSelectionUI() {
   document.querySelectorAll(".card").forEach(c => {
     c.classList.toggle("selected", selectedPaths.includes(c.dataset.path));
   });
 }
 
-function selectAll() {
-  selectedPaths = [];
-  document.querySelectorAll(".card").forEach(c => {
-    selectedPaths.push(c.dataset.path);
-    c.classList.add("selected");
-  });
-}
-
+// ==========================================
+// Gallery Actions
+// ==========================================
 async function deleteImage(filepath) {
+  // Check if favorited (matching original: cannot delete favorited)
+  const card = document.querySelector(`.card[data-path="${CSS.escape(filepath)}"]`);
+  const favBtn = card?.querySelector(".card-btn.fav.active");
+  if (favBtn) {
+    showToast("Unfavorite first before deleting", "warn");
+    return;
+  }
   if (!confirm("Delete this image?")) return;
   const d = await api("/api/gallery/delete", { method: "POST", body: { paths: [filepath] } });
   if (d.deleted > 0) {
     selectedPaths = selectedPaths.filter(p => p !== filepath);
     refreshGallery();
     showToast("Deleted", "success");
-  } else if (d.errors.length) {
+  } else if (d.errors?.length) {
     showToast(d.errors[0], "error");
   }
 }
 
 async function deleteSelected() {
   if (selectedPaths.length === 0) return;
+  // Check if any are favorited
+  for (const p of selectedPaths) {
+    const card = document.querySelector(`.card[data-path="${CSS.escape(p)}"]`);
+    if (card?.querySelector(".card-btn.fav.active")) {
+      showToast("Some images are favorited. Unfavorite them first.", "warn");
+      return;
+    }
+  }
   if (!confirm(`Delete ${selectedPaths.length} image(s)?`)) return;
   const d = await api("/api/gallery/delete", { method: "POST", body: { paths: [...selectedPaths] } });
   selectedPaths = [];
@@ -433,10 +694,7 @@ async function toggleFav(filepath, btn) {
 
 async function useAsRef(filepath) {
   const d = await api("/api/gallery/use-as-ref", { method: "POST", body: { filepath } });
-  if (d.ok) {
-    refreshRefs();
-    showToast("Added as reference", "success");
-  }
+  if (d.ok) { refreshRefs(); showToast("Added as reference", "success"); }
 }
 
 async function openInExplorer(filepath) {
@@ -445,12 +703,8 @@ async function openInExplorer(filepath) {
 
 async function loadSetup(filepath) {
   const d = await api("/api/gallery/load-setup", { method: "POST", body: { filepath } });
-  if (d.ok) {
-    await loadSettings();
-    showToast("Loaded saved setup", "success");
-  } else {
-    showToast(d.error || "Failed", "error");
-  }
+  if (d.ok) { await loadSettings(); refreshRefs(); showToast("Loaded saved setup", "success"); }
+  else showToast(d.error || "Failed", "error");
 }
 
 async function copyToClipboard(filepath) {
@@ -458,12 +712,18 @@ async function copyToClipboard(filepath) {
   showToast(d.ok ? "Copied to clipboard" : (d.error || "Failed"), d.ok ? "success" : "error");
 }
 
-function showPromptPopup(filepath, prompt) {
-  const decoded = prompt.replace(/\\'/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<');
-  const text = decoded || "(no prompt)";
-  const w = window.open("", "_blank", "width=500,height=300");
+function showPromptPopup(prompt) {
+  const text = prompt || "(no prompt)";
+  const w = window.open("", "_blank", "width=560,height=360");
   if (w) {
-    w.document.write(`<html><head><title>Prompt</title><style>body{background:#2C2C2E;color:#F5F5F7;font-family:sans-serif;padding:20px;white-space:pre-wrap;word-break:break-all;}</style></head><body>${text.replace(/</g,'&lt;')}</body></html>`);
+    w.document.write(`<!DOCTYPE html><html><head><title>Prompt</title><style>
+body{background:#2C2C2E;color:#F5F5F7;font-family:'Malgun Gothic',sans-serif;padding:16px;}
+pre{white-space:pre-wrap;word-break:break-all;font-size:11px;line-height:1.6;background:#1C1C1E;padding:12px;border-radius:10px;border:1px solid #48484A;}
+button{margin-top:10px;padding:8px 20px;background:#D4A574;border:none;border-radius:8px;cursor:pointer;font-weight:bold;color:#1C1C1E;font-size:11px;}
+button:hover{background:#C4956A;}
+h3{font-size:13px;margin-bottom:8px;}
+</style></head><body><h3>Prompt</h3><pre>${text.replace(/</g, "&lt;")}</pre>
+<button onclick="navigator.clipboard.writeText(document.querySelector('pre').textContent);this.textContent='Copied!'">Copy</button></body></html>`);
   }
 }
 
@@ -473,14 +733,10 @@ function showPromptPopup(filepath, prompt) {
 async function generate() {
   await saveSettings();
   const d = await api("/api/generate", { method: "POST" });
-  if (!d.ok) {
-    showToast(d.error || "Cannot generate", "error");
-    return;
-  }
+  if (!d.ok) { showToast(d.error || "Cannot generate", "error"); return; }
   showToast(`Generating ${d.count} image(s)...`, "success");
   updateGenUI(true);
 
-  // Add skeleton cards
   const grid = document.getElementById("galleryGrid");
   const empty = document.getElementById("emptyState");
   if (empty) empty.style.display = "none";
@@ -499,14 +755,11 @@ async function stopGenerate() {
 }
 
 function updateGenUI(generating) {
+  isGenerating = generating;
   document.getElementById("genBtn").disabled = generating;
   document.getElementById("topGenBtn").disabled = generating;
   document.getElementById("stopBtn").disabled = !generating;
-  if (generating) {
-    document.getElementById("genBtn").textContent = "Generating...";
-  } else {
-    document.getElementById("genBtn").textContent = "Generate";
-  }
+  document.getElementById("genBtn").textContent = generating ? "Generating..." : "Generate";
 }
 
 // ==========================================
@@ -521,10 +774,8 @@ function startPolling() {
 async function pollEvents() {
   const d = await api("/api/events");
   if (!d.events || d.events.length === 0) return;
-
   for (const ev of d.events) {
     if (ev.type === "image_done") {
-      // Remove one skeleton
       const skel = document.querySelector(".skeleton");
       if (skel) skel.remove();
       refreshGallery();
@@ -537,37 +788,34 @@ async function pollEvents() {
       document.querySelectorAll(".skeleton").forEach(s => s.remove());
       updateGenUI(false);
       refreshGallery();
-      const done = ev.done || 0;
-      const failed = ev.failed || 0;
-      document.getElementById("progressLabel").textContent = `Done  ok ${done}  fail ${failed}`;
-      document.getElementById("progressFill").style.width = done > 0 ? "100%" : "0%";
-      document.getElementById("statusLabel").textContent = `Completed  ${done} image(s) saved`;
+      document.getElementById("progressLabel").textContent = `Done  ok ${ev.done || 0}  fail ${ev.failed || 0}`;
+      document.getElementById("progressFill").style.width = (ev.done || 0) > 0 ? "100%" : "0%";
+      document.getElementById("statusLabel").textContent = `Completed  ${ev.done || 0} image(s) saved`;
     }
   }
 }
 
 function updateProgress(current, total) {
-  if (total > 0) {
-    document.getElementById("progressFill").style.width = `${(current / total) * 100}%`;
-  }
+  if (total > 0) document.getElementById("progressFill").style.width = `${(current / total) * 100}%`;
   document.getElementById("progressLabel").textContent = `${current}/${total}`;
   document.getElementById("statusLabel").textContent = `Generating ${current}/${total}...`;
 }
 
 async function pollLogs() {
   const d = await api("/api/logs");
+  if (!d.logs) return;
   const box = document.getElementById("logBox");
-  box.textContent = (d.logs || []).join("\n");
+  box.textContent = d.logs.join("\n");
   box.scrollTop = box.scrollHeight;
 }
 
 async function refreshApiStatus() {
   const d = await api("/api/status");
-  const vDot = document.getElementById("vertexDot");
-  const sDot = document.getElementById("studioDot");
-  vDot.className = "dot " + d.vertex;
-  sDot.className = "dot " + d.studio;
-  if (d.is_generating) updateGenUI(true);
+  if (!d.vertex) return;
+  document.getElementById("vertexDot").className = "dot " + d.vertex;
+  document.getElementById("studioDot").className = "dot " + d.studio;
+  if (d.is_generating && !isGenerating) updateGenUI(true);
+  if (!d.is_generating && isGenerating) { updateGenUI(false); refreshGallery(); }
 }
 
 // ==========================================
@@ -575,10 +823,7 @@ async function refreshApiStatus() {
 // ==========================================
 async function browseFolder() {
   const d = await api("/api/browse-folder", { method: "POST" });
-  if (d.ok) {
-    document.getElementById("folderInput").value = d.folder;
-    showToast("Folder set", "success");
-  }
+  if (d.ok) { document.getElementById("folderInput").value = d.folder; showToast("Folder set", "success"); }
 }
 
 async function saveProject() {
@@ -589,12 +834,95 @@ async function saveProject() {
 
 async function loadProject() {
   const d = await api("/api/browse-project", { method: "POST" });
-  if (d.ok) {
-    await loadSettings();
-    refreshGallery();
-    refreshRefs();
-    showToast("Project loaded", "success");
-  }
+  if (d.ok) { await loadSettings(); refreshGallery(); refreshRefs(); showToast("Project loaded", "success"); }
+}
+
+// ==========================================
+// Recent Projects Picker (on startup)
+// ==========================================
+async function checkRecentProjects() {
+  // Only show if gallery is empty
+  if (allGalleryPaths.length > 0) return;
+  const d = await api("/api/project/recent");
+  if (!d.projects || d.projects.length === 0) return;
+  showProjectsModal(d.projects);
+}
+
+function showProjectsModal(projects) {
+  const modal = document.getElementById("projectsModal");
+  const list = document.getElementById("projectsList");
+  list.innerHTML = "";
+
+  projects.forEach(p => {
+    const card = document.createElement("div");
+    card.className = "project-card";
+    card.addEventListener("click", () => { loadProjectByPath(p.filepath); closeProjectsModal(); });
+
+    // Preview
+    const preview = document.createElement("div");
+    preview.className = "project-preview";
+    if (p.preview_path) {
+      const img = document.createElement("img");
+      img.src = `/api/gallery/thumb?path=${encodeURIComponent(p.preview_path)}&size=128`;
+      preview.appendChild(img);
+    } else {
+      const noP = document.createElement("div");
+      noP.className = "no-preview";
+      noP.textContent = "No preview";
+      preview.appendChild(noP);
+    }
+    card.appendChild(preview);
+
+    // Info
+    const info = document.createElement("div");
+    info.className = "project-info";
+    const name = document.createElement("div");
+    name.className = "project-name";
+    name.textContent = p.name;
+    info.appendChild(name);
+
+    const meta = document.createElement("div");
+    meta.className = "project-meta";
+    const relTime = formatRelativeTime(p.modified_at);
+    meta.textContent = `${relTime} \u2022 ${p.image_count} image(s)`;
+    info.appendChild(meta);
+
+    const prompt = document.createElement("div");
+    prompt.className = "project-prompt";
+    const pText = (p.prompt || "").replace(/\n/g, " ").trim() || "No prompt saved";
+    prompt.textContent = pText.length > 84 ? pText.substring(0, 81) + "..." : pText;
+    info.appendChild(prompt);
+
+    card.appendChild(info);
+    list.appendChild(card);
+  });
+
+  modal.classList.remove("hidden");
+}
+
+function closeProjectsModal() {
+  document.getElementById("projectsModal").classList.add("hidden");
+}
+
+async function loadProjectByPath(filepath) {
+  const d = await api("/api/project/load", { method: "POST", body: { filepath } });
+  if (d.ok) { await loadSettings(); refreshGallery(); refreshRefs(); showToast("Project loaded", "success"); }
+}
+
+async function loadProjectFromBrowser() {
+  closeProjectsModal();
+  await loadProject();
+}
+
+function formatRelativeTime(timestamp) {
+  if (!timestamp) return "Unknown";
+  const delta = Math.max(0, Math.floor(Date.now() / 1000 - timestamp));
+  if (delta < 60) return "Just now";
+  const min = Math.floor(delta / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  return `${Math.floor(hr / 24)}d ago`;
 }
 
 // ==========================================
@@ -608,57 +936,57 @@ document.getElementById("toggleSidebar").addEventListener("click", () => {
 });
 
 // ==========================================
-// Image Viewer
+// Image Viewer (persistent navigation)
 // ==========================================
 function openViewer(filepath) {
   const modal = document.getElementById("viewerModal");
   const canvas = document.getElementById("viewerCanvas");
-  const ctx = canvas.getContext("2d");
-
   modal.classList.remove("hidden");
   viewerPath = filepath;
 
   const img = new window.Image();
   img.onload = () => {
-    viewerState = {
-      img, scale: 1, offsetX: 0, offsetY: 0, dragging: false, lastX: 0, lastY: 0,
-    };
+    viewerState = { img, scale: 1, offsetX: 0, offsetY: 0, dragging: false, lastX: 0, lastY: 0 };
     fitViewer();
   };
   img.src = `/api/gallery/image?path=${encodeURIComponent(filepath)}`;
-
   document.getElementById("viewerTitle").textContent = filepath.split(/[/\\]/).pop();
 
-  // Load prompt
-  fetch(`/api/gallery`).then(r => r.json()).then(d => {
-    const item = d.items.find(it => it.filepath === filepath);
+  // Load prompt for footer
+  fetch("/api/gallery").then(r => r.json()).then(d => {
+    const item = (d.items || []).find(it => it.filepath === filepath);
     document.getElementById("viewerPrompt").textContent = item ? item.prompt : "";
   });
 
-  canvas.onmousedown = (e) => { if (viewerState) { viewerState.dragging = true; viewerState.lastX = e.clientX; viewerState.lastY = e.clientY; canvas.style.cursor = "grabbing"; } };
-  canvas.onmousemove = (e) => {
-    if (!viewerState?.dragging) return;
-    viewerState.offsetX += e.clientX - viewerState.lastX;
-    viewerState.offsetY += e.clientY - viewerState.lastY;
-    viewerState.lastX = e.clientX;
-    viewerState.lastY = e.clientY;
-    renderViewer();
-  };
-  canvas.onmouseup = () => { if (viewerState) { viewerState.dragging = false; canvas.style.cursor = "grab"; } };
-  canvas.onwheel = (e) => {
-    if (!viewerState) return;
-    e.preventDefault();
-    const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-    const rect = canvas.getBoundingClientRect();
-    const cx = e.clientX - rect.left;
-    const cy = e.clientY - rect.top;
-    const imgX = (cx - viewerState.offsetX) / viewerState.scale;
-    const imgY = (cy - viewerState.offsetY) / viewerState.scale;
-    viewerState.scale = Math.max(0.05, Math.min(10, viewerState.scale * factor));
-    viewerState.offsetX = cx - imgX * viewerState.scale;
-    viewerState.offsetY = cy - imgY * viewerState.scale;
-    renderViewer();
-  };
+  // Bind canvas events (only once)
+  if (!canvas._bound) {
+    canvas.onmousedown = (e) => {
+      if (viewerState) { viewerState.dragging = true; viewerState.lastX = e.clientX; viewerState.lastY = e.clientY; canvas.style.cursor = "grabbing"; }
+    };
+    canvas.onmousemove = (e) => {
+      if (!viewerState?.dragging) return;
+      viewerState.offsetX += e.clientX - viewerState.lastX;
+      viewerState.offsetY += e.clientY - viewerState.lastY;
+      viewerState.lastX = e.clientX; viewerState.lastY = e.clientY;
+      renderViewer();
+    };
+    canvas.onmouseup = () => { if (viewerState) { viewerState.dragging = false; canvas.style.cursor = "grab"; } };
+    canvas.onwheel = (e) => {
+      if (!viewerState) return;
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      const rect = canvas.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      const imgX = (cx - viewerState.offsetX) / viewerState.scale;
+      const imgY = (cy - viewerState.offsetY) / viewerState.scale;
+      viewerState.scale = Math.max(0.05, Math.min(10, viewerState.scale * factor));
+      viewerState.offsetX = cx - imgX * viewerState.scale;
+      viewerState.offsetY = cy - imgY * viewerState.scale;
+      renderViewer();
+    };
+    canvas._bound = true;
+  }
 }
 
 function fitViewer() {
@@ -682,9 +1010,8 @@ function renderViewer() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
-  const w = viewerState.img.width * viewerState.scale;
-  const h = viewerState.img.height * viewerState.scale;
-  ctx.drawImage(viewerState.img, viewerState.offsetX, viewerState.offsetY, w, h);
+  ctx.drawImage(viewerState.img, viewerState.offsetX, viewerState.offsetY,
+    viewerState.img.width * viewerState.scale, viewerState.img.height * viewerState.scale);
 }
 
 function closeViewer() {
@@ -694,10 +1021,10 @@ function closeViewer() {
 }
 
 function navigateViewer(step) {
+  if (!viewerPath && !document.getElementById("viewerModal").classList.contains("hidden")) return;
   if (!viewerPath) return;
-  const cards = [...document.querySelectorAll(".card")];
-  if (cards.length === 0) return;
-  const paths = cards.map(c => c.dataset.path);
+  const paths = allGalleryPaths;
+  if (paths.length === 0) return;
   let idx = paths.indexOf(viewerPath);
   if (idx === -1) idx = 0;
   else idx = (idx + step + paths.length) % paths.length;
@@ -715,7 +1042,7 @@ function showToast(msg, kind = "info") {
   t.textContent = msg;
   t.className = "toast " + kind;
   if (toastTimer) clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.classList.add("hidden"); }, 2200);
+  toastTimer = setTimeout(() => t.classList.add("hidden"), 2000);
 }
 
 // ==========================================
@@ -724,5 +1051,5 @@ function showToast(msg, kind = "info") {
 ["aspectSelect", "resolutionSelect", "countSelect", "namingSwitch",
  "namingPrefix", "namingDelimiter", "namingIndexPrefix", "namingPadding"].forEach(id => {
   const el = document.getElementById(id);
-  if (el) el.addEventListener("change", () => { saveSettings(); });
+  if (el) el.addEventListener("change", () => saveSettings());
 });

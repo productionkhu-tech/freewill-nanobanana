@@ -119,6 +119,9 @@ def open_with_selenium(url):
         options.add_argument("--disable-infobars")
         options.add_argument("--no-first-run")
         options.add_argument("--no-default-browser-check")
+        options.add_argument("--disable-application-cache")
+        options.add_argument("--disk-cache-size=0")
+        options.add_argument("--aggressive-cache-discard")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
 
         try:
@@ -138,6 +141,9 @@ def open_with_selenium(url):
             edge_opts.add_argument("--disable-infobars")
             edge_opts.add_argument("--no-first-run")
             edge_opts.add_argument("--no-default-browser-check")
+            edge_opts.add_argument("--disable-application-cache")
+            edge_opts.add_argument("--disk-cache-size=0")
+            edge_opts.add_argument("--aggressive-cache-discard")
             edge_opts.add_experimental_option("excludeSwitches", ["enable-automation"])
             driver = webdriver.Edge(options=edge_opts)
             print("  Opened in Edge (app mode)")
@@ -170,6 +176,8 @@ def open_with_subprocess(url):
                     "--window-size=1500,920",
                     "--no-first-run",
                     "--no-default-browser-check",
+                    "--disable-application-cache",
+                    "--disk-cache-size=0",
                 ])
                 print(f"  Opened with: {os.path.basename(path)} (app mode)")
                 return True
@@ -256,6 +264,16 @@ def main():
     print("=" * 50)
     print("  NanoBanana Web - AI Image Studio")
     print("=" * 50)
+
+    # --- Clear Chrome cache on startup ---
+    import shutil
+    for cache_dir in ["Default/Cache", "Default/Code Cache", "Default/Service Worker"]:
+        p = os.path.join(APP_PROFILE_DIR, cache_dir)
+        if os.path.isdir(p):
+            try:
+                shutil.rmtree(p, ignore_errors=True)
+            except Exception:
+                pass
 
     # --- Duplicate instance check ---
     if not acquire_mutex():

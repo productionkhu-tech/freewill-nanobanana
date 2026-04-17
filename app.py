@@ -1219,10 +1219,15 @@ def _fetch_release_notes(version_tag):
 
 @app.route("/api/release-notes-check")
 def release_notes_check():
-    """Called once on app startup. If the current VERSION differs from the
-    last-seen version recorded on disk, returns the new version's release
-    notes so the frontend can show a "What's new" popup. Marks the current
-    version as seen so the popup only shows once per install."""
+    """Called once on app startup. Shows the popup whenever we can tell the
+    user just got a newer version than what they previously saw.
+
+    Detection strategy (in priority order):
+      1. last_seen file exists with a DIFFERENT version → show
+      2. last_seen missing BUT user_updates/ overlay exists (= user just
+         updated from an older EXE that had no release-notes endpoint) → show
+      3. last_seen missing AND no overlay → brand-new install, don't show
+    """
     current = _read_version()
     vfile = _last_seen_version_file()
     try:
@@ -1231,9 +1236,18 @@ def release_notes_check():
     except Exception:
         last = ""
 
-    # Show only when we have a real previous version to compare against
-    # (suppresses popup on a brand-new install)
-    show = bool(last) and last != current
+    # Detect "updated from a pre-release-notes version"
+    post_update_migration = False
+    if not last:
+        # Was there an overlay created by the auto-updater?
+        if getattr(sys, "frozen", False):
+            overlay = os.path.join(
+                os.path.dirname(sys.executable), "user_updates", "VERSION"
+            )
+            if os.path.isfile(overlay):
+                post_update_migration = True
+
+    show = (bool(last) and last != current) or post_update_migration
     notes = ""
     if show:
         notes = _fetch_release_notes(current)

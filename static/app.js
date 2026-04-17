@@ -30,12 +30,36 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupKeyboardShortcuts();
   setupClipboardPaste();
   setupFixedPromptMention();
+  await checkReleaseNotes();   // show "What's new" popup if first launch after update
   checkRecentProjects();
   try {
     const d = await api("/api/delete-confirm-state");
     _skipDeleteConfirm = !!d.skip;
   } catch (e) { /* ignore */ }
 });
+
+// ==========================================
+// Release notes "what's new" popup (first launch after update)
+// ==========================================
+async function checkReleaseNotes() {
+  try {
+    const d = await api("/api/release-notes-check");
+    if (!d.show) return;
+    document.getElementById("rnVersion").textContent = d.version || "";
+    const prevEl = document.getElementById("rnPrevious");
+    if (d.previous) {
+      prevEl.textContent = `  (이전: ${d.previous})`;
+    } else {
+      prevEl.textContent = "";
+    }
+    document.getElementById("rnNotes").textContent = d.notes || "새로운 버전이 적용되었습니다.";
+    document.getElementById("releaseNotesModal").classList.remove("hidden");
+  } catch (e) { /* network/server down — skip silently */ }
+}
+
+function closeReleaseNotes() {
+  document.getElementById("releaseNotesModal").classList.add("hidden");
+}
 
 // ==========================================
 // Keyboard Shortcuts

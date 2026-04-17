@@ -1120,6 +1120,77 @@ def _read_version():
 _BUILD_ID = str(int(time.time()))
 
 
+# --- Release-notes-on-first-launch-after-update ---
+def _user_data_dir():
+    d = os.path.join(os.path.expanduser("~"), ".nanobanana")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def _last_seen_version_file():
+    return os.path.join(_user_data_dir(), "last_seen_version.txt")
+
+
+def _fetch_release_notes(version_tag):
+    """Fetch release body from GitHub for the given tag. Returns "" on any error."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/productionkhu-tech/freewill-nanobanana/releases/tags/{version_tag}",
+            headers={
+                "User-Agent": "NanoBanana",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return (data.get("body") or "").strip()
+    except Exception as e:
+        print(f"  release notes fetch failed: {e}")
+        return ""
+
+
+@app.route("/api/release-notes-check")
+def release_notes_check():
+    """Called once on app startup. If the current VERSION differs from the
+    last-seen version recorded on disk, returns the new version's release
+    notes so the frontend can show a "What's new" popup. Marks the current
+    version as seen so the popup only shows once per install."""
+    current = _read_version()
+    vfile = _last_seen_version_file()
+    try:
+        with open(vfile, "r", encoding="utf-8") as f:
+            last = f.read().strip()
+    except Exception:
+        last = ""
+
+    # Show only when we have a real previous version to compare against
+    # (suppresses popup on a brand-new install)
+    show = bool(last) and last != current
+    notes = ""
+    if show:
+        notes = _fetch_release_notes(current)
+        if not notes:
+            notes = "새로운 버전이 적용되었습니다."
+
+    # Record current as seen so popup doesn't show again
+    try:
+        with open(vfile, "w", encoding="utf-8") as f:
+            f.write(current)
+    except Exception:
+        pass
+
+    return jsonify({
+        "show": show,
+        "version": current,
+        "previous": last,
+        "notes": notes,
+    })
+
+
 @app.after_request
 def _no_cache_static(resp):
     """Force fresh CSS/JS on every request so pywebview's WebView2 cache

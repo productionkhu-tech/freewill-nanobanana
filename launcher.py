@@ -251,12 +251,44 @@ def main():
                 f"포트 {PORT}가 사용 중입니다. 다른 프로그램을 종료하고 다시 실행해주세요."
             )
 
-    # Auto-update check (git pull if available)
+    # Auto-update check — show Yes/No dialog, user decides
     try:
-        from updater import run_update_check
-        if run_update_check():
-            print("  Update applied, restarting...")
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+        from updater import check_for_update, download_and_overlay
+        has_update, current, remote = check_for_update()
+        print(f"  Local={current}  Remote={remote}  HasUpdate={has_update}")
+        if has_update:
+            try:
+                import ctypes
+                MB_YESNO = 0x04
+                MB_ICONINFO = 0x40
+                MB_TOPMOST = 0x00040000
+                IDYES = 6
+                msg = (
+                    f"새 버전이 있어요!\n\n"
+                    f"현재 버전: {current}\n"
+                    f"최신 버전: {remote}\n\n"
+                    f"지금 업데이트하시겠습니까?\n"
+                    f"(앱이 자동으로 재시작됩니다)"
+                )
+                result = ctypes.windll.user32.MessageBoxW(
+                    0, msg, "NanoBanana 업데이트",
+                    MB_YESNO | MB_ICONINFO | MB_TOPMOST
+                )
+                if result == IDYES:
+                    print("  User accepted update — downloading...")
+                    try:
+                        download_and_overlay()
+                        print("  Update applied, restarting...")
+                        os.execv(sys.executable, [sys.executable] + sys.argv)
+                    except Exception as e:
+                        ctypes.windll.user32.MessageBoxW(
+                            0, f"업데이트 실패:\n{e}\n\n현재 버전으로 계속 진행합니다.",
+                            "NanoBanana", 0x10
+                        )
+                else:
+                    print("  User skipped update")
+            except Exception as e:
+                print(f"  Update prompt error: {e}")
     except Exception as e:
         print(f"  Update check: {e}")
 

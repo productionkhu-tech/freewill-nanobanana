@@ -196,6 +196,34 @@
   </div>
 </div>
 
+<!-- RELEASE NOTES MODAL (shown once after an update) -->
+<div id="releaseNotesModal" class="close-modal hidden">
+  <div class="close-dialog" style="width:580px;max-height:80vh">
+    <h2>🎉 업데이트 완료!</h2>
+    <p class="close-desc">
+      <strong id="rnVersion" style="color:var(--accent)"></strong> 버전이 적용되었어요.
+      <span id="rnPrevious" style="color:var(--text3);font-size:10px"></span>
+    </p>
+    <div id="rnNotes" style="
+      background:var(--input-bg);
+      border:1px solid var(--border);
+      border-radius:10px;
+      padding:14px 16px;
+      max-height:320px;
+      overflow-y:auto;
+      font-size:11px;
+      line-height:1.7;
+      white-space:pre-wrap;
+      color:var(--text);
+      margin-bottom:16px;
+      font-family:inherit;
+    "></div>
+    <div class="close-buttons">
+      <button class="btn-accent-sm" onclick="closeReleaseNotes()">확인</button>
+    </div>
+  </div>
+</div>
+
 <!-- DELETE CONFIRM MODAL -->
 <div id="deleteModal" class="close-modal hidden">
   <div class="close-dialog">

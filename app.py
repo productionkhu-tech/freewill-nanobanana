@@ -32,6 +32,13 @@ def _to_rgb_flatten(img, bg_color=(255, 255, 255)):
     every transparent pixel BLACK — PNG logos/icons with alpha become
     unrecognizable black blobs. This helper composites the image onto a
     neutral background so the user sees the actual artwork.
+
+    CRITICAL: must always return a NEW image object. Callers typically do
+    `with Image.open(fp) as img: pil = _to_rgb_flatten(img)` and then rely
+    on `pil` remaining valid AFTER the `with` block closes `img`. If we
+    returned `img` itself for the RGB branch, the close would nuke the
+    stored reference and later thumbnail reads would get "image is closed"
+    errors (seen as broken-image placeholders in the ref panel).
     """
     try:
         if img.mode == "P":
@@ -43,11 +50,10 @@ def _to_rgb_flatten(img, bg_color=(255, 255, 255)):
             bg.paste(img, mask=alpha)
             return bg
         if img.mode != "RGB":
-            return img.convert("RGB")
-        return img
+            return img.convert("RGB")  # convert() already returns a new image
+        return img.copy()               # RGB: clone so the caller's `with` can close safely
     except Exception:
-        # If anything goes sideways, fall back to the old behavior rather
-        # than refusing the image outright.
+        # Fall back to the old behavior rather than refusing the image outright.
         return img.convert("RGB")
 
 # ==========================================

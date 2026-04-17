@@ -71,6 +71,11 @@ function _renderReleaseNotes(raw) {
       .replace(/^#{1,6}\s*/, "")      // ## heading → plain
       .trim();
     if (!line) { flushList(); continue; }
+    // Hide infrastructure lines meant for the updater, not the user.
+    // Covers: "sha256: <hex>", "sha-256:", bare 64-char hex line, size etc.
+    if (/^sha-?256\s*[:=]/i.test(line)) continue;
+    if (/^[0-9a-fA-F]{64}$/.test(line)) continue;
+    if (/^(size|build|commit|hash)\s*[:=]/i.test(line)) continue;
     if (/^[-*]\s+/.test(line)) {
       if (!inList) { out.push("<ul>"); inList = true; }
       out.push(`<li>${esc(line.replace(/^[-*]\s+/, ""))}</li>`);

@@ -1134,14 +1134,10 @@ if getattr(sys, 'frozen', False):
 else:
     _flask_base = os.path.dirname(os.path.abspath(__file__))
 
-# Prefer overlay dirs from auto-updater if set by launcher
-_tpl_dir = os.environ.get("NB_TEMPLATE_DIR") or os.path.join(_flask_base, 'templates')
-_static_dir = os.environ.get("NB_STATIC_DIR") or os.path.join(_flask_base, 'static')
-
 app = Flask(
     __name__,
-    template_folder=_tpl_dir,
-    static_folder=_static_dir,
+    template_folder=os.path.join(_flask_base, 'templates'),
+    static_folder=os.path.join(_flask_base, 'static'),
 )
 state = AppState()
 
@@ -1155,16 +1151,8 @@ def add_no_cache(response):
 
 
 def _read_version():
-    # Priority 1: auto-updater overlay (post-update, next to EXE)
-    if getattr(sys, "frozen", False):
-        overlay = os.path.join(os.path.dirname(sys.executable), "user_updates", "VERSION")
-        if os.path.isfile(overlay):
-            try:
-                with open(overlay, "r", encoding="utf-8") as f:
-                    return f.read().strip()
-            except Exception:
-                pass
-    # Priority 2: bundled VERSION (frozen) or dev copy
+    """VERSION lives inside the PyInstaller bundle (or next to the source
+    file in dev mode). No overlay paths — the updater swaps the whole EXE."""
     candidates = [
         os.path.join(getattr(sys, '_MEIPASS', ''), "VERSION"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"),
@@ -1236,18 +1224,11 @@ def release_notes_check():
     except Exception:
         last = ""
 
-    # Detect "updated from a pre-release-notes version"
-    post_update_migration = False
-    if not last:
-        # Was there an overlay created by the auto-updater?
-        if getattr(sys, "frozen", False):
-            overlay = os.path.join(
-                os.path.dirname(sys.executable), "user_updates", "VERSION"
-            )
-            if os.path.isfile(overlay):
-                post_update_migration = True
-
-    show = (bool(last) and last != current) or post_update_migration
+    # Show when the bundled VERSION is different from what the user last
+    # saw on this machine. Because the updater now swaps the whole EXE,
+    # the new bundled VERSION is guaranteed to match the remote after an
+    # update — so this comparison is reliable.
+    show = bool(last) and last != current
     notes = ""
     if show:
         notes = _fetch_release_notes(current)

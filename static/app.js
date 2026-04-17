@@ -278,7 +278,7 @@ function addPromptSection(initialText = "") {
   const ta = document.createElement("textarea");
   ta.className = "prompt-box prompt-section-box";
   ta.rows = 4;
-  ta.placeholder = "Describe the image... Type @ to insert [Image N] tag";
+  ta.placeholder = "Describe the image... Enter=Generate, Shift+Enter=newline, @ mentions refs";
   ta.value = initialText;
   ta.addEventListener("input", (e) => {
     onPromptInput(e, ta);
@@ -448,6 +448,16 @@ function onPromptKeydown(e, textarea) {
     all[next]?.focus();
     return;
   }
+
+  // Enter (without Shift) → queue a generation.
+  // Shift+Enter keeps the default newline behavior.
+  // When the mention menu is open, Enter still inserts the mention (handled below).
+  if (e.key === "Enter" && !e.shiftKey && !mentionMenu && !_imeComposing) {
+    e.preventDefault();
+    generate();
+    return;
+  }
+
   if (!mentionMenu) return;
   if (e.key === "ArrowDown") { e.preventDefault(); navigateMention(1); }
   else if (e.key === "ArrowUp") { e.preventDefault(); navigateMention(-1); }

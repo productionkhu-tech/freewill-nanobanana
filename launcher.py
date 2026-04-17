@@ -49,30 +49,18 @@ else:
     BUNDLE_DIR = os.path.dirname(os.path.abspath(__file__))
     EXE_DIR = BUNDLE_DIR
 
-# Overlay dir (populated by the auto-updater) takes precedence over the
-# PyInstaller _MEIPASS bundle, so that updated templates/static/app.py
-# are picked up without rebuilding the EXE.
-OVERLAY_DIR = os.path.join(EXE_DIR, "user_updates")
-if os.path.isdir(OVERLAY_DIR):
-    # Prepend to sys.path so `import app` / `updater` prefer overlayed .py
-    sys.path.insert(0, OVERLAY_DIR)
-    # Flask templates/static must be pointed at the overlay as well;
-    # we pass these via env vars consumed by app.py at import time.
-    overlay_tpl = os.path.join(OVERLAY_DIR, "templates")
-    overlay_static = os.path.join(OVERLAY_DIR, "static")
-    if os.path.isdir(overlay_tpl):
-        os.environ["NB_TEMPLATE_DIR"] = overlay_tpl
-    if os.path.isdir(overlay_static):
-        os.environ["NB_STATIC_DIR"] = overlay_static
-    BASE_DIR = OVERLAY_DIR
-else:
-    BASE_DIR = BUNDLE_DIR
-
+BASE_DIR = BUNDLE_DIR
 ICON_PATH = os.path.join(BASE_DIR, "app.ico")
 if not os.path.isfile(ICON_PATH):
-    ICON_PATH = os.path.join(BUNDLE_DIR, "app.ico")
-if not os.path.isfile(ICON_PATH):
     ICON_PATH = None
+
+# Clean up any leftover overlay dir from older versions. The updater no
+# longer uses this approach — we swap the whole EXE instead.
+try:
+    from updater import cleanup_legacy_overlay
+    cleanup_legacy_overlay()
+except Exception:
+    pass
 
 
 # --- Close flow state ---
@@ -251,9 +239,9 @@ def main():
                 f"포트 {PORT}가 사용 중입니다. 다른 프로그램을 종료하고 다시 실행해주세요."
             )
 
-    # Auto-update check — show Yes/No dialog, user decides
+    # Auto-update — Yes/No dialog, user decides. Whole-EXE swap on accept.
     try:
-        from updater import check_for_update, download_and_overlay
+        from updater import check_for_update, apply_update_and_relaunch
         has_update, current, remote = check_for_update()
         print(f"  Local={current}  Remote={remote}  HasUpdate={has_update}")
         if has_update:
@@ -277,22 +265,11 @@ def main():
                 if result == IDYES:
                     print("  User accepted update — downloading...")
                     try:
-                        download_and_overlay()
-                        print("  Update applied, restarting...")
-                        # For onefile EXE, spawn a NEW process and exit this one.
-                        # os.execv reuses the current _MEIxxx temp dir which still
-                        # holds the old bundled files — the overlay wouldn't
-                        # actually take effect until the next cold start.
-                        if getattr(sys, "frozen", False):
-                            import subprocess
-                            subprocess.Popen(
-                                [sys.executable],
-                                creationflags=0x00000008,  # DETACHED_PROCESS
-                                close_fds=True,
-                            )
-                            sys.exit(0)
-                        else:
-                            os.execv(sys.executable, [sys.executable] + sys.argv)
+                        apply_update_and_relaunch(remote)
+                        # A swap script is now running in a detached cmd.
+                        # Exit this process so the script can rename the EXE.
+                        print("  Swap script launched, exiting...")
+                        sys.exit(0)
                     except Exception as e:
                         ctypes.windll.user32.MessageBoxW(
                             0, f"업데이트 실패:\n{e}\n\n현재 버전으로 계속 진행합니다.",

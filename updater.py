@@ -230,56 +230,93 @@ def apply_update_and_relaunch(version_tag):
     #   3. Launch the new EXE
     #   4. Delete itself
     # Pass our PID to the bat so it can force-kill the lingering process if
-    # the polite exit didn't release the EXE handle. Symptom we're fixing:
-    # a previous version's update loop called sys.exit(0) from a daemon
-    # thread, which only kills the thread — the main pywebview loop kept
-    # running, the EXE stayed locked, the swap's rename loop timed out
-    # after 30s, and :fail tried to relaunch the old EXE which the single-
-    # instance mutex immediately blocked. User ended up with no update and
-    # no visible error.
+    # the polite exit didn't release the EXE handle.
+    #
+    # KEY FIX vs v1723 and earlier: `chcp 65001` at the top of the bat.
+    # On Korean Windows the console default codepage is 949 (EUC-KR). When
+    # cmd.exe reads a UTF-8 encoded .bat file in cp949 mode, any Korean
+    # character in a path like "C:\Users\...\나노바나나 api\NanoBanana.exe"
+    # gets mangled into garbage bytes. Every `ren`/`move`/`start` then
+    # silently fails because the mangled path doesn't exist, and the bat
+    # falls through to :fail with no diagnostic. Switching to UTF-8
+    # codepage BEFORE the path variables are expanded fixes this.
+    #
+    # Also writes a log to %TEMP%\nanobanana_update.log so future failures
+    # are debuggable instead of mysterious.
     our_pid = os.getpid()
     bat_body = f"""@echo off
+chcp 65001 >nul 2>&1
 setlocal EnableDelayedExpansion
 set "OLD={exe_path}"
 set "NEW={new_exe_path}"
 set "PID={our_pid}"
+set "BACKUP=%OLD%.old"
+set "LOG=%TEMP%\\nanobanana_update.log"
+
+echo ==== %DATE% %TIME% ==== >> "%LOG%"
+echo OLD="%OLD%" >> "%LOG%"
+echo NEW="%NEW%" >> "%LOG%"
+echo PID=%PID% >> "%LOG%"
+
 set "TRIES=0"
 :wait_loop
-ren "%OLD%" "{exe_name}.tmp" >nul 2>&1
-if not errorlevel 1 goto :do_swap
+REM Probe: if the running EXE releases its file handle, rename succeeds.
+ren "%OLD%" "{exe_name}.old" >nul 2>&1
+if not errorlevel 1 goto :do_move
 set /a TRIES+=1
+echo wait_loop try=!TRIES! rc=%errorlevel% >> "%LOG%"
 if !TRIES! GEQ 6 goto :force_kill
 ping -n 2 127.0.0.1 >nul
 goto :wait_loop
 
 :force_kill
-REM Gentle rename failed 6 times — the old process is still holding the
-REM file. Force-kill by PID and try once more. Then any subsequent retries
-REM use taskkill /IM as a last resort.
+echo force_kill PID=%PID% >> "%LOG%"
 taskkill /F /PID %PID% >nul 2>&1
 ping -n 2 127.0.0.1 >nul
-ren "%OLD%" "{exe_name}.tmp" >nul 2>&1
-if not errorlevel 1 goto :do_swap
+ren "%OLD%" "{exe_name}.old" >nul 2>&1
+if not errorlevel 1 goto :do_move
+echo taskkill by name (last resort) >> "%LOG%"
 taskkill /F /IM "{exe_name}" >nul 2>&1
 ping -n 2 127.0.0.1 >nul
-ren "%OLD%" "{exe_name}.tmp" >nul 2>&1
-if errorlevel 1 goto :fail
+ren "%OLD%" "{exe_name}.old" >nul 2>&1
+if errorlevel 1 (
+    echo rename still failing after both taskkills >> "%LOG%"
+    goto :fail
+)
 
-:do_swap
-ren "%OLD%.tmp" "{exe_name}" >nul 2>&1
-del "%OLD%" >nul 2>&1
+:do_move
+REM OLD has been renamed to OLD.old; the OLD position is empty.
+REM Move NEW into that position (disk-move, not copy, so it's atomic on same volume).
+echo moving "%NEW%" -^> "%OLD%" >> "%LOG%"
 move /y "%NEW%" "%OLD%" >nul 2>&1
-if errorlevel 1 goto :fail
+if errorlevel 1 (
+    echo move failed rc=%errorlevel%, restoring backup >> "%LOG%"
+    if exist "%BACKUP%" ren "%BACKUP%" "{exe_name}" >nul 2>&1
+    goto :fail
+)
+echo move ok, cleaning backup >> "%LOG%"
+del "%BACKUP%" >nul 2>&1
+echo launching new EXE >> "%LOG%"
 start "" "%OLD%"
+echo SUCCESS >> "%LOG%"
 goto :cleanup
 
 :fail
-REM Couldn't replace — launch the old one so user isn't stuck
-if exist "%OLD%" start "" "%OLD%"
+echo FAIL >> "%LOG%"
+REM Try to leave the user SOMETHING runnable.
+if exist "%OLD%" start "" "%OLD%" & goto :cleanup
+if exist "%BACKUP%" (
+    ren "%BACKUP%" "{exe_name}" >nul 2>&1
+    if exist "%OLD%" start "" "%OLD%"
+)
 
 :cleanup
 (goto) 2>nul & del "%~f0"
 """
+    # No BOM — cmd's `chcp 65001` directive at the top switches the
+    # codepage BEFORE the variable assignments are parsed. Writing with
+    # utf-8-sig would put a BOM at byte 0 which cmd treats as garbage
+    # before even seeing @echo off.
     with open(swap_bat, "w", encoding="utf-8") as f:
         f.write(bat_body)
 

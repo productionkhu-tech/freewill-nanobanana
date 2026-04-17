@@ -197,6 +197,64 @@ def is_port_in_use(port):
 # If another NanoBanana is already running, focus its window and exit silently.
 _instance_mutex_handle = None
 
+def _focus_existing_nanobanana_window():
+    """Bring any already-running NanoBanana window to the front.
+
+    Previously we used FindWindowW(None, "NanoBanana") which requires an
+    EXACT title match. The app's JS mutates the title as the project
+    loads ("NanoBanana - project.json *" with a dirty marker), so the
+    exact match missed the window and the user saw nothing happen on a
+    second launch. We now EnumWindows and match any visible top-level
+    window whose title starts with "NanoBanana".
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        found_hwnd = [0]
+
+        def _cb(hwnd, _lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length <= 0:
+                    return True
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                if buf.value.startswith("NanoBanana"):
+                    found_hwnd[0] = hwnd
+                    return False  # stop enumeration
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(EnumWindowsProc(_cb), 0)
+        hwnd = found_hwnd[0]
+        if not hwnd:
+            return False
+
+        # SetForegroundWindow has input-rules restrictions when called from
+        # a non-foreground process. AllowSetForegroundWindow(ASFW_ANY)
+        # lifts the restriction for this call; combined with a restore-
+        # then-foreground sequence this reliably pops the existing window.
+        SW_RESTORE = 9
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        try:
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
+        except Exception:
+            pass
+        user32.SetForegroundWindow(hwnd)
+        return True
+    except Exception as e:
+        print(f"  focus existing window failed: {e}")
+        return False
+
+
 def acquire_single_instance():
     global _instance_mutex_handle
     if sys.platform != "win32":
@@ -205,25 +263,22 @@ def acquire_single_instance():
         import ctypes
         from ctypes import wintypes
         ERROR_ALREADY_EXISTS = 183
-        kernel32 = ctypes.windll.kernel32
+        # CRITICAL: use_last_error=True + ctypes.get_last_error() is the
+        # only reliable way to read Windows' last-error from ctypes. The
+        # default ctypes.windll.kernel32 doesn't preserve GetLastError()
+        # across the Python<->C boundary, so ERROR_ALREADY_EXISTS could
+        # come back as 0 and we'd treat a second launch as the first.
+        # That's what caused the "two windows + port-5656-in-use error"
+        # symptom on a second double-click.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
         kernel32.CreateMutexW.restype = wintypes.HANDLE
-        # Global\\ prefix makes it session-wide; user-space would be \\Local
         _instance_mutex_handle = kernel32.CreateMutexW(
             None, False, "NanoBanana-AIImageStudio-SingleInstance-v1"
         )
-        err = kernel32.GetLastError()
+        err = ctypes.get_last_error()
         if err == ERROR_ALREADY_EXISTS:
-            # Another instance is already running. Focus its window.
-            try:
-                user32 = ctypes.windll.user32
-                hwnd = user32.FindWindowW(None, "NanoBanana")
-                if hwnd:
-                    SW_RESTORE = 9
-                    user32.ShowWindow(hwnd, SW_RESTORE)
-                    user32.SetForegroundWindow(hwnd)
-            except Exception:
-                pass
+            _focus_existing_nanobanana_window()
             return False
         return True
     except Exception as e:
@@ -465,12 +520,18 @@ def main():
             pass
         sys.exit(1)
 
-    # Port collision fallback (rare — single-instance mutex should have caught)
+    # Port collision fallback. If the single-instance mutex check somehow
+    # missed (ctypes GetLastError quirk, session isolation, etc.), the port
+    # being in use is an equally valid signal that another NanoBanana is
+    # running. Focus its window and exit quietly instead of showing a
+    # scary "port 5656 in use" error to the user.
     if is_port_in_use(PORT):
-        show_error_and_exit(
-            "NanoBanana",
-            f"포트 {PORT}가 사용 중입니다. 다른 프로그램을 종료하고 다시 실행해주세요."
-        )
+        print("  Port busy - assuming another instance is running; focusing it.")
+        try:
+            _focus_existing_nanobanana_window()
+        except Exception:
+            pass
+        sys.exit(0)
 
     # Async update check — does NOT block the window from opening. A popup
     # shows later if an update is available. Fixes the "8s black screen"

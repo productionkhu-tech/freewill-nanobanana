@@ -81,6 +81,12 @@ class AppState:
         self.fail_count = 0
         self.discarded_count = 0
         self.queue_count = 0
+        self.max_queued_images = 100
+        self.max_parallel_requests = 100
+        self.pending_jobs = []
+        self.pending_jobs_lock = threading.Lock()
+        self.active_job_count = 0
+        self.skip_delete_confirm = False
         self.output_dir = os.path.join(os.path.expanduser("~"), "Desktop", "NanoBanana_Output")
         self.file_counter = 0
 
@@ -113,8 +119,7 @@ class AppState:
         self.current_project_path = None
         self.project_dirty = False
         self.project_default_save_dir = os.path.join(
-            os.path.expanduser("~/Desktop"),
-            "NanoBanana_Output",
+            os.path.expanduser("~/Documents"),
             "NanoBanana JSON",
         )
 
@@ -142,6 +147,9 @@ class AppState:
 
         # Skip delete confirm for session
         self.skip_delete_confirm = False
+
+        # Close-requested flag (set by launcher when user clicks X)
+        self.close_requested = False
 
     def log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -569,7 +577,7 @@ class AppState:
 
     def delete_gallery_item(self, filepath):
         if filepath in self.favorites:
-            return False, "Unfavorite first"
+            return False, "Unfavorite first", None
         try:
             if os.path.exists(filepath):
                 os.remove(filepath)
@@ -578,13 +586,15 @@ class AppState:
             self.favorites.discard(filepath)
             self.gallery_items.pop(filepath, None)
             # Also remove from refs if present
+            removed_ref_idx = None
+            ref_count_before = len(self.ref_path_list)
             if filepath in self.ref_path_list:
-                idx = self.ref_path_list.index(filepath)
-                self.remove_ref(idx)
+                removed_ref_idx = self.ref_path_list.index(filepath)
+                self.remove_ref(removed_ref_idx)
             self.project_dirty = True
-            return True, "Deleted"
+            return True, "Deleted", {"removed_ref_idx": removed_ref_idx, "ref_count_before": ref_count_before}
         except Exception as e:
-            return False, str(e)[:80]
+            return False, str(e)[:80], None
 
     def toggle_favorite(self, filepath):
         if filepath in self.favorites:
@@ -612,6 +622,11 @@ class AppState:
 
     # --- Project ---
     def get_project_save_dir(self):
+        # Ensure the directory exists so file dialogs actually land here
+        try:
+            os.makedirs(self.project_default_save_dir, exist_ok=True)
+        except Exception:
+            pass
         return self.project_default_save_dir
 
     def default_project_filename(self):
@@ -758,17 +773,30 @@ class AppState:
         return True, f"Loaded {restored} images"
 
     def get_recent_projects(self, limit=6):
-        pdir = self.get_project_save_dir()
-        if not os.path.isdir(pdir):
+        # Scan both the current save dir and the legacy Desktop location
+        search_dirs = [
+            self.get_project_save_dir(),
+            os.path.join(os.path.expanduser("~/Desktop"), "NanoBanana_Output", "NanoBanana JSON"),
+        ]
+        candidates = []
+        seen = set()
+        for pdir in search_dirs:
+            if not pdir or not os.path.isdir(pdir):
+                continue
+            try:
+                for n in os.listdir(pdir):
+                    if not n.lower().endswith(".json"):
+                        continue
+                    fp = os.path.join(pdir, n)
+                    if fp in seen:
+                        continue
+                    seen.add(fp)
+                    candidates.append(fp)
+            except Exception:
+                continue
+        if not candidates:
             return []
         entries = []
-        try:
-            candidates = [
-                os.path.join(pdir, n) for n in os.listdir(pdir)
-                if n.lower().endswith(".json")
-            ]
-        except Exception:
-            return []
         candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         for fp in candidates[:limit]:
             try:
@@ -889,49 +917,64 @@ class AppState:
 
         return {"status": "cancelled", "index": idx, "seed": seed}
 
+    def _pop_pending_job(self):
+        with self.pending_jobs_lock:
+            if not self.pending_jobs:
+                return None
+            job = self.pending_jobs.pop(0)
+            self.active_job_count += 1
+            return job
+
+    def _finish_pending_job(self):
+        with self.pending_jobs_lock:
+            self.active_job_count = max(0, self.active_job_count - 1)
+
+    def get_queue_outstanding(self):
+        with self.pending_jobs_lock:
+            return len(self.pending_jobs) + self.active_job_count
+
+    def get_queue_pending(self):
+        with self.pending_jobs_lock:
+            return len(self.pending_jobs)
+
     def gen_worker(self):
-        prompt = self.compose_prompt()
-        model = self.model
-        aspect = self.aspect
-        resolution = self.resolution
-        naming = self.get_naming_settings()
-        providers = self.get_available_providers()
-        count = self.count
-        modalities = ["IMAGE"]
-
-        img_cfg = {"aspect_ratio": aspect}
-        if "gemini-3" in model:
-            img_cfg["image_size"] = resolution
-
-        ref_snapshots = self.get_effective_ref_images(model)
-        ref_payloads = [self.ref_image_to_bytes(r) for r in ref_snapshots]
-
-        if not providers:
-            self.log("No provider available")
+        try:
+            self._gen_worker_body()
+        except Exception as e:
+            self.log(f"Worker crashed: {str(e)[:120]}")
+        finally:
+            # Always reset state so the user can try again
             self.is_generating = False
             self.cancel_flag = False
-            self.push_event({"type": "done"})
-            return
+            with self.pending_jobs_lock:
+                self.pending_jobs.clear()
+                self.active_job_count = 0
+            self.push_event({"type": "done", "done": self.done_count, "failed": self.fail_count})
 
-        jobs = [
-            {"index": i, "total": count,
-             "seed": random.randint(0, 2147483646),
-             "preferred_provider": providers[i % len(providers)]}
-            for i in range(count)
-        ]
-
-        max_workers = max(1, min(count, 4))
-        pending_idx = 0
+    def _gen_worker_body(self):
+        max_workers = self.max_parallel_requests
         active = {}
 
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="nano-gen") as executor:
-            while pending_idx < len(jobs) or active:
-                while not self.cancel_flag and pending_idx < len(jobs) and len(active) < max_workers:
-                    job = jobs[pending_idx]
-                    pending_idx += 1
-                    fut = executor.submit(
-                        self.generate_one_image, job, prompt, ref_payloads, model, img_cfg, modalities
-                    )
+            while True:
+                # Fill workers from queue
+                while not self.cancel_flag and len(active) < max_workers:
+                    job = self._pop_pending_job()
+                    if job is None:
+                        break
+                    try:
+                        fut = executor.submit(
+                            self.generate_one_image,
+                            {"index": job["index"], "total": 0,
+                             "seed": job["seed"], "preferred_provider": job["preferred_provider"]},
+                            job["prompt"], job["ref_payloads"], job["model"],
+                            job["img_cfg"], ["IMAGE"]
+                        )
+                    except Exception as e:
+                        self.log(f"Submit failed: {str(e)[:120]}")
+                        self._finish_pending_job()
+                        self.fail_count += 1
+                        continue
                     active[fut] = job
 
                 if not active:
@@ -949,14 +992,21 @@ class AppState:
                         result = {"status": "failed", "index": job["index"],
                                   "seed": job["seed"], "error": str(e)[:120], "elapsed": 0}
 
+                    self._finish_pending_job()
                     idx = result["index"]
+                    prompt = job["prompt"]
+                    model = job["model"]
+                    aspect = job["aspect"]
+                    resolution = job["resolution"]
+                    naming = job["naming"]
+
                     if result["status"] == "success":
                         pil = result["image"]
                         elapsed = result["elapsed"]
                         api_used = result["api_used"]
                         seed = result["seed"]
                         fn = self.make_filename(seed, naming)
-                        fp = os.path.join(self.output_dir, fn)
+                        fp = os.path.join(job["output_dir"], fn)
                         self.save_generated_image(pil, fp, prompt, model)
                         self.done_count += 1
 
@@ -966,13 +1016,10 @@ class AppState:
                             "fixed_prompt": self.fixed_prompt,
                             "prompt_sections": list(self.prompt_sections),
                             "model": model, "aspect": aspect, "resolution": resolution,
-                            "count": count, "output_dir": self.output_dir,
+                            "count": 1, "output_dir": job["output_dir"],
                             "naming": naming,
-                            "ref_paths": list(self.ref_path_list),
-                            "pinned_ref_paths": [
-                                p for i, p in enumerate(self.ref_path_list)
-                                if i < len(self.ref_pinned) and self.ref_pinned[i]
-                            ],
+                            "ref_paths": list(job.get("ref_paths", [])),
+                            "pinned_ref_paths": list(job.get("pinned_ref_paths", [])),
                         }
                         self.add_gallery_item(fp, prompt, elapsed, api_used,
                                               aspect=aspect, resolution=resolution,
@@ -985,7 +1032,9 @@ class AppState:
                             "elapsed": round(elapsed, 1),
                             "api_used": api_used,
                             "done": self.done_count,
+                            "failed": self.fail_count,
                             "total": self.queue_count,
+                            "outstanding": self.get_queue_outstanding(),
                         })
                         self.log(f"[{idx+1}] Saved {fn} ({elapsed:.1f}s via {api_used})")
                     elif result["status"] == "failed":
@@ -997,14 +1046,16 @@ class AppState:
                             "done": self.done_count,
                             "failed": self.fail_count,
                             "total": self.queue_count,
+                            "outstanding": self.get_queue_outstanding(),
                         })
                         self.log(f"[{idx+1}] {result.get('error','')} ({result.get('elapsed',0):.1f}s)")
                     else:
                         self.log(f"[{idx+1}] Cancelled")
 
-        self.is_generating = False
-        self.cancel_flag = False
-        self.push_event({"type": "done", "done": self.done_count, "failed": self.fail_count})
+                # Refill loop
+                if self.cancel_flag and not active:
+                    break
+
         self.log(f"Finished: {self.done_count} saved, {self.fail_count} failed")
 
         # Auto-save project
@@ -1028,10 +1079,14 @@ if getattr(sys, 'frozen', False):
 else:
     _flask_base = os.path.dirname(os.path.abspath(__file__))
 
+# Prefer overlay dirs from auto-updater if set by launcher
+_tpl_dir = os.environ.get("NB_TEMPLATE_DIR") or os.path.join(_flask_base, 'templates')
+_static_dir = os.environ.get("NB_STATIC_DIR") or os.path.join(_flask_base, 'static')
+
 app = Flask(
     __name__,
-    template_folder=os.path.join(_flask_base, 'templates'),
-    static_folder=os.path.join(_flask_base, 'static'),
+    template_folder=_tpl_dir,
+    static_folder=_static_dir,
 )
 state = AppState()
 
@@ -1060,10 +1115,51 @@ def _read_version():
     return "unknown"
 
 
+# Unique cache-buster per server start — prevents pywebview's embedded
+# WebView from serving stale CSS/JS after a rebuild.
+_BUILD_ID = str(int(time.time()))
+
+
+@app.after_request
+def _no_cache_static(resp):
+    """Force fresh CSS/JS on every request so pywebview's WebView2 cache
+    never serves stale stylesheets after a rebuild."""
+    ct = resp.headers.get("Content-Type", "")
+    if any(t in ct for t in ("text/css", "application/javascript", "text/html")):
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    return resp
+
+
 @app.route("/")
 def index():
     html = render_template("index.html")
-    return html.replace("__VERSION__", _read_version())
+    html = html.replace("__VERSION__", _read_version() + "." + _BUILD_ID)
+    # Disable browser cache on the main HTML so fresh asset query strings load.
+    resp = Response(html)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    return resp
+
+
+@app.route("/viewer")
+def viewer():
+    """Standalone image viewer window (opened via pywebview create_window)."""
+    html = render_template("viewer.html")
+    html = html.replace("__VERSION__", _read_version() + "." + _BUILD_ID)
+    resp = Response(html)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    return resp
+
+
+@app.route("/prompt-popup")
+def prompt_popup():
+    """Standalone prompt display window."""
+    html = render_template("prompt_popup.html")
+    html = html.replace("__VERSION__", _read_version() + "." + _BUILD_ID)
+    resp = Response(html)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    return resp
 
 
 @app.route("/api/version")
@@ -1073,6 +1169,10 @@ def api_version():
 
 @app.route("/api/status")
 def api_status():
+    outstanding = state.get_queue_outstanding()
+    # Piggyback the close-requested flag here so JS doesn't need a separate poll
+    close_req = state.close_requested
+    state.close_requested = False
     return jsonify({
         "vertex": state.vertex_status,
         "studio": state.studio_status,
@@ -1080,6 +1180,11 @@ def api_status():
         "done": state.done_count,
         "failed": state.fail_count,
         "total": state.queue_count,
+        "outstanding": outstanding,
+        "max_queue": state.max_queued_images,
+        "project_dirty": state.project_dirty,
+        "current_project": state.current_project_path or "",
+        "close_requested": close_req,
     })
 
 
@@ -1159,18 +1264,31 @@ def get_refs():
 
 @app.route("/api/refs/upload", methods=["POST"])
 def upload_refs():
+    import hashlib
     files = request.files.getlist("files")
     added = 0
+    os.makedirs(state.temp_ref_dir, exist_ok=True)
     for f in files:
         ext = os.path.splitext(f.filename)[1].lower()
         if ext not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
             continue
-        # Save to temp then add
-        os.makedirs(state.temp_ref_dir, exist_ok=True)
-        fn = f"upload_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}{ext}"
-        fp = os.path.join(state.temp_ref_dir, fn)
-        f.save(fp)
+
+        # Read bytes once, hash them to dedupe identical content
+        data = f.read()
+        if not data:
+            continue
+        digest = hashlib.sha1(data).hexdigest()[:16]
+        fp = os.path.join(state.temp_ref_dir, f"ref_{digest}{ext}")
+
+        # If a file with this exact content already exists on disk, reuse it
+        if not os.path.exists(fp):
+            with open(fp, "wb") as out:
+                out.write(data)
+
+        # Track so we know it was cached by this app (used for accounting, not deletion)
         state.temp_ref_paths.add(fp)
+
+        # add_ref_image already skips if the same path is already in ref_path_list
         if state.add_ref_image(fp):
             added += 1
     return jsonify({"ok": True, "added": added})
@@ -1320,13 +1438,21 @@ def delete_gallery():
     paths = d.get("paths", [])
     deleted = 0
     errors = []
+    ref_removals = []
     for fp in paths:
-        ok, msg = state.delete_gallery_item(fp)
+        ok, msg, meta = state.delete_gallery_item(fp)
         if ok:
             deleted += 1
+            if meta and meta.get("removed_ref_idx") is not None:
+                ref_removals.append(meta)
         else:
             errors.append(msg)
-    return jsonify({"ok": True, "deleted": deleted, "errors": errors})
+    return jsonify({
+        "ok": True,
+        "deleted": deleted,
+        "errors": errors,
+        "ref_removals": ref_removals,
+    })
 
 
 @app.route("/api/gallery/favorite", methods=["POST"])
@@ -1403,8 +1529,6 @@ def load_setup():
 # --- Generation ---
 @app.route("/api/generate", methods=["POST"])
 def start_generate():
-    if state.is_generating:
-        return jsonify({"ok": False, "error": "Already generating"})
     if not state.client_vertex and not state.client_studio:
         return jsonify({"ok": False, "error": "No API connected"})
 
@@ -1412,22 +1536,88 @@ def start_generate():
     if not prompt:
         return jsonify({"ok": False, "error": "Empty prompt"})
 
+    providers = state.get_available_providers()
+    if not providers:
+        return jsonify({"ok": False, "error": "No provider available"})
+
     os.makedirs(state.output_dir, exist_ok=True)
     naming = state.get_naming_settings()
-    state.prepare_file_counter(naming)
 
-    state.is_generating = True
-    state.cancel_flag = False
-    state.queue_count = state.count
-    state.done_count = 0
-    state.fail_count = 0
-    state.discarded_count = 0
+    was_generating = state.is_generating
+    count = state.count
 
-    providers = state.get_available_providers()
-    state.log(f"Starting {state.count} image(s) across {', '.join(state.get_provider_label(p) for p in providers)}")
+    # Check queue capacity
+    outstanding = state.get_queue_outstanding()
+    if outstanding + count > state.max_queued_images:
+        return jsonify({
+            "ok": False,
+            "error": f"Queue full ({outstanding}/{state.max_queued_images})",
+            "queue_full": True,
+        })
 
-    threading.Thread(target=state.gen_worker, daemon=True).start()
-    return jsonify({"ok": True, "count": state.count})
+    # Snapshot settings for this batch
+    model = state.model
+    aspect = state.aspect
+    resolution = state.resolution
+    img_cfg = {"aspect_ratio": aspect}
+    if "gemini-3" in model:
+        img_cfg["image_size"] = resolution
+    ref_snapshots = state.get_effective_ref_images(model)
+    ref_payloads = [state.ref_image_to_bytes(r) for r in ref_snapshots]
+    ref_paths = list(state.ref_path_list)
+    pinned_ref_paths = [
+        p for i, p in enumerate(state.ref_path_list)
+        if i < len(state.ref_pinned) and state.ref_pinned[i]
+    ]
+
+    base_idx = state.queue_count if was_generating else 0
+    if not was_generating:
+        state.prepare_file_counter(naming)
+        state.queue_count = 0
+        state.done_count = 0
+        state.fail_count = 0
+        state.discarded_count = 0
+
+    new_jobs = []
+    for i in range(count):
+        new_jobs.append({
+            "index": base_idx + i,
+            "seed": random.randint(0, 2147483646),
+            "preferred_provider": providers[i % len(providers)],
+            "prompt": prompt,
+            "model": model,
+            "aspect": aspect,
+            "resolution": resolution,
+            "img_cfg": dict(img_cfg),
+            "naming": dict(naming),
+            "ref_payloads": ref_payloads,
+            "ref_paths": ref_paths,
+            "pinned_ref_paths": pinned_ref_paths,
+            "output_dir": state.output_dir,
+            "fixed_prompt": state.fixed_prompt,
+            "prompt_sections": list(state.prompt_sections),
+        })
+
+    with state.pending_jobs_lock:
+        state.pending_jobs.extend(new_jobs)
+    state.queue_count += count
+
+    if not was_generating:
+        state.is_generating = True
+        state.cancel_flag = False
+        state.log(f"Starting {count} image(s) across {', '.join(state.get_provider_label(p) for p in providers)}")
+        threading.Thread(target=state.gen_worker, daemon=True).start()
+    else:
+        preview = prompt.replace("\n", " ").strip()
+        preview = preview[:56] + ("..." if len(preview) > 56 else "")
+        state.log(f"Queued {count} image(s) (outstanding {state.get_queue_outstanding()}/{state.max_queued_images}) | {preview}")
+
+    return jsonify({
+        "ok": True,
+        "count": count,
+        "queued": was_generating,
+        "outstanding": state.get_queue_outstanding(),
+    })
 
 
 @app.route("/api/stop", methods=["POST"])
@@ -1445,18 +1635,36 @@ def recent_projects():
     return jsonify({"projects": entries})
 
 
+def _sanitize_project_name(name):
+    """Strip illegal Windows filename chars and trim length."""
+    name = (name or "").strip()
+    if not name:
+        return ""
+    bad = '<>:"/\\|?*'
+    cleaned = "".join(c for c in name if c not in bad and ord(c) >= 32)
+    cleaned = cleaned.strip(" .")
+    return cleaned[:80]
+
+
 @app.route("/api/project/save", methods=["POST"])
 def save_project():
     d = request.json or {}
     fp = d.get("filepath", "")
+    name = _sanitize_project_name(d.get("name", ""))
     if not fp:
         save_dir = state.get_project_save_dir()
         os.makedirs(save_dir, exist_ok=True)
-        fp = os.path.join(save_dir, state.default_project_filename())
+        if name:
+            fp = os.path.join(save_dir, f"{name}.json")
+        elif state.current_project_path and os.path.basename(state.current_project_path):
+            # Overwrite existing named project
+            fp = state.current_project_path
+        else:
+            fp = os.path.join(save_dir, state.default_project_filename())
     try:
         state.save_project(fp)
         state.log(f"Project saved: {os.path.basename(fp)}")
-        return jsonify({"ok": True, "filepath": fp})
+        return jsonify({"ok": True, "filepath": fp, "name": os.path.basename(fp)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)[:120]})
 
@@ -1555,7 +1763,7 @@ def browse_project():
         # Default to NanoBanana JSON project folder
         project_dir = state.get_project_save_dir()
         if not os.path.isdir(project_dir):
-            project_dir = os.path.join(os.path.expanduser("~/Desktop"), "NanoBanana_Output")
+            project_dir = os.path.expanduser("~/Documents")
         if not os.path.isdir(project_dir):
             project_dir = state.output_dir
         fp = filedialog.askopenfilename(
@@ -1578,11 +1786,12 @@ def save_project_as():
     try:
         from tkinter import filedialog
         root = _make_dialog_root()
+        initial_dir = state.get_project_save_dir()
         fp = filedialog.asksaveasfilename(
             parent=root,
             title="Save Project",
             defaultextension=".json",
-            initialdir=state.output_dir,
+            initialdir=initial_dir,
             initialfile=state.default_project_filename(),
             filetypes=[("JSON Project", "*.json")],
         )
@@ -1594,6 +1803,64 @@ def save_project_as():
         return jsonify({"ok": False})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)[:80]})
+
+
+# --- Close / save prompt ---
+@app.route("/api/close-requested")
+def close_requested():
+    """JS polls this to detect when user clicked the X button."""
+    requested = state.close_requested
+    # Reset after read so the dialog only triggers once per click
+    state.close_requested = False
+    return jsonify({"close_requested": requested})
+
+
+@app.route("/api/delete-confirm-state")
+def delete_confirm_state():
+    return jsonify({"skip": state.skip_delete_confirm})
+
+
+@app.route("/api/delete-confirm-state", methods=["POST"])
+def set_delete_confirm_state():
+    d = request.json or {}
+    state.skip_delete_confirm = bool(d.get("skip", False))
+    return jsonify({"ok": True, "skip": state.skip_delete_confirm})
+
+
+@app.route("/api/close-info")
+def close_info():
+    has_content = (
+        bool(state.gallery_items)
+        or bool(state.ref_path_list)
+        or bool(state.compose_prompt().strip())
+    )
+    return jsonify({
+        "has_content": has_content,
+        "project_dirty": state.project_dirty,
+        "current_project": state.current_project_path or "",
+        "current_project_name": os.path.basename(state.current_project_path) if state.current_project_path else "",
+        "save_dir": state.get_project_save_dir(),
+    })
+
+
+@app.route("/api/close-save", methods=["POST"])
+def close_save():
+    """Save project (to current path or default location) before closing."""
+    try:
+        d = request.json or {}
+        name = _sanitize_project_name(d.get("name", ""))
+        save_dir = state.get_project_save_dir()
+        os.makedirs(save_dir, exist_ok=True)
+        if name:
+            fp = os.path.join(save_dir, f"{name}.json")
+        elif state.current_project_path:
+            fp = state.current_project_path
+        else:
+            fp = os.path.join(save_dir, state.default_project_filename())
+        state.save_project(fp)
+        return jsonify({"ok": True, "filepath": fp})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:120]})
 
 
 # --- Clipboard copy ---
@@ -1675,13 +1942,10 @@ def init_app():
 
 
 def cleanup():
+    # Only clean up sensitive credentials on exit.
+    # Ref image cache is intentionally preserved so that projects loaded later
+    # can still reference the same file paths (e.g. pasted/uploaded clipboard images).
     state.cleanup_vertex_credentials()
-    for fp in list(state.temp_ref_paths):
-        try:
-            if os.path.exists(fp):
-                os.remove(fp)
-        except Exception:
-            pass
 
 
 atexit.register(cleanup)

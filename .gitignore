@@ -13,6 +13,10 @@ build/
 # Credentials — NEVER commit
 service_account*.json
 credentials*.json
+setup_env.bat
+
+# Auto-updater overlay (user-local, not source)
+user_updates/
 
 # User output
 NanoBanana_Output/

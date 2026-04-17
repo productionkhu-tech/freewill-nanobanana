@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+<title>Prompt</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  background:#2C2C2E;color:#F5F5F7;
+  font-family:'Malgun Gothic','Segoe UI',system-ui,sans-serif;
+  font-size:12px;height:100vh;display:flex;flex-direction:column;overflow:hidden;
+  -webkit-font-smoothing:antialiased;
+}
+header{
+  padding:14px 18px 10px;background:#1C1C1E;border-bottom:1px solid #48484A;
+}
+h1{font-size:14px;font-weight:bold}
+.filename{font-size:10px;color:#A1A1A6;margin-top:4px;font-family:'Cascadia Code',Consolas,monospace}
+main{flex:1;padding:14px 18px;overflow:auto}
+pre{
+  background:#1C1C1E;border:1px solid #48484A;border-radius:10px;
+  padding:14px;font-size:12px;line-height:1.6;color:#F5F5F7;
+  font-family:'Malgun Gothic','Segoe UI',system-ui,sans-serif;
+  white-space:pre-wrap;word-break:break-word;
+}
+footer{padding:10px 18px;background:#1C1C1E;border-top:1px solid #48484A;display:flex;gap:8px;justify-content:flex-end}
+button{
+  padding:8px 20px;border:none;border-radius:8px;cursor:pointer;
+  font-weight:bold;font-size:11px;font-family:inherit;
+  background:#D4A574;color:#1C1C1E;
+}
+button:hover{background:#C4956A}
+button.sec{background:#3A3A3C;color:#A1A1A6}
+button.sec:hover{background:#48484A}
+</style>
+</head>
+<body>
+<header>
+  <h1>Prompt</h1>
+  <div class="filename" id="fname">—</div>
+</header>
+<main>
+  <pre id="body">(loading...)</pre>
+</main>
+<footer>
+  <button class="sec" onclick="window.close()">Close</button>
+  <button onclick="copyAll()" id="copyBtn">Copy</button>
+</footer>
+<script>
+const params = new URLSearchParams(location.search);
+const b64 = params.get("b64") || "";
+const name = decodeURIComponent(params.get("name") || "");
+
+let text = "";
+try { text = atob(b64); text = decodeURIComponent(escape(text)); } catch(e){ text = ""; }
+document.getElementById("body").textContent = text || "(empty)";
+document.getElementById("fname").textContent = name;
+document.title = name ? `Prompt — ${name}` : "Prompt";
+
+function copyAll() {
+  navigator.clipboard.writeText(text).then(() => {
+    const b = document.getElementById("copyBtn");
+    const orig = b.textContent;
+    b.textContent = "Copied!";
+    setTimeout(() => { b.textContent = orig; }, 1200);
+  });
+}
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") window.close();
+});
+</script>
+</body>
+</html>

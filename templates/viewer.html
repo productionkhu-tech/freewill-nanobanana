@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Image Viewer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #050505;
+  color: #F5F5F7;
+  font-family: 'Malgun Gothic','Segoe UI',system-ui,sans-serif;
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  user-select: none;
+}
+header {
+  height: 44px;
+  background: #111;
+  display: flex;
+  align-items: center;
+  padding: 0 14px;
+  flex-shrink: 0;
+  gap: 10px;
+}
+header .title {
+  font-size: 12px;
+  font-weight: bold;
+  color: #F5F5F7;
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+header .nav {
+  display: flex;
+  gap: 6px;
+}
+header .nav button {
+  width: 28px;
+  height: 28px;
+  border: 1px solid #2D2F36;
+  border-radius: 14px;
+  background: #18191C;
+  color: #A1A1A6;
+  font-size: 14px;
+  font-weight: bold;
+  cursor: pointer;
+  font-family: inherit;
+}
+header .nav button:hover { background: #2D2F36; color: #F5F5F7; }
+header .counter {
+  font-size: 10px;
+  color: #636366;
+  font-family: 'Cascadia Code','Consolas',monospace;
+  min-width: 60px;
+  text-align: center;
+}
+header .hint {
+  font-size: 10px;
+  color: #636366;
+}
+#canvas {
+  flex: 1;
+  display: block;
+  background: #050505;
+  cursor: grab;
+}
+#canvas:active { cursor: grabbing; }
+footer {
+  min-height: 48px;
+  max-height: 160px;
+  background: #0F1013;
+  padding: 10px 14px;
+  flex-shrink: 0;
+  overflow-y: auto;
+}
+.label {
+  font-size: 10px;
+  font-weight: bold;
+  color: #636366;
+  margin-bottom: 4px;
+}
+#prompt {
+  font-size: 10px;
+  color: #A1A1A6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
+}
+.empty { color: #636366; }
+</style>
+</head>
+<body>
+<header>
+  <span class="title" id="title">Loading…</span>
+  <span class="counter" id="counter"></span>
+  <div class="nav">
+    <button id="prevBtn" title="Previous (←)">&larr;</button>
+    <button id="nextBtn" title="Next (→)">&rarr;</button>
+  </div>
+  <span class="hint">Wheel = zoom, Drag = pan, ← → = navigate, Esc = close, 0 = fit</span>
+</header>
+<canvas id="canvas"></canvas>
+<footer>
+  <div class="label">Prompt</div>
+  <div id="prompt" class="empty">—</div>
+</footer>
+
+<script>
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+let state = { img: null, scale: 1, offsetX: 0, offsetY: 0, dragging: false, lastX: 0, lastY: 0 };
+
+let currentPath = new URLSearchParams(location.search).get("path") || "";
+let galleryPaths = [];
+
+function resizeCanvas() {
+  canvas.width = canvas.clientWidth;
+  canvas.height = canvas.clientHeight;
+}
+
+function fit() {
+  if (!state.img) return;
+  resizeCanvas();
+  const s = Math.min(canvas.width / state.img.width, canvas.height / state.img.height);
+  state.scale = s;
+  state.offsetX = (canvas.width - state.img.width * s) / 2;
+  state.offsetY = (canvas.height - state.img.height * s) / 2;
+  render();
+}
+
+function render() {
+  if (!state.img) return;
+  resizeCanvas();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(state.img, state.offsetX, state.offsetY,
+    state.img.width * state.scale, state.img.height * state.scale);
+}
+
+function updateTitleAndCounter() {
+  const name = currentPath.split(/[/\\]/).pop() || "Image Viewer";
+  document.title = name;
+  document.getElementById("title").textContent = name;
+  const counter = document.getElementById("counter");
+  if (galleryPaths.length > 0) {
+    const idx = galleryPaths.indexOf(currentPath);
+    counter.textContent = idx >= 0 ? `${idx + 1} / ${galleryPaths.length}` : "";
+  } else {
+    counter.textContent = "";
+  }
+}
+
+function loadImage(filepath) {
+  currentPath = filepath;
+  updateTitleAndCounter();
+  const img = new Image();
+  img.onload = () => { state.img = img; fit(); };
+  img.onerror = () => { document.getElementById("title").textContent = "Failed to load image"; };
+  img.src = `/api/gallery/image?path=${encodeURIComponent(filepath)}`;
+
+  // Load prompt for this filepath
+  const box = document.getElementById("prompt");
+  box.textContent = "—";
+  box.classList.add("empty");
+  fetch("/api/gallery").then(r => r.json()).then(d => {
+    galleryPaths = (d.items || []).map(i => i.filepath);
+    updateTitleAndCounter();
+    const item = (d.items || []).find(i => i.filepath === filepath);
+    if (item && item.prompt) {
+      box.textContent = item.prompt;
+      box.classList.remove("empty");
+    }
+  });
+}
+
+function navigate(step) {
+  if (!galleryPaths.length) return;
+  let idx = galleryPaths.indexOf(currentPath);
+  if (idx === -1) idx = 0;
+  idx = (idx + step + galleryPaths.length) % galleryPaths.length;
+  loadImage(galleryPaths[idx]);
+}
+
+document.getElementById("prevBtn").addEventListener("click", () => navigate(-1));
+document.getElementById("nextBtn").addEventListener("click", () => navigate(1));
+
+canvas.addEventListener("mousedown", (e) => {
+  state.dragging = true;
+  state.lastX = e.clientX;
+  state.lastY = e.clientY;
+});
+window.addEventListener("mousemove", (e) => {
+  if (!state.dragging) return;
+  state.offsetX += e.clientX - state.lastX;
+  state.offsetY += e.clientY - state.lastY;
+  state.lastX = e.clientX;
+  state.lastY = e.clientY;
+  render();
+});
+window.addEventListener("mouseup", () => { state.dragging = false; });
+
+canvas.addEventListener("wheel", (e) => {
+  if (!state.img) return;
+  e.preventDefault();
+  const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  const r = canvas.getBoundingClientRect();
+  const cx = e.clientX - r.left, cy = e.clientY - r.top;
+  const ix = (cx - state.offsetX) / state.scale;
+  const iy = (cy - state.offsetY) / state.scale;
+  state.scale = Math.max(0.05, Math.min(10, state.scale * factor));
+  state.offsetX = cx - ix * state.scale;
+  state.offsetY = cy - iy * state.scale;
+  render();
+}, { passive: false });
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { window.close(); return; }
+  if (e.key === "0") { fit(); return; }
+  if (e.key === "ArrowLeft") { e.preventDefault(); navigate(-1); return; }
+  if (e.key === "ArrowRight") { e.preventDefault(); navigate(1); return; }
+});
+
+// Throttled resize — recompute viewport fit at most every 100ms while dragging
+// the window edge, preventing render thrashing.
+let _resizeTimer = null;
+window.addEventListener("resize", () => {
+  if (_resizeTimer) return;
+  _resizeTimer = setTimeout(() => { _resizeTimer = null; fit(); }, 100);
+});
+
+// Kick off
+loadImage(currentPath);
+</script>
+</body>
+</html>

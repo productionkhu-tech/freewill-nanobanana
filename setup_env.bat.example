@@ -1,0 +1,66 @@
+@echo off
+REM ============================================================
+REM  NanoBanana - API Credentials Setup (TEMPLATE)
+REM
+REM  Copy this file to `setup_env.bat` and fill in YOUR credentials.
+REM  The real setup_env.bat is .gitignored — never commit it.
+REM
+REM  Run by DOUBLE-CLICKING. No admin rights required.
+REM ============================================================
+
+setlocal EnableDelayedExpansion
+title NanoBanana - Setup
+
+echo.
+echo ============================================================
+echo   NanoBanana API Credentials Setup (TEMPLATE)
+echo ============================================================
+echo.
+
+REM ---- FILL THESE IN ----
+set "STUDIO_KEY=YOUR_GOOGLE_AI_STUDIO_KEY_HERE"
+set "VERTEX_PROJECT=YOUR_GCP_PROJECT_ID_HERE"
+set "VERTEX_LOCATION=global"
+REM -----------------------
+
+set "NB_HOME=%USERPROFILE%\.nanobanana"
+if not exist "!NB_HOME!" mkdir "!NB_HOME!"
+set "VERTEX_JSON=!NB_HOME!\vertex_credentials.json"
+
+REM Paste your service account JSON here (as a heredoc-style block).
+REM Remove these example lines and replace with your real JSON.
+>"!VERTEX_JSON!" (
+echo {
+echo   "type": "service_account",
+echo   "project_id": "YOUR_PROJECT_ID",
+echo   "private_key_id": "YOUR_PRIVATE_KEY_ID",
+echo   "private_key": "-----BEGIN PRIVATE KEY-----\nYOUR_KEY_HERE\n-----END PRIVATE KEY-----\n",
+echo   "client_email": "YOUR_SERVICE_ACCOUNT@YOUR_PROJECT.iam.gserviceaccount.com",
+echo   "client_id": "YOUR_CLIENT_ID",
+echo   "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+echo   "token_uri": "https://oauth2.googleapis.com/token",
+echo   "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+echo   "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/YOUR_SERVICE_ACCOUNT%%40YOUR_PROJECT.iam.gserviceaccount.com",
+echo   "universe_domain": "googleapis.com"
+echo }
+)
+echo [1/4] Wrote Vertex credentials to:
+echo       !VERTEX_JSON!
+
+setx NANOBANANA_STUDIO_KEY "!STUDIO_KEY!" >nul
+echo [2/4] Set NANOBANANA_STUDIO_KEY
+
+setx GOOGLE_APPLICATION_CREDENTIALS "!VERTEX_JSON!" >nul
+echo [3/4] Set GOOGLE_APPLICATION_CREDENTIALS
+
+setx NANOBANANA_PROJECT_ID "!VERTEX_PROJECT!" >nul
+setx NANOBANANA_LOCATION "!VERTEX_LOCATION!" >nul
+echo [4/4] Set NANOBANANA_PROJECT_ID and NANOBANANA_LOCATION
+
+echo.
+echo ============================================================
+echo   DONE!  Close this window and launch NanoBanana.exe.
+echo ============================================================
+echo.
+pause
+endlocal

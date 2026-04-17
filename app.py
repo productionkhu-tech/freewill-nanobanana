@@ -303,6 +303,56 @@ class AppState:
                 return Image.open(io.BytesIO(part.inline_data.data)).convert("RGB")
         return None
 
+    def diagnose_empty_response(self, resp, provider_label=""):
+        """Log WHY no image came back — finish_reason, safety_ratings, text parts,
+        prompt_feedback. Helps the user understand safety filter vs text-only
+        responses vs model refusal."""
+        try:
+            prefix = f"[{provider_label}] " if provider_label else ""
+            # Prompt feedback (block reason at prompt level)
+            pf = getattr(resp, "prompt_feedback", None)
+            if pf is not None:
+                block_reason = getattr(pf, "block_reason", None)
+                if block_reason:
+                    self.log(f"{prefix}PROMPT BLOCKED: {block_reason}")
+                pf_ratings = getattr(pf, "safety_ratings", None) or []
+                for r in pf_ratings:
+                    cat = getattr(r, "category", "?")
+                    prob = getattr(r, "probability", "?")
+                    if str(prob) not in ("NEGLIGIBLE", "HarmProbability.NEGLIGIBLE"):
+                        self.log(f"{prefix}prompt safety: {cat} = {prob}")
+
+            if not resp.candidates:
+                self.log(f"{prefix}Response has 0 candidates")
+                return
+
+            for i, cand in enumerate(resp.candidates):
+                fr = getattr(cand, "finish_reason", None)
+                if fr is not None:
+                    self.log(f"{prefix}candidate[{i}] finish_reason: {fr}")
+                ratings = getattr(cand, "safety_ratings", None) or []
+                for r in ratings:
+                    cat = getattr(r, "category", "?")
+                    prob = getattr(r, "probability", "?")
+                    blocked = getattr(r, "blocked", False)
+                    if blocked or str(prob) not in ("NEGLIGIBLE", "HarmProbability.NEGLIGIBLE"):
+                        flag = " [BLOCKED]" if blocked else ""
+                        self.log(f"{prefix}safety: {cat} = {prob}{flag}")
+
+                # Any text response (the model explaining WHY it refused)
+                content = getattr(cand, "content", None)
+                if content:
+                    parts = getattr(content, "parts", None) or []
+                    for p in parts:
+                        txt = getattr(p, "text", None)
+                        if txt:
+                            snippet = txt.strip().replace("\n", " ")
+                            if len(snippet) > 200:
+                                snippet = snippet[:200] + "..."
+                            self.log(f"{prefix}text reply: {snippet}")
+        except Exception as e:
+            self.log(f"diagnose error: {str(e)[:80]}")
+
     # --- Reference Images ---
     def get_ref_limit(self, model=None):
         m = model or self.model
@@ -875,6 +925,9 @@ class AppState:
                     return {"status": "success", "index": idx, "seed": seed,
                             "image": pil, "elapsed": elapsed, "api_used": api_used}
 
+                # Log WHY the primary provider returned no image
+                self.diagnose_empty_response(resp, self.get_provider_label(api_used))
+
                 # Try fallback provider if no image
                 fallback_providers = [
                     p for p in self.build_provider_order()
@@ -891,6 +944,8 @@ class AppState:
                     if pil2:
                         return {"status": "success", "index": idx, "seed": seed,
                                 "image": pil2, "elapsed": time.time()-start, "api_used": fu}
+                    # Log why the fallback also failed
+                    self.diagnose_empty_response(resp2, fl)
 
                 self.log(f"[{idx+1}] No image (attempt {attempt+1})")
                 if attempt < max_retries - 1:

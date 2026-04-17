@@ -173,9 +173,11 @@ function setupClipboardPaste() {
 // ==========================================
 // API Helper
 // ==========================================
+const _NB_CSRF = document.querySelector('meta[name="nb-csrf"]')?.content || "";
 async function api(url, opts = {}) {
+  opts.headers = { "X-NB-Token": _NB_CSRF, ...(opts.headers || {}) };
   if (opts.body && typeof opts.body === "object" && !(opts.body instanceof FormData)) {
-    opts.headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
+    opts.headers = { "Content-Type": "application/json", ...opts.headers };
     opts.body = JSON.stringify(opts.body);
   }
   try { const r = await fetch(url, opts); return r.json(); }
@@ -232,7 +234,7 @@ function scheduleSettingsSave() {
 async function saveSettings() {
   const sections = [];
   document.querySelectorAll(".prompt-section-box").forEach(el => sections.push(el.value));
-  await api("/api/settings", { method: "POST", body: {
+  const r = await api("/api/settings", { method: "POST", body: {
     model: document.getElementById("modelSelect").value,
     aspect: document.getElementById("aspectSelect").value,
     resolution: document.getElementById("resolutionSelect").value,
@@ -247,6 +249,11 @@ async function saveSettings() {
     naming_padding: parseInt(document.getElementById("namingPadding").value),
     gallery_columns: galleryColumns,
   }});
+  if (r && r.ok === false) {
+    // Surface the failure — silent loss of settings is how users end up
+    // fighting the UI for 10 minutes before noticing.
+    showToast(r.error || "Settings save failed", "error");
+  }
 }
 
 function onModelChange() {
@@ -411,6 +418,12 @@ document.addEventListener("compositionend", (e) => {
     setTimeout(() => _tryShowMention(t), 0);
   }
 }, true);
+// Safety nets so the flag can never get stuck on if the IME silently drops
+// compositionend (Alt-Tab away mid-compose, window loses focus, IME switch).
+window.addEventListener("blur", () => { _imeComposing = false; });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) _imeComposing = false;
+});
 
 // Direct `@` keypress handler — works even when the Korean IME is active.
 // On a Korean keyboard `@` is Shift+2; with Hangul mode on, the IME can
@@ -461,7 +474,21 @@ function onPromptKeydown(e, textarea) {
   if (!mentionMenu) return;
   if (e.key === "ArrowDown") { e.preventDefault(); navigateMention(1); }
   else if (e.key === "ArrowUp") { e.preventDefault(); navigateMention(-1); }
-  else if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); insertMention(); }
+  else if (e.key === "Enter" || e.key === "Tab") {
+    e.preventDefault();
+    // During Korean IME composition, Enter commits the pending char FIRST.
+    // If we insert the mention now, the browser will write the @ over our
+    // change as it finishes composition. Defer until compositionend fires.
+    if (e.isComposing || _imeComposing) {
+      const onceEnd = () => {
+        textarea.removeEventListener("compositionend", onceEnd);
+        setTimeout(insertMention, 0);
+      };
+      textarea.addEventListener("compositionend", onceEnd);
+    } else {
+      insertMention();
+    }
+  }
   else if (e.key === "Escape") { e.preventDefault(); closeMentionMenu(); }
 }
 
@@ -483,30 +510,39 @@ function showMentionMenu(textarea, cursorPos) {
     });
     mentionMenu.appendChild(btn);
   }
-  // Append first (hidden) to measure menu height, then position
-  mentionMenu.style.visibility = "hidden";
-  mentionMenu.style.left = "0px";
-  mentionMenu.style.top = "0px";
   document.body.appendChild(mentionMenu);
 
+  // Reposition now AND after a short delay (in case layout wasn't settled
+  // yet — IME timing, fonts loading, etc.). Without this, first rect read
+  // sometimes returned 0s and menu rendered off-screen showing a blank box.
+  positionMentionMenu(textarea);
+  setTimeout(() => positionMentionMenu(textarea), 30);
+}
+
+function positionMentionMenu(textarea) {
+  if (!mentionMenu) return;
   const rect = textarea.getBoundingClientRect();
-  const menuH = mentionMenu.offsetHeight || (refCount * 28 + 10);
+  // If rect is still 0×0 (textarea not yet laid out / hidden), defer
+  if (rect.width === 0 && rect.height === 0) return;
+
+  const menuH = mentionMenu.offsetHeight || (refCount * 30 + 10);
   const menuW = mentionMenu.offsetWidth || 160;
   const vh = window.innerHeight;
   const vw = window.innerWidth;
 
-  // Prefer below the textarea; flip above only if not enough space
+  // Always anchor below the textarea. If no room, flip above.
   const below = rect.bottom + 4;
   const above = rect.top - menuH - 4;
-  let top = (below + menuH <= vh) ? below : (above >= 0 ? above : Math.max(4, vh - menuH - 4));
-  let left = rect.left + 20;
-  if (left + menuW > vw) left = Math.max(4, vw - menuW - 4);
-  if (left < 4) left = 4;
+  let top;
+  if (below + menuH <= vh) top = below;
+  else if (above >= 4) top = above;
+  else top = Math.max(4, vh - menuH - 4);
+
+  let left = Math.max(4, Math.min(rect.left + 20, vw - menuW - 4));
 
   mentionMenu.style.left = `${left}px`;
   mentionMenu.style.top = `${top}px`;
   mentionMenu.style.bottom = "auto";
-  mentionMenu.style.visibility = "visible";
 }
 
 function navigateMention(dir) {
@@ -522,11 +558,23 @@ function navigateMention(dir) {
 function insertMention() {
   if (!mentionMenu || !mentionTarget) return;
   const tag = `[Image ${parseInt(mentionMenu.dataset.selected || "0") + 1}]`;
-  const ta = mentionTarget.textarea, pos = mentionTarget.cursorPos;
-  ta.value = ta.value.substring(0, pos - 1) + tag + " " + ta.value.substring(pos);
-  ta.selectionStart = ta.selectionEnd = pos - 1 + tag.length + 1;
+  const ta = mentionTarget.textarea;
+  // Re-read position at insert time; the stored cursorPos can be stale if
+  // the IME committed more characters between "@" press and this call.
+  const caret = ta.selectionStart;
+  const value = ta.value;
+  // Find the most recent "@" at or before the caret — that's the one we
+  // opened the menu for. Fallback to the stored cursorPos if nothing found.
+  let atPos = caret - 1;
+  while (atPos >= 0 && value[atPos] !== "@") atPos--;
+  if (atPos < 0) atPos = Math.max(0, (mentionTarget.cursorPos || 1) - 1);
+  ta.value = value.substring(0, atPos) + tag + " " + value.substring(caret);
+  const newCaret = atPos + tag.length + 1;
+  ta.selectionStart = ta.selectionEnd = newCaret;
   ta.focus();
+  if (typeof syncPromptHighlight === "function") syncPromptHighlight(ta);
   closeMentionMenu();
+  scheduleSettingsSave();
 }
 
 function closeMentionMenu() {
@@ -590,19 +638,15 @@ async function refreshRefs() {
         showToast("Unsupported format", "warn");
         return;
       }
-      // Upload as new ref then replace at index i by removing old then moving last
+      // Replace in place — server-side endpoint preserves position + pin state.
       const form = new FormData();
-      form.append("files", f);
-      const up = await api("/api/refs/upload", { method: "POST", body: form });
-      if (up.added > 0) {
-        // Replace via dedicated endpoint: remove old, the new one is appended.
-        // Simpler: call replace endpoint with file — but backend uses file dialog.
-        // Workaround: remove old ref and rely on user to reorder. For now,
-        // tell user to move (or implement server-side swap later).
-        // Here we use /api/refs/replace if available, else fall back.
-        await api(`/api/refs/${i}`, { method: "DELETE" });
+      form.append("file", f);
+      const r = await api(`/api/refs/replace/${i}`, { method: "POST", body: form });
+      if (r.ok) {
         await refreshRefs();
-        showToast("Reference replaced via drop", "success");
+        showToast("Reference replaced", "success");
+      } else {
+        showToast(r.error || "Replace failed", "error");
       }
     });
 
@@ -1149,13 +1193,24 @@ function updateGenUI(gen, outstanding) {
 // ==========================================
 // Polling
 // ==========================================
+let statusPollTimer = null;
 function startPolling() {
+  stopPolling();
   pollTimer = setInterval(pollEvents, 800);
   logPollTimer = setInterval(pollLogs, 2000);
   // Status poll carries close-requested + API status + generation state;
   // 500ms keeps close button feel instant.
-  setInterval(refreshApiStatus, 500);
+  statusPollTimer = setInterval(refreshApiStatus, 500);
 }
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (logPollTimer) { clearInterval(logPollTimer); logPollTimer = null; }
+  if (statusPollTimer) { clearInterval(statusPollTimer); statusPollTimer = null; }
+}
+// Kill timers before the page goes away so we don't get a flood of
+// "failed to fetch" entries after the server window is gone.
+window.addEventListener("pagehide", stopPolling);
+window.addEventListener("beforeunload", stopPolling);
 
 async function pollEvents() {
   const d = await api("/api/events");

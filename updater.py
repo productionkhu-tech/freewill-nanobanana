@@ -21,9 +21,11 @@ Why this replaces the old overlay approach:
 """
 
 import os
+import re
 import sys
 import json
 import time
+import hashlib
 import shutil
 import tempfile
 import urllib.request
@@ -32,6 +34,19 @@ REPO = "productionkhu-tech/freewill-nanobanana"
 BRANCH = "main"
 REMOTE_VERSION_URL = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}/VERSION"
 RELEASES_API = f"https://api.github.com/repos/{REPO}/releases"
+
+
+def _version_tuple(v):
+    """Turn a version string into a tuple of ints for robust comparison.
+    String comparison of 'v2026-04-17' > 'v2026-04-9' happens to work today
+    only because every segment is zero-padded. If the format ever shifts
+    (e.g. a 3-digit NN suffix) string compare quietly breaks; tuple compare
+    keeps doing the right thing."""
+    nums = re.findall(r"\d+", v or "")
+    try:
+        return tuple(int(n) for n in nums)
+    except ValueError:
+        return tuple()
 
 
 def _bundle_version_file():
@@ -66,12 +81,19 @@ def check_for_update():
     except Exception as e:
         print(f"  remote version fetch failed: {e}")
         return False, current, current
-    has_update = bool(remote) and remote != current and remote > current
+    if not remote or remote == current:
+        return False, current, remote
+    cur_t = _version_tuple(current)
+    rem_t = _version_tuple(remote)
+    has_update = bool(rem_t) and rem_t > cur_t
     return has_update, current, remote
 
 
-def _find_release_asset_url(version_tag):
-    """Fetch GitHub Release for the given tag, return NanoBanana.exe asset URL."""
+def _find_release_assets(version_tag):
+    """Return (exe_url, expected_sha256) for the release at `version_tag`.
+    If the release body contains a line like "sha256: <hex>" or there's a
+    NanoBanana.exe.sha256 asset, that hash is returned and verified after
+    download. Otherwise returns empty sha — size-only validation."""
     req = urllib.request.Request(
         f"{RELEASES_API}/tags/{version_tag}",
         headers={
@@ -81,17 +103,66 @@ def _find_release_asset_url(version_tag):
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read().decode("utf-8"))
+    exe_url = ""
+    sha_url = ""
     for asset in data.get("assets", []):
-        if asset.get("name", "").lower() == "nanobanana.exe":
-            return asset.get("browser_download_url", "")
-    return ""
+        name = asset.get("name", "").lower()
+        if name == "nanobanana.exe":
+            exe_url = asset.get("browser_download_url", "")
+        elif name == "nanobanana.exe.sha256":
+            sha_url = asset.get("browser_download_url", "")
+    # Inline sha256 in release body (preferred, no second asset needed)
+    body = (data.get("body") or "")
+    m = re.search(r"(?:sha-?256|hash)\s*[:=]\s*([0-9a-fA-F]{64})", body, re.IGNORECASE)
+    inline_sha = m.group(1).lower() if m else ""
+    # Fetch sidecar sha256 file if present
+    remote_sha = ""
+    if sha_url:
+        try:
+            with urllib.request.urlopen(
+                urllib.request.Request(sha_url, headers={"User-Agent": "NanoBanana-Updater"}),
+                timeout=10,
+            ) as r:
+                txt = r.read().decode("utf-8", errors="replace").strip().split()
+                if txt and re.fullmatch(r"[0-9a-fA-F]{64}", txt[0]):
+                    remote_sha = txt[0].lower()
+        except Exception:
+            pass
+    return exe_url, (inline_sha or remote_sha)
 
 
-def _download(url, dest_path):
-    req = urllib.request.Request(url, headers={"User-Agent": "NanoBanana-Updater"})
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        with open(dest_path, "wb") as f:
-            shutil.copyfileobj(resp, f)
+def _download_with_retry(url, dest_path, attempts=3):
+    """Stream download with a short retry loop. A truncated mid-stream
+    download would otherwise pass the size check but crash on launch."""
+    last_err = None
+    for i in range(attempts):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "NanoBanana-Updater"})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                total = int(resp.headers.get("Content-Length") or 0)
+                with open(dest_path, "wb") as f:
+                    shutil.copyfileobj(resp, f)
+            got = os.path.getsize(dest_path)
+            if total and got != total:
+                raise IOError(f"Short read: got {got}, expected {total}")
+            return
+        except Exception as e:
+            last_err = e
+            print(f"  download attempt {i+1}/{attempts} failed: {e}")
+            try:
+                os.remove(dest_path)
+            except Exception:
+                pass
+            time.sleep(min(2 ** i, 5))
+    raise last_err if last_err else IOError("download failed")
+
+
+def _sha256_of(path, chunk=1 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 def apply_update_and_relaunch(version_tag):
@@ -108,20 +179,42 @@ def apply_update_and_relaunch(version_tag):
     exe_dir = os.path.dirname(exe_path)
     exe_name = os.path.basename(exe_path)
 
-    # Find the asset URL for the target version
-    url = _find_release_asset_url(version_tag)
+    # If the EXE lives under Program Files we'd need UAC to overwrite it.
+    # Surface that clearly so the user can move the install elsewhere.
+    pf1 = os.environ.get("ProgramFiles", "")
+    pf2 = os.environ.get("ProgramFiles(x86)", "")
+    exe_real = os.path.realpath(exe_path)
+    for root in (pf1, pf2):
+        if root and os.path.commonpath([exe_real, os.path.realpath(root)]) == os.path.realpath(root):
+            raise RuntimeError(
+                "Program Files에 설치되어 있어 자동 업데이트를 적용할 수 없습니다.\n"
+                "바탕화면 같은 일반 폴더로 NanoBanana.exe를 옮긴 뒤 다시 실행해주세요."
+            )
+
+    url, expected_sha = _find_release_assets(version_tag)
     if not url:
         raise RuntimeError(f"No NanoBanana.exe asset found for {version_tag}")
 
     new_exe_path = os.path.join(exe_dir, "NanoBanana.new.exe")
     print(f"  Downloading {version_tag} EXE...")
-    _download(url, new_exe_path)
+    _download_with_retry(url, new_exe_path)
     size = os.path.getsize(new_exe_path)
     if size < 1_000_000:
-        # Something went wrong — don't attempt swap with a tiny file
         try: os.remove(new_exe_path)
         except Exception: pass
         raise RuntimeError(f"Downloaded file too small ({size} bytes)")
+    # Integrity check — if the release publishes a sha256 (inline in body or
+    # sidecar asset) we verify here. A mismatch aborts the swap so we never
+    # replace a working EXE with a corrupted download.
+    if expected_sha:
+        got_sha = _sha256_of(new_exe_path)
+        if got_sha.lower() != expected_sha.lower():
+            try: os.remove(new_exe_path)
+            except Exception: pass
+            raise RuntimeError(
+                f"Hash mismatch: expected {expected_sha[:12]}..., got {got_sha[:12]}..."
+            )
+        print(f"  SHA256 verified")
     print(f"  Downloaded {size/1024/1024:.1f} MB")
 
     # Write the swap script into %TEMP% so antivirus doesn't flag a bat

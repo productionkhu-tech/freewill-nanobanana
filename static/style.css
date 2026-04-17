@@ -737,26 +737,31 @@ textarea.prompt-box { min-height: 82px; }
      scale = min(container_width / img_w, max_vh / img_h)
    implemented implicitly by the browser via the max-* constraints.
    ═══════════════════════════════════════════════════════════════ */
+/* Reserve height BEFORE the image loads so the card doesn't collapse into a
+   thin line (especially in 1/2-column modes where the image is large and
+   loads asynchronously). --card-ar is set by JS from the saved aspect. */
 .media-frame {
   background: #111113;
   border-radius: 10px 10px 0 0;
   display: block;
+  position: relative;
   width: 100%;
   line-height: 0;
-  /* NO overflow: hidden — let the image define its own height.
-     Previously overflow:hidden combined with an implicit height constraint
-     from the flex card caused vertical cropping. */
+  overflow: hidden;
+  /* padding-bottom trick — more reliable than aspect-ratio inside a grid row
+     whose intrinsic height hasn't settled yet. */
+  padding-bottom: calc(100% / var(--card-ar, 1.7778));
 }
 
-/* Image fills card width; height follows aspect ratio exactly */
 .card-img {
   display: block !important;
+  position: absolute;
+  inset: 0;
   width: 100% !important;
-  height: auto !important;
+  height: 100% !important;
   max-width: 100% !important;
+  object-fit: contain;
   background: #111113;
-  /* Clip only the top-corners radius visually via parent overflow not needed
-     because border-radius on media-frame is enough with this structure. */
 }
 
 /* Card body: sits below image, always renders in full */
@@ -1076,18 +1081,29 @@ footer {
   border: 1px solid var(--border);
   border-radius: 10px;
   overflow: hidden;
+  display: block;             /* grid item — explicitly block layout inside */
+  min-height: 180px;          /* prevent "thin line" collapse in wide columns */
 }
 .skeleton .skel-img {
   width: 100%;
-  aspect-ratio: 16/9;
+  /* Use padding-bottom trick for guaranteed 16:9 — aspect-ratio sometimes
+     collapses to 0 when a grid row's intrinsic height is still zero. */
+  padding-bottom: 56.25%;
   background: var(--surface2);
   animation: pulse 1.5s ease-in-out infinite;
+  display: block;
 }
+/* Per-column tuning: match visible card image heights */
+.gallery-grid.cols-1 .skeleton { min-height: 420px; }
+.gallery-grid.cols-2 .skeleton { min-height: 260px; }
+.gallery-grid.cols-4 .skeleton { min-height: 180px; }
+.gallery-grid.cols-8 .skeleton { min-height: 110px; }
+
 .skeleton .skel-line {
   height: 10px;
   background: var(--surface2);
   border-radius: 999px;
-  margin: 6px 12px;
+  margin: 8px 12px;
   animation: pulse 1.5s ease-in-out infinite .2s;
 }
 .skeleton .skel-chips {

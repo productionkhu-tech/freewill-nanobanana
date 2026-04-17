@@ -78,6 +78,72 @@ def is_port_in_use(port):
         return True
 
 
+# --- Single-instance guard via a named Win32 mutex.
+# If another NanoBanana is already running, focus its window and exit silently.
+_instance_mutex_handle = None
+
+def acquire_single_instance():
+    global _instance_mutex_handle
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        ERROR_ALREADY_EXISTS = 183
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        # Global\\ prefix makes it session-wide; user-space would be \\Local
+        _instance_mutex_handle = kernel32.CreateMutexW(
+            None, False, "NanoBanana-AIImageStudio-SingleInstance-v1"
+        )
+        err = kernel32.GetLastError()
+        if err == ERROR_ALREADY_EXISTS:
+            # Another instance is already running. Focus its window.
+            try:
+                user32 = ctypes.windll.user32
+                hwnd = user32.FindWindowW(None, "NanoBanana")
+                if hwnd:
+                    SW_RESTORE = 9
+                    user32.ShowWindow(hwnd, SW_RESTORE)
+                    user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+            return False
+        return True
+    except Exception as e:
+        print(f"  single-instance check failed: {e}")
+        return True  # don't block launch on Win32 errors
+
+
+def check_webview2_installed():
+    """WebView2 Evergreen Runtime is required on Win10. Detect via registry
+    (matches Microsoft's own recommended check). Returns True if installed."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import winreg
+        paths = [
+            (winreg.HKEY_LOCAL_MACHINE,
+             r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+            (winreg.HKEY_LOCAL_MACHINE,
+             r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+            (winreg.HKEY_CURRENT_USER,
+             r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+        ]
+        for hive, path in paths:
+            try:
+                with winreg.OpenKey(hive, path) as k:
+                    v, _ = winreg.QueryValueEx(k, "pv")
+                    if v and v != "0.0.0.0":
+                        return True
+            except OSError:
+                continue
+        return False
+    except Exception:
+        return True  # if we can't tell, assume OK
+
+
 def wait_for_server(host, port, timeout=30):
     start = time.time()
     while time.time() - start < timeout:
@@ -145,20 +211,25 @@ class JsApi:
             print(f"  cleanup_temp error: {e}")
 
     def open_viewer(self, filepath):
-        """Open image viewer in new pywebview window (dedupe by filepath)."""
+        """Open image viewer in new pywebview window (dedupe by filepath).
+        Skips over windows that have already been destroyed — pywebview doesn't
+        always remove them from its windows list, so we test each one."""
         print(f"  JS -> open_viewer({filepath!r})")
         try:
             import urllib.parse
             for w in list(webview.windows):
                 if w is _window:
                     continue
-                if getattr(w, "_nb_filepath", None) == filepath:
-                    try:
-                        w.show()
-                        w.restore()
-                    except Exception:
-                        pass
+                # If the handle is gone (user closed the viewer), skip it.
+                try:
+                    if getattr(w, "_nb_filepath", None) != filepath:
+                        continue
+                    w.show()
+                    w.restore()
                     return
+                except Exception:
+                    # Window is dead — move on and open a fresh one.
+                    continue
             encoded = urllib.parse.quote(filepath, safe="")
             viewer_url = f"{APP_URL}/viewer?path={encoded}"
             title = os.path.basename(filepath) or "Image Viewer"
@@ -224,63 +295,112 @@ def main():
     print("  NanoBanana - AI Image Studio")
     print("=" * 50)
 
+    # Single-instance guard — silently focus existing window if one is running.
+    if not acquire_single_instance():
+        print("  Another instance is already running — focused and exiting.")
+        sys.exit(0)
+
     # Verify API credentials — abort if missing
     check_api_env()
 
-    # Single-instance guard
-    if is_port_in_use(PORT):
-        print("  Port busy - killing old instance...")
-        if sys.platform == "win32":
-            os.system("taskkill /F /IM NanoBanana.exe >nul 2>&1")
-            time.sleep(2)
-        if is_port_in_use(PORT):
-            show_error_and_exit(
-                "NanoBanana",
-                f"포트 {PORT}가 사용 중입니다. 다른 프로그램을 종료하고 다시 실행해주세요."
-            )
-
-    # Auto-update — Yes/No dialog, user decides. Whole-EXE swap on accept.
-    try:
-        from updater import check_for_update, apply_update_and_relaunch
-        has_update, current, remote = check_for_update()
-        print(f"  Local={current}  Remote={remote}  HasUpdate={has_update}")
-        if has_update:
-            try:
-                import ctypes
-                MB_YESNO = 0x04
-                MB_ICONINFO = 0x40
-                MB_TOPMOST = 0x00040000
-                IDYES = 6
-                msg = (
-                    f"새 버전이 있어요!\n\n"
-                    f"현재 버전: {current}\n"
-                    f"최신 버전: {remote}\n\n"
-                    f"지금 업데이트하시겠습니까?\n"
-                    f"(앱이 자동으로 재시작됩니다)"
-                )
-                result = ctypes.windll.user32.MessageBoxW(
-                    0, msg, "NanoBanana 업데이트",
-                    MB_YESNO | MB_ICONINFO | MB_TOPMOST
-                )
-                if result == IDYES:
-                    print("  User accepted update — downloading...")
-                    try:
-                        apply_update_and_relaunch(remote)
-                        # A swap script is now running in a detached cmd.
-                        # Exit this process so the script can rename the EXE.
-                        print("  Swap script launched, exiting...")
-                        sys.exit(0)
-                    except Exception as e:
+    # Warn (don't abort) if installed under Program Files. The auto-updater
+    # can't overwrite the EXE there without UAC, so a user stuck there would
+    # silently stay on an old version forever.
+    if sys.platform == "win32" and getattr(sys, "frozen", False):
+        try:
+            exe_real = os.path.realpath(sys.executable)
+            for root in (os.environ.get("ProgramFiles", ""), os.environ.get("ProgramFiles(x86)", "")):
+                if not root:
+                    continue
+                try:
+                    if os.path.commonpath([exe_real, os.path.realpath(root)]) == os.path.realpath(root):
+                        import ctypes
                         ctypes.windll.user32.MessageBoxW(
-                            0, f"업데이트 실패:\n{e}\n\n현재 버전으로 계속 진행합니다.",
-                            "NanoBanana", 0x10
+                            0,
+                            "NanoBanana이 Program Files에 설치되어 있어요.\n\n"
+                            "이 위치에서는 자동 업데이트가 작동하지 않습니다.\n"
+                            "바탕화면 같은 일반 폴더로 EXE를 옮긴 뒤 다시 실행해주세요.",
+                            "NanoBanana", 0x30,
                         )
-                else:
-                    print("  User skipped update")
-            except Exception as e:
-                print(f"  Update prompt error: {e}")
-    except Exception as e:
-        print(f"  Update check: {e}")
+                        break
+                except ValueError:
+                    continue
+        except Exception as e:
+            print(f"  Program Files check: {e}")
+
+    # WebView2 presence check — friendly message if absent.
+    if not check_webview2_installed():
+        try:
+            import ctypes
+            MB_OK = 0x00
+            MB_ICONWARN = 0x30
+            result = ctypes.windll.user32.MessageBoxW(
+                0,
+                "Microsoft Edge WebView2 런타임이 필요합니다.\n\n"
+                "https://go.microsoft.com/fwlink/p/?LinkId=2124703 에서\n"
+                "다운로드해 설치한 뒤 앱을 다시 실행해주세요.",
+                "NanoBanana",
+                MB_OK | MB_ICONWARN,
+            )
+        except Exception:
+            pass
+        sys.exit(1)
+
+    # Port collision fallback (rare — single-instance mutex should have caught)
+    if is_port_in_use(PORT):
+        show_error_and_exit(
+            "NanoBanana",
+            f"포트 {PORT}가 사용 중입니다. 다른 프로그램을 종료하고 다시 실행해주세요."
+        )
+
+    # Async update check — does NOT block the window from opening. A popup
+    # shows later if an update is available. Fixes the "8s black screen"
+    # startup delay on flaky networks.
+    def _bg_update_check():
+        try:
+            time.sleep(2)  # let the UI settle first
+            from updater import check_for_update, apply_update_and_relaunch
+            has_update, current, remote = check_for_update()
+            print(f"  Local={current}  Remote={remote}  HasUpdate={has_update}")
+            if not has_update:
+                return
+            import ctypes
+            MB_YESNO = 0x04
+            MB_ICONINFO = 0x40
+            MB_TOPMOST = 0x00040000
+            IDYES = 6
+            msg = (
+                f"새 버전이 있어요!\n\n"
+                f"현재 버전: {current}\n"
+                f"최신 버전: {remote}\n\n"
+                f"지금 업데이트하시겠습니까?\n"
+                f"(앱이 자동으로 재시작됩니다)"
+            )
+            result = ctypes.windll.user32.MessageBoxW(
+                0, msg, "NanoBanana 업데이트",
+                MB_YESNO | MB_ICONINFO | MB_TOPMOST
+            )
+            if result == IDYES:
+                try:
+                    apply_update_and_relaunch(remote)
+                    # Tell the main window to close cleanly, then exit
+                    global _force_close
+                    _force_close = True
+                    try:
+                        if _window is not None:
+                            _window.destroy()
+                    except Exception:
+                        pass
+                    sys.exit(0)
+                except Exception as e:
+                    ctypes.windll.user32.MessageBoxW(
+                        0, f"업데이트 실패:\n{e}\n\n현재 버전으로 계속 진행합니다.",
+                        "NanoBanana", 0x10
+                    )
+        except Exception as e:
+            print(f"  Update check: {e}")
+
+    threading.Thread(target=_bg_update_check, daemon=True).start()
 
     # Start Flask server
     print(f"  Starting server on {APP_URL}")

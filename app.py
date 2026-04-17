@@ -73,8 +73,11 @@ class AppState:
     def __init__(self):
         self.client_vertex = None
         self.client_studio = None
-        self.vertex_rate_limiter = RateLimiter(interval=0.5)
-        self.studio_rate_limiter = RateLimiter(interval=0.5)
+        # Rate limit: UI hint says "10 RPM auto-throttled to ~8 RPM". That's
+        # 1 request every 7.5s per provider. Previously this was 0.5s (120
+        # RPM) — we'd hit 429s constantly.
+        self.vertex_rate_limiter = RateLimiter(interval=7.5)
+        self.studio_rate_limiter = RateLimiter(interval=7.5)
         self.is_generating = False
         self.cancel_flag = False
         self.done_count = 0
@@ -86,9 +89,18 @@ class AppState:
         self.pending_jobs = []
         self.pending_jobs_lock = threading.Lock()
         self.active_job_count = 0
+        # Persisted across restarts (loaded below from .nanobanana/prefs.json)
         self.skip_delete_confirm = False
         self.output_dir = os.path.join(os.path.expanduser("~"), "Desktop", "NanoBanana_Output")
         self.file_counter = 0
+        self.file_counter_lock = threading.Lock()   # parallel-worker safe naming
+        # Protect the parallel lists ref_images/ref_path_list/ref_pinned
+        self.ref_lock = threading.RLock()
+        # Protect gallery_items mutations vs HTTP thread iteration
+        self.gallery_lock = threading.RLock()
+        # Prompt history (last N entries, persisted)
+        self.prompt_history = []
+        self.max_prompt_history = 50
 
         # Reference images
         self.ref_images = []       # PIL.Image list
@@ -151,6 +163,9 @@ class AppState:
         # Close-requested flag (set by launcher when user clicks X)
         self.close_requested = False
 
+        # Throttle for incremental project auto-save during long batches
+        self._last_autosave_ts = 0.0
+
     def log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
         entry = f"[{ts}] {msg}"
@@ -169,11 +184,55 @@ class AppState:
             self.progress_events.clear()
             return events
 
+    # --- Persisted preferences (skip_delete_confirm, prompt_history) ---
+    def _prefs_file(self):
+        d = os.path.join(os.path.expanduser("~"), ".nanobanana")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
+        return os.path.join(d, "prefs.json")
+
+    def load_prefs(self):
+        try:
+            with open(self._prefs_file(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.skip_delete_confirm = bool(data.get("skip_delete_confirm", False))
+            hist = data.get("prompt_history", [])
+            if isinstance(hist, list):
+                self.prompt_history = [str(x) for x in hist][: self.max_prompt_history]
+        except Exception:
+            pass
+
+    def save_prefs(self):
+        try:
+            tmp = self._prefs_file() + ".tmp"
+            data = {
+                "skip_delete_confirm": self.skip_delete_confirm,
+                "prompt_history": self.prompt_history,
+            }
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._prefs_file())
+        except Exception as e:
+            self.log(f"prefs save failed: {str(e)[:80]}")
+
+    def push_prompt_history(self, prompt):
+        p = (prompt or "").strip()
+        if not p:
+            return
+        # Move to front, dedupe
+        self.prompt_history = [p] + [x for x in self.prompt_history if x != p]
+        self.prompt_history = self.prompt_history[: self.max_prompt_history]
+        self.save_prefs()
+
     # --- API ---
     def cleanup_vertex_credentials(self):
         pass
 
     def init_api(self):
+        # Load persisted preferences first so the rest of the app sees them
+        self.load_prefs()
         # Vertex AI — requires GOOGLE_APPLICATION_CREDENTIALS + NANOBANANA_PROJECT_ID
         creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
         project_id = os.environ.get("NANOBANANA_PROJECT_ID", "")
@@ -360,11 +419,13 @@ class AppState:
 
     def get_effective_ref_images(self, model=None):
         limit = self.get_ref_limit(model)
-        return list(self.ref_images[:limit])
+        with self.ref_lock:
+            return list(self.ref_images[:limit])
 
     def get_effective_ref_paths(self, model=None):
         limit = self.get_ref_limit(model)
-        return list(self.ref_path_list[:limit])
+        with self.ref_lock:
+            return list(self.ref_path_list[:limit])
 
     def ref_image_to_bytes(self, ref_pil):
         buf = io.BytesIO()
@@ -409,69 +470,95 @@ class AppState:
         return parts or [types.Part.from_text(text=prompt)]
 
     def add_ref_image(self, filepath, pinned=False):
-        if filepath in self.ref_path_list:
-            self.log(f"Ref already added: {os.path.basename(filepath)}")
-            return False
-        limit = self.get_ref_limit()
-        if len(self.ref_images) >= limit:
-            self.log(f"Max {limit} reference images")
-            return False
-        try:
-            with Image.open(filepath) as img:
-                pil = img.convert("RGB")
-            self.ref_images.append(pil)
-            self.ref_path_list.append(filepath)
-            self.ref_pinned.append(bool(pinned))
-            self.project_dirty = True
-            return True
-        except Exception as e:
-            self.log(f"Ref load failed: {str(e)[:80]}")
-            return False
+        with self.ref_lock:
+            if filepath in self.ref_path_list:
+                self.log(f"Ref already added: {os.path.basename(filepath)}")
+                return False
+            limit = self.get_ref_limit()
+            if len(self.ref_images) >= limit:
+                self.log(f"Max {limit} reference images")
+                return False
+            try:
+                with Image.open(filepath) as img:
+                    pil = img.convert("RGB")
+                self.ref_images.append(pil)
+                self.ref_path_list.append(filepath)
+                self.ref_pinned.append(bool(pinned))
+                self.project_dirty = True
+                return True
+            except Exception as e:
+                self.log(f"Ref load failed: {str(e)[:80]}")
+                return False
 
     def remove_ref(self, idx):
-        if 0 <= idx < len(self.ref_images):
-            img = self.ref_images.pop(idx)
-            fp = self.ref_path_list.pop(idx)
-            if idx < len(self.ref_pinned):
-                self.ref_pinned.pop(idx)
-            try:
-                img.close()
-            except Exception:
-                pass
-            self.cleanup_temp_ref_path(fp)
-            self.project_dirty = True
-            return True
-        return False
-
-    def toggle_ref_pin(self, idx):
-        if not (0 <= idx < len(self.ref_path_list)):
-            return
-        while len(self.ref_pinned) < len(self.ref_path_list):
-            self.ref_pinned.append(False)
-        self.ref_pinned[idx] = not self.ref_pinned[idx]
-        self.project_dirty = True
-
-    def clear_refs(self, preserve_pinned=False):
-        kept_imgs, kept_paths, kept_pinned = [], [], []
-        removed = []
-        for i, (img, fp) in enumerate(zip(self.ref_images, self.ref_path_list)):
-            pin = i < len(self.ref_pinned) and bool(self.ref_pinned[i])
-            if preserve_pinned and pin:
-                kept_imgs.append(img)
-                kept_paths.append(fp)
-                kept_pinned.append(pin)
-            else:
-                removed.append(fp)
+        with self.ref_lock:
+            if 0 <= idx < len(self.ref_images):
+                img = self.ref_images.pop(idx)
+                fp = self.ref_path_list.pop(idx)
+                if idx < len(self.ref_pinned):
+                    self.ref_pinned.pop(idx)
                 try:
                     img.close()
                 except Exception:
                     pass
-        self.ref_images = kept_imgs
-        self.ref_path_list = kept_paths
-        self.ref_pinned = kept_pinned
+                self.cleanup_temp_ref_path(fp)
+                self.project_dirty = True
+                return True
+            return False
+
+    def replace_ref(self, idx, filepath):
+        """Replace the ref at `idx` with the image at `filepath`, preserving
+        position and pin state. Used by drag-drop onto an existing ref cell."""
+        with self.ref_lock:
+            if not (0 <= idx < len(self.ref_images)):
+                return False
+            try:
+                with Image.open(filepath) as img:
+                    pil = img.convert("RGB")
+            except Exception as e:
+                self.log(f"Replace failed: {str(e)[:80]}")
+                return False
+            old = self.ref_images[idx]
+            old_fp = self.ref_path_list[idx]
+            self.ref_images[idx] = pil
+            self.ref_path_list[idx] = filepath
+            try: old.close()
+            except Exception: pass
+            self.cleanup_temp_ref_path(old_fp)
+            self.project_dirty = True
+            return True
+
+    def toggle_ref_pin(self, idx):
+        with self.ref_lock:
+            if not (0 <= idx < len(self.ref_path_list)):
+                return
+            while len(self.ref_pinned) < len(self.ref_path_list):
+                self.ref_pinned.append(False)
+            self.ref_pinned[idx] = not self.ref_pinned[idx]
+            self.project_dirty = True
+
+    def clear_refs(self, preserve_pinned=False):
+        kept_imgs, kept_paths, kept_pinned = [], [], []
+        removed = []
+        with self.ref_lock:
+            for i, (img, fp) in enumerate(zip(self.ref_images, self.ref_path_list)):
+                pin = i < len(self.ref_pinned) and bool(self.ref_pinned[i])
+                if preserve_pinned and pin:
+                    kept_imgs.append(img)
+                    kept_paths.append(fp)
+                    kept_pinned.append(pin)
+                else:
+                    removed.append(fp)
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
+            self.ref_images = kept_imgs
+            self.ref_path_list = kept_paths
+            self.ref_pinned = kept_pinned
+            self.project_dirty = True
         for fp in removed:
             self.cleanup_temp_ref_path(fp)
-        self.project_dirty = True
 
     def cleanup_temp_ref_path(self, filepath):
         if filepath not in self.temp_ref_paths:
@@ -537,8 +624,13 @@ class AppState:
     def make_filename(self, seed, naming=None):
         s = naming or self.get_naming_settings()
         if s["enabled"]:
-            self.file_counter += 1
-            num = str(self.file_counter).zfill(s["padding"])
+            # Atomic read-increment-use under a lock. Without this, two
+            # parallel workers could read the same counter value and write
+            # identical filenames — silent image overwrite.
+            with self.file_counter_lock:
+                self.file_counter += 1
+                n = self.file_counter
+            num = str(n).zfill(s["padding"])
             prefix = (s["prefix"] or "image").strip()
             middle = (s["delimiter"] or "").strip()
             idx_prefix = (s.get("index_prefix") or "").strip()
@@ -552,23 +644,35 @@ class AppState:
     def prepare_file_counter(self, naming=None):
         s = naming or self.get_naming_settings()
         if not s["enabled"]:
-            self.file_counter = 0
+            with self.file_counter_lock:
+                self.file_counter = 0
             return
-        pattern = re.compile(
+        # Relaxed pattern — match ANY number-ending filename that starts with
+        # the prefix, so legacy naming schemes don't reset the counter and
+        # cause overwrites.
+        strict_pattern = re.compile(
             rf"^{re.escape(s['prefix'])}"
             rf"(?:_{re.escape(s['delimiter'])})?"
             rf"_{re.escape(s.get('index_prefix', ''))}(\d+)\.png$",
             re.IGNORECASE,
         )
+        loose_pattern = re.compile(
+            rf"^{re.escape(s['prefix'])}.*?(\d+)\.png$",
+            re.IGNORECASE,
+        )
         max_num = 0
         try:
             for name in os.listdir(self.output_dir):
-                m = pattern.match(name)
+                m = strict_pattern.match(name) or loose_pattern.match(name)
                 if m:
-                    max_num = max(max_num, int(m.group(1)))
+                    try:
+                        max_num = max(max_num, int(m.group(1)))
+                    except (ValueError, IndexError):
+                        continue
         except OSError:
             pass
-        self.file_counter = max_num
+        with self.file_counter_lock:
+            self.file_counter = max_num
 
     def build_png_metadata(self, prompt, model):
         from PIL.PngImagePlugin import PngInfo
@@ -607,23 +711,43 @@ class AppState:
 
     # --- Gallery ---
     def add_gallery_item(self, filepath, prompt, elapsed, api_used, aspect="", resolution="", generated_at="", generation_settings=None):
-        self.gallery_order_counter -= 1
-        self.gallery_items[filepath] = {
-            "filepath": filepath,
-            "prompt": prompt,
-            "order": self.gallery_order_counter,
-            "visible": True,
-            "resolution": resolution,
-            "aspect": aspect,
-            "elapsed_sec": elapsed,
-            "api_used": api_used,
-            "generated_at": generated_at or datetime.now().isoformat(timespec="seconds"),
-            "favorite": False,
-            "generation_settings": generation_settings or {},
-        }
-        if filepath not in self.generated_paths:
-            self.generated_paths.append(filepath)
-        self.project_dirty = True
+        # Lock to prevent dict-size-change errors when HTTP threads iterate
+        # gallery_items concurrently with the worker adding items.
+        with self.gallery_lock:
+            self.gallery_order_counter -= 1
+            self.gallery_items[filepath] = {
+                "filepath": filepath,
+                "prompt": prompt,
+                "order": self.gallery_order_counter,
+                "visible": True,
+                "resolution": resolution,
+                "aspect": aspect,
+                "elapsed_sec": elapsed,
+                "api_used": api_used,
+                "generated_at": generated_at or datetime.now().isoformat(timespec="seconds"),
+                "favorite": False,
+                "generation_settings": generation_settings or {},
+            }
+            if filepath not in self.generated_paths:
+                self.generated_paths.append(filepath)
+            self.project_dirty = True
+        # Write a tiny sidecar JSON next to the image so metadata survives
+        # a crash. collect_project_state can scavenge these on startup.
+        try:
+            side = filepath + ".meta.json"
+            with open(side, "w", encoding="utf-8") as f:
+                json.dump({
+                    "filepath": filepath,
+                    "prompt": prompt,
+                    "elapsed_sec": float(elapsed or 0),
+                    "api_used": api_used,
+                    "aspect": aspect,
+                    "resolution": resolution,
+                    "generated_at": generated_at or datetime.now().isoformat(timespec="seconds"),
+                    "generation_settings": generation_settings or {},
+                }, f, ensure_ascii=False)
+        except Exception:
+            pass
 
     def delete_gallery_item(self, filepath):
         if filepath in self.favorites:
@@ -684,14 +808,25 @@ class AppState:
 
     def collect_project_state(self):
         current_ref_paths = [p for p in self.get_effective_ref_paths() if p and os.path.exists(p)]
-        pinned_ref_paths = [
-            p for i, p in enumerate(self.ref_path_list)
-            if i < len(self.ref_pinned) and self.ref_pinned[i] and p and os.path.exists(p)
-        ]
-        items = [
-            self._serialize_item(fp, item)
-            for fp, item in sorted(self.gallery_items.items(), key=lambda x: x[1].get("order", 0))
-        ]
+        with self.ref_lock:
+            pinned_ref_paths = [
+                p for i, p in enumerate(self.ref_path_list)
+                if i < len(self.ref_pinned) and self.ref_pinned[i] and p and os.path.exists(p)
+            ]
+        # Snapshot under gallery_lock to avoid "dict changed size during iteration".
+        # Secondary key (filepath) keeps legacy items (order=0 or missing) in a
+        # deterministic order — prevents the gallery jumping around on reload.
+        with self.gallery_lock:
+            items = [
+                self._serialize_item(fp, item)
+                for fp, item in sorted(
+                    self.gallery_items.items(),
+                    key=lambda x: (x[1].get("order", 0), x[0]),
+                )
+            ]
+        # Snapshot logs under its lock
+        with self.log_lock:
+            logs_str = "\n".join(self.logs)
         return {
             "project_version": 1,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
@@ -711,7 +846,7 @@ class AppState:
                 "search_query": "",
                 "gallery_columns": self.gallery_columns,
             },
-            "logs": "\n".join(self.logs),
+            "logs": logs_str,
             "gallery_items": items,
         }
 
@@ -731,10 +866,19 @@ class AppState:
         }
 
     def save_project(self, filepath):
+        """Atomic save: write to .tmp then os.replace so a disk-full or
+        crash mid-write cannot corrupt the target file."""
         data = self.collect_project_state()
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w", encoding="utf-8") as f:
+        tmp = filepath + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, filepath)
         self.current_project_path = filepath
         self.project_dirty = False
         return True
@@ -753,7 +897,12 @@ class AppState:
         self.model = ui.get("model", self.model)
         self.aspect = ui.get("aspect", self.aspect)
         self.resolution = ui.get("resolution", self.resolution)
-        self.count = int(ui.get("count", self.count))
+        # Tolerant parse — older projects sometimes have count="" which would
+        # raise ValueError and abort load mid-way, losing the whole session.
+        try:
+            self.count = max(1, min(10, int(str(ui.get("count", self.count)).strip() or self.count)))
+        except (TypeError, ValueError):
+            self.count = self.count or 1
         self.output_dir = ui.get("output_dir", self.output_dir)
         self.fixed_prompt = ui.get("fixed_prompt", "")
         self.prompt_sections = ui.get("prompt_sections", [ui.get("prompt", "")])
@@ -765,9 +914,15 @@ class AppState:
         self.naming_prefix = naming.get("prefix", "S010")
         self.naming_delimiter = naming.get("delimiter", "C010")
         self.naming_index_prefix = naming.get("index_prefix", "I")
-        self.naming_padding = int(naming.get("padding", 3))
+        try:
+            self.naming_padding = max(1, min(5, int(naming.get("padding", 3))))
+        except (TypeError, ValueError):
+            self.naming_padding = 3
 
-        self.gallery_columns = int(ui.get("gallery_columns", 2))
+        try:
+            self.gallery_columns = max(1, min(8, int(ui.get("gallery_columns", 2))))
+        except (TypeError, ValueError):
+            self.gallery_columns = 2
 
         # Clear and restore refs
         self.clear_refs()
@@ -972,6 +1127,25 @@ class AppState:
 
         return {"status": "cancelled", "index": idx, "seed": seed}
 
+    def _maybe_autosave(self, min_interval=15.0):
+        """Best-effort project save during long batches. Throttled to avoid
+        disk thrash when many images complete back-to-back. Silent on error —
+        the sidecar .meta.json files already cover per-image metadata."""
+        now = time.time()
+        if now - self._last_autosave_ts < min_interval:
+            return
+        if not self.project_dirty:
+            return
+        try:
+            save_dir = self.get_project_save_dir()
+            os.makedirs(save_dir, exist_ok=True)
+            fp = self.current_project_path or os.path.join(save_dir, self.default_project_filename())
+            self.save_project(fp)
+            self._last_autosave_ts = now
+        except Exception:
+            # Don't let autosave failures break the generation loop
+            self._last_autosave_ts = now
+
     def _pop_pending_job(self):
         with self.pending_jobs_lock:
             if not self.pending_jobs:
@@ -1010,7 +1184,12 @@ class AppState:
         max_workers = self.max_parallel_requests
         active = {}
 
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="nano-gen") as executor:
+        # Do NOT use the `with` block — its __exit__ calls shutdown(wait=True)
+        # which would block Stop by up to the SDK request timeout (~60s) while
+        # the last in-flight generate_content calls finish. Instead, shut down
+        # explicitly with cancel_futures=True so Stop feels instant.
+        executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="nano-gen")
+        try:
             while True:
                 # Fill workers from queue
                 while not self.cancel_flag and len(active) < max_workers:
@@ -1111,6 +1290,20 @@ class AppState:
                 if self.cancel_flag and not active:
                     break
 
+                # Incremental auto-save — flush the project JSON every so often
+                # so a crash mid-batch doesn't lose prompts/settings/gallery.
+                # Per-image .meta.json sidecars already survive on their own.
+                self._maybe_autosave()
+        finally:
+            # Shut down without waiting on in-flight requests. Cancel queued but
+            # not-yet-started futures so Stop doesn't hang the UI for ~60s
+            # while the SDK finishes a slow generate_content call.
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                # Older Python without cancel_futures — fall back to wait=False.
+                executor.shutdown(wait=False)
+
         self.log(f"Finished: {self.done_count} saved, {self.fail_count} failed")
 
         # Auto-save project
@@ -1139,7 +1332,37 @@ app = Flask(
     template_folder=os.path.join(_flask_base, 'templates'),
     static_folder=os.path.join(_flask_base, 'static'),
 )
+# Cap upload size at 40 MB so a rogue drop can't OOM the process
+app.config["MAX_CONTENT_LENGTH"] = 40 * 1024 * 1024
 state = AppState()
+
+
+# --- CSRF protection ---
+# Any local webpage on 127.0.0.1 could POST to our endpoints. Require a
+# custom header whose value we print into the HTML template; local pages
+# in a browser won't see that value and will be rejected.
+import secrets as _secrets
+CSRF_TOKEN = _secrets.token_urlsafe(32)
+
+# Endpoints exempt from CSRF (GET is safe; our /api/status polling is GET-only)
+_CSRF_EXEMPT_METHODS = {"GET", "HEAD", "OPTIONS"}
+_CSRF_EXEMPT_PATHS = {"/api/version"}  # any public-ish read-only endpoints
+
+
+@app.before_request
+def _csrf_guard():
+    # Skip if it's our own UI (served from same origin with token)
+    if request.method in _CSRF_EXEMPT_METHODS:
+        return None
+    if request.path in _CSRF_EXEMPT_PATHS:
+        return None
+    # Non-API routes (HTML views) pass through
+    if not request.path.startswith("/api/"):
+        return None
+    tok = request.headers.get("X-NB-Token", "")
+    if tok != CSRF_TOKEN:
+        return ("forbidden", 403)
+    return None
 
 
 @app.after_request
@@ -1262,34 +1485,28 @@ def _no_cache_static(resp):
     return resp
 
 
-@app.route("/")
-def index():
-    html = render_template("index.html")
+def _render_html(template_name):
+    html = render_template(template_name)
     html = html.replace("__VERSION__", _read_version() + "." + _BUILD_ID)
-    # Disable browser cache on the main HTML so fresh asset query strings load.
+    html = html.replace("__CSRF_TOKEN__", CSRF_TOKEN)
     resp = Response(html)
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     return resp
+
+
+@app.route("/")
+def index():
+    return _render_html("index.html")
 
 
 @app.route("/viewer")
 def viewer():
-    """Standalone image viewer window (opened via pywebview create_window)."""
-    html = render_template("viewer.html")
-    html = html.replace("__VERSION__", _read_version() + "." + _BUILD_ID)
-    resp = Response(html)
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-    return resp
+    return _render_html("viewer.html")
 
 
 @app.route("/prompt-popup")
 def prompt_popup():
-    """Standalone prompt display window."""
-    html = render_template("prompt_popup.html")
-    html = html.replace("__VERSION__", _read_version() + "." + _BUILD_ID)
-    resp = Response(html)
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-    return resp
+    return _render_html("prompt_popup.html")
 
 
 @app.route("/api/version")
@@ -1338,25 +1555,38 @@ def get_settings():
     })
 
 
+def _safe_int(value, default, lo=None, hi=None):
+    try:
+        n = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    if lo is not None: n = max(lo, n)
+    if hi is not None: n = min(hi, n)
+    return n
+
+
 @app.route("/api/settings", methods=["POST"])
 def update_settings():
     d = request.json or {}
     for k in ("model", "aspect", "resolution", "fixed_prompt",
               "naming_prefix", "naming_delimiter", "naming_index_prefix"):
-        if k in d:
-            setattr(state, k, d[k])
+        if k in d and d[k] is not None:
+            setattr(state, k, str(d[k]))
     if "count" in d:
-        state.count = max(1, int(d["count"]))
-    if "output_dir" in d:
-        state.output_dir = d["output_dir"]
+        # Clamp to the valid UI range so a rogue client can't brick the dropdown
+        state.count = _safe_int(d.get("count"), state.count, lo=1, hi=10)
+    if "output_dir" in d and d["output_dir"]:
+        state.output_dir = str(d["output_dir"])
     if "naming_enabled" in d:
-        state.naming_enabled = bool(d["naming_enabled"])
+        state.naming_enabled = bool(d.get("naming_enabled"))
     if "naming_padding" in d:
-        state.naming_padding = max(1, min(5, int(d["naming_padding"])))
+        state.naming_padding = _safe_int(d.get("naming_padding"), state.naming_padding, lo=1, hi=5)
     if "prompt_sections" in d:
-        state.prompt_sections = list(d["prompt_sections"])
+        ps = d.get("prompt_sections")
+        if isinstance(ps, list):
+            state.prompt_sections = [str(x) for x in ps]
     if "gallery_columns" in d:
-        state.gallery_columns = int(d["gallery_columns"])
+        state.gallery_columns = _safe_int(d.get("gallery_columns"), state.gallery_columns, lo=1, hi=8)
     state.project_dirty = True
     return jsonify({"ok": True, "ref_limit": state.get_ref_limit()})
 
@@ -1492,8 +1722,36 @@ def clear_refs():
 @app.route("/api/refs/pin/<int:idx>", methods=["POST"])
 def pin_ref(idx):
     state.toggle_ref_pin(idx)
-    pinned = idx < len(state.ref_pinned) and state.ref_pinned[idx]
+    with state.ref_lock:
+        pinned = idx < len(state.ref_pinned) and state.ref_pinned[idx]
     return jsonify({"ok": True, "pinned": pinned})
+
+
+@app.route("/api/refs/replace/<int:idx>", methods=["POST"])
+def replace_ref_upload(idx):
+    """Replace ref at idx with an uploaded file. Preserves position/pin."""
+    import hashlib
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"ok": False, "error": "No file"})
+    ext = os.path.splitext(f.filename or "")[1].lower()
+    if ext not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+        return jsonify({"ok": False, "error": "Unsupported format"})
+    # Size cap (enforced separately from MAX_CONTENT_LENGTH so error message is clean)
+    data = f.read()
+    if not data:
+        return jsonify({"ok": False, "error": "Empty file"})
+    if len(data) > 40 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "File too large (>40MB)"})
+    digest = hashlib.sha1(data).hexdigest()[:16]
+    os.makedirs(state.temp_ref_dir, exist_ok=True)
+    target = os.path.join(state.temp_ref_dir, f"ref_{digest}{ext}")
+    if not os.path.exists(target):
+        with open(target, "wb") as out:
+            out.write(data)
+    state.temp_ref_paths.add(target)
+    ok = state.replace_ref(idx, target)
+    return jsonify({"ok": ok})
 
 
 @app.route("/api/refs/paste", methods=["POST"])
@@ -1520,7 +1778,7 @@ def ref_thumb(idx):
 def get_gallery():
     state.prune_missing_files()
     items = []
-    for fp, item in sorted(state.gallery_items.items(), key=lambda x: x[1].get("order", 0)):
+    for fp, item in sorted(state.gallery_items.items(), key=lambda x: (x[1].get("order", 0), x[0])):
         items.append({
             "filepath": fp,
             "filename": os.path.basename(fp),
@@ -1536,10 +1794,62 @@ def get_gallery():
     return jsonify({"items": items, "count": len(items)})
 
 
+def _is_path_allowed(fp):
+    """Only allow files that the app itself produced or the user explicitly
+    pulled into the app. Prevents /api/gallery/image?path=C:\\Windows\\win.ini
+    exfiltration from a malicious local webpage hitting 127.0.0.1.
+
+    Allowlist (resolved real paths):
+      - anything currently in state.gallery_items
+      - anything under state.output_dir
+      - anything under state.temp_ref_dir (clipboard / uploaded refs)
+      - project save dir (for thumbnails of recent-project previews)
+      - explicitly registered ref paths
+    """
+    if not fp:
+        return False
+    try:
+        real = os.path.realpath(fp)
+    except Exception:
+        return False
+    if not os.path.isfile(real):
+        return False
+    # Known-good exact paths
+    if real in (os.path.realpath(p) for p in list(state.gallery_items.keys()) + list(state.ref_path_list)):
+        return True
+    # Allowed parent directories
+    allowed_dirs = []
+    try:
+        allowed_dirs.append(os.path.realpath(state.output_dir))
+    except Exception: pass
+    try:
+        allowed_dirs.append(os.path.realpath(state.temp_ref_dir))
+    except Exception: pass
+    try:
+        allowed_dirs.append(os.path.realpath(state.get_project_save_dir()))
+    except Exception: pass
+    # legacy Desktop location for recent projects
+    try:
+        allowed_dirs.append(os.path.realpath(
+            os.path.join(os.path.expanduser("~/Desktop"), "NanoBanana_Output", "NanoBanana JSON")
+        ))
+    except Exception: pass
+    for d in allowed_dirs:
+        if not d:
+            continue
+        try:
+            common = os.path.commonpath([real, d])
+            if common == d:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 @app.route("/api/gallery/image")
 def serve_gallery_image():
     fp = request.args.get("path", "")
-    if not fp or not os.path.exists(fp):
+    if not fp or not _is_path_allowed(fp):
         return "", 404
     return send_file(fp, mimetype="image/png")
 
@@ -1547,15 +1857,19 @@ def serve_gallery_image():
 @app.route("/api/gallery/thumb")
 def serve_gallery_thumb():
     fp = request.args.get("path", "")
-    size = int(request.args.get("size", 360))
-    if not fp or not os.path.exists(fp):
+    try:
+        size = int(request.args.get("size", 360))
+    except (TypeError, ValueError):
+        size = 360
+    size = max(32, min(size, 2048))
+    if not fp or not _is_path_allowed(fp):
         return "", 404
     try:
         with Image.open(fp) as img:
             pil = img.convert("RGB")
-        pil.thumbnail((size, size), Image.LANCZOS)
-        buf = io.BytesIO()
-        pil.save(buf, "JPEG", quality=85)
+            pil.thumbnail((size, size), Image.LANCZOS)
+            buf = io.BytesIO()
+            pil.save(buf, "JPEG", quality=85)
         buf.seek(0)
         return send_file(buf, mimetype="image/jpeg")
     except Exception:
@@ -1989,7 +2303,20 @@ def delete_confirm_state():
 def set_delete_confirm_state():
     d = request.json or {}
     state.skip_delete_confirm = bool(d.get("skip", False))
+    state.save_prefs()
     return jsonify({"ok": True, "skip": state.skip_delete_confirm})
+
+
+@app.route("/api/prompt-history")
+def api_prompt_history():
+    return jsonify({"history": list(state.prompt_history)})
+
+
+@app.route("/api/prompt-history", methods=["DELETE"])
+def clear_prompt_history():
+    state.prompt_history = []
+    state.save_prefs()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/close-info")

@@ -450,7 +450,68 @@ function _onAtKeydown(e, textarea) {
   setTimeout(check, 0);
 }
 
+// Treat `[Image N]` like an atomic chip: Backspace at the right edge (with
+// or without a trailing space) deletes the whole tag, Delete at the left
+// edge eats it forward, and Left/Right arrow jumps over it. This matches
+// how mention pills work in Slack/Discord and avoids the broken "[Image"
+// fragments the highlight layer can't colorize.
+// Backspace also eats the trailing space that insertMention() adds, so one
+// Backspace after insertion removes the whole chip + its space. Forward
+// Delete only removes the bracketed tag itself — we don't want to start
+// munching leading spaces the user typed on purpose.
+const _MENTION_RE_LEFT  = /\[Image (\d+)\] ?$/;
+const _MENTION_RE_RIGHT = /^\[Image (\d+)\]/;
+
+function _atomicMentionEdit(e, textarea) {
+  if (textarea.selectionStart !== textarea.selectionEnd) return false; // honor real selections
+  const pos = textarea.selectionStart;
+  const value = textarea.value;
+
+  if (e.key === "Backspace") {
+    const m = value.slice(0, pos).match(_MENTION_RE_LEFT);
+    if (!m) return false;
+    const start = pos - m[0].length;
+    textarea.value = value.slice(0, start) + value.slice(pos);
+    textarea.selectionStart = textarea.selectionEnd = start;
+    syncPromptHighlight(textarea);
+    scheduleSettingsSave();
+    e.preventDefault();
+    return true;
+  }
+  if (e.key === "Delete") {
+    const m = value.slice(pos).match(_MENTION_RE_RIGHT);
+    if (!m) return false;
+    textarea.value = value.slice(0, pos) + value.slice(pos + m[0].length);
+    textarea.selectionStart = textarea.selectionEnd = pos;
+    syncPromptHighlight(textarea);
+    scheduleSettingsSave();
+    e.preventDefault();
+    return true;
+  }
+  if (e.key === "ArrowLeft" && !e.shiftKey && !e.ctrlKey) {
+    const m = value.slice(0, pos).match(/\[Image (\d+)\]$/);
+    if (!m) return false;
+    const np = pos - m[0].length;
+    textarea.selectionStart = textarea.selectionEnd = np;
+    e.preventDefault();
+    return true;
+  }
+  if (e.key === "ArrowRight" && !e.shiftKey && !e.ctrlKey) {
+    const m = value.slice(pos).match(/^\[Image (\d+)\]/);
+    if (!m) return false;
+    const np = pos + m[0].length;
+    textarea.selectionStart = textarea.selectionEnd = np;
+    e.preventDefault();
+    return true;
+  }
+  return false;
+}
+
 function onPromptKeydown(e, textarea) {
+  // Handle mention-as-chip first so backspace eats the whole [Image N]
+  // before the default single-char delete fires.
+  if (!mentionMenu && _atomicMentionEdit(e, textarea)) return;
+
   if (e.key === "Tab" && !mentionMenu) {
     e.preventDefault();
     const boxes = [...document.querySelectorAll(".prompt-section-box")];

@@ -127,17 +127,21 @@ try:
 except Exception:
     pass
 
-# Clean up stale NanoBanana.new.exe left behind by a failed auto-update
-# swap. Earlier updater versions (pre-v1715) would download the new EXE
-# but fail to replace the running EXE, leaving a confusing orphan file
-# next to the real one. If we're running the real EXE now, any .new.exe
-# sibling is dead weight — delete it so the user's folder stays clean.
+# Clean up stale NanoBanana.new.exe / NanoBanana.exe.old orphans left
+# behind by a failed or interrupted auto-update swap. These files sit
+# next to the real EXE and are pure dead weight - the user sees them,
+# asks what they are, and we have to apologize. We only delete our own
+# named orphans, never anything else in the folder.
 try:
     if getattr(sys, "frozen", False) and sys.platform == "win32":
         _exe_dir = os.path.dirname(sys.executable)
-        _orphan = os.path.join(_exe_dir, "NanoBanana.new.exe")
-        if os.path.isfile(_orphan):
-            os.remove(_orphan)
+        for _name in ("NanoBanana.new.exe", "NanoBanana.exe.old"):
+            _orphan = os.path.join(_exe_dir, _name)
+            if os.path.isfile(_orphan):
+                try:
+                    os.remove(_orphan)
+                except Exception:
+                    pass
 except Exception as _e:
     print(f"  orphan cleanup: {_e}")
 

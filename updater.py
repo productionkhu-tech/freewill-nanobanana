@@ -295,7 +295,17 @@ if errorlevel 1 (
     goto :fail
 )
 echo move ok, cleaning backup >> "%LOG%"
-del "%BACKUP%" >nul 2>&1
+REM Force-delete the backup. If Windows is still holding a reference to
+REM the renamed-away file (rare but happens on some AV configs), wait a
+REM beat and retry so we don't leave NanoBanana.exe.old orphaned in the
+REM user's folder forever.
+del /F /Q "%BACKUP%" >nul 2>&1
+if exist "%BACKUP%" (
+    echo backup still present, retrying after 1s >> "%LOG%"
+    ping -n 2 127.0.0.1 >nul
+    del /F /Q "%BACKUP%" >nul 2>&1
+)
+if exist "%BACKUP%" echo WARN backup could not be removed >> "%LOG%"
 echo launching new EXE >> "%LOG%"
 start "" "%OLD%"
 echo SUCCESS >> "%LOG%"

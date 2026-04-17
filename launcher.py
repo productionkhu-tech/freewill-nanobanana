@@ -383,15 +383,13 @@ def main():
             if result == IDYES:
                 try:
                     apply_update_and_relaunch(remote)
-                    # Tell the main window to close cleanly, then exit
-                    global _force_close
-                    _force_close = True
-                    try:
-                        if _window is not None:
-                            _window.destroy()
-                    except Exception:
-                        pass
-                    sys.exit(0)
+                    # Force immediate process termination. sys.exit(0) from a
+                    # daemon thread only kills the thread — the main pywebview
+                    # loop keeps running and holds the EXE handle, which
+                    # causes swap.bat to time out waiting to rename. os._exit
+                    # terminates the whole process with no unwind so the file
+                    # lock is released immediately and the bat can swap.
+                    os._exit(0)
                 except Exception as e:
                     ctypes.windll.user32.MessageBoxW(
                         0, f"업데이트 실패:\n{e}\n\n현재 버전으로 계속 진행합니다.",

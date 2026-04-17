@@ -229,28 +229,54 @@ def apply_update_and_relaunch(version_tag):
     #   2. Move NanoBanana.new.exe over NanoBanana.exe (replaces atomically on Windows)
     #   3. Launch the new EXE
     #   4. Delete itself
+    # Pass our PID to the bat so it can force-kill the lingering process if
+    # the polite exit didn't release the EXE handle. Symptom we're fixing:
+    # a previous version's update loop called sys.exit(0) from a daemon
+    # thread, which only kills the thread — the main pywebview loop kept
+    # running, the EXE stayed locked, the swap's rename loop timed out
+    # after 30s, and :fail tried to relaunch the old EXE which the single-
+    # instance mutex immediately blocked. User ended up with no update and
+    # no visible error.
+    our_pid = os.getpid()
     bat_body = f"""@echo off
 setlocal EnableDelayedExpansion
 set "OLD={exe_path}"
 set "NEW={new_exe_path}"
+set "PID={our_pid}"
 set "TRIES=0"
 :wait_loop
 ren "%OLD%" "{exe_name}.tmp" >nul 2>&1
-if errorlevel 1 (
-    set /a TRIES+=1
-    if !TRIES! GEQ 30 goto :fail
-    ping -n 1 127.0.0.1 >nul
-    goto :wait_loop
-)
+if not errorlevel 1 goto :do_swap
+set /a TRIES+=1
+if !TRIES! GEQ 6 goto :force_kill
+ping -n 2 127.0.0.1 >nul
+goto :wait_loop
+
+:force_kill
+REM Gentle rename failed 6 times — the old process is still holding the
+REM file. Force-kill by PID and try once more. Then any subsequent retries
+REM use taskkill /IM as a last resort.
+taskkill /F /PID %PID% >nul 2>&1
+ping -n 2 127.0.0.1 >nul
+ren "%OLD%" "{exe_name}.tmp" >nul 2>&1
+if not errorlevel 1 goto :do_swap
+taskkill /F /IM "{exe_name}" >nul 2>&1
+ping -n 2 127.0.0.1 >nul
+ren "%OLD%" "{exe_name}.tmp" >nul 2>&1
+if errorlevel 1 goto :fail
+
+:do_swap
 ren "%OLD%.tmp" "{exe_name}" >nul 2>&1
 del "%OLD%" >nul 2>&1
 move /y "%NEW%" "%OLD%" >nul 2>&1
 if errorlevel 1 goto :fail
 start "" "%OLD%"
 goto :cleanup
+
 :fail
 REM Couldn't replace — launch the old one so user isn't stuck
 if exist "%OLD%" start "" "%OLD%"
+
 :cleanup
 (goto) 2>nul & del "%~f0"
 """

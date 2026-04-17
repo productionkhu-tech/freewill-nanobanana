@@ -306,8 +306,24 @@ if exist "%BACKUP%" (
     del /F /Q "%BACKUP%" >nul 2>&1
 )
 if exist "%BACKUP%" echo WARN backup could not be removed >> "%LOG%"
+REM Brief pause so AV scanners can finish their "freshly-written binary"
+REM scan before we try to run it. Without this some AV configs reject
+REM the launch for a couple seconds after a move, which showed up as
+REM "update completed but app didn't reopen".
+ping -n 3 127.0.0.1 >nul
 echo launching new EXE >> "%LOG%"
-start "" "%OLD%"
+start "NanoBanana" "%OLD%"
+REM Verify it actually started. If `start` returned fine but the process
+REM didn't stay up (AV quarantined, missing DLL, etc.) we retry once.
+ping -n 3 127.0.0.1 >nul
+tasklist /FI "IMAGENAME eq {exe_name}" 2>nul | find /I "{exe_name}" >nul
+if errorlevel 1 (
+    echo first start did not stick, retrying >> "%LOG%"
+    start "NanoBanana" "%OLD%"
+    ping -n 3 127.0.0.1 >nul
+    tasklist /FI "IMAGENAME eq {exe_name}" 2>nul | find /I "{exe_name}" >nul
+    if errorlevel 1 echo WARN new EXE not running after two start attempts >> "%LOG%"
+)
 echo SUCCESS >> "%LOG%"
 goto :cleanup
 

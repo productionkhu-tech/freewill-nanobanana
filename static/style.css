@@ -264,7 +264,11 @@ textarea.prompt-box { min-height: 82px; }
 }
 .prompt-wrap .prompt-highlight .mention {
   color: #5B9FFF;
-  font-weight: 600;
+  /* MUST match the textarea's font metrics exactly — any weight/letter-
+     spacing/font-style difference makes the caret position drift from
+     the highlighted text. Previously this was font-weight: 600 which
+     widened [Image N] by several pixels in the overlay but not in the
+     textarea, so the caret visibly separated from the end of the tag. */
 }
 .prompt-wrap .prompt-box:focus + .prompt-highlight { border-color: var(--accent); }
 

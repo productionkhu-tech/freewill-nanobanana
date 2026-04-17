@@ -618,17 +618,24 @@ async function refreshRefs() {
     const cell = document.createElement("div");
     cell.className = "ref-cell" + (ref.pinned ? " pinned" : "");
 
-    // Drag-and-drop file onto cell to replace this ref
-    cell.addEventListener("dragover", (e) => {
+    // Drag-and-drop file onto cell to replace this ref.
+    // Counter pattern so dragleave firing on child elements (image, buttons)
+    // doesn't flash the drop-target highlight off and back on.
+    let _dragDepth = 0;
+    cell.addEventListener("dragenter", (e) => {
       e.preventDefault();
+      _dragDepth++;
       cell.classList.add("drop-target");
     });
+    cell.addEventListener("dragover", (e) => { e.preventDefault(); });
     cell.addEventListener("dragleave", () => {
-      cell.classList.remove("drop-target");
+      _dragDepth = Math.max(0, _dragDepth - 1);
+      if (_dragDepth === 0) cell.classList.remove("drop-target");
     });
     cell.addEventListener("drop", async (e) => {
       e.preventDefault();
       e.stopPropagation();
+      _dragDepth = 0;
       cell.classList.remove("drop-target");
       const files = e.dataTransfer?.files;
       if (!files || !files.length) return;
@@ -755,10 +762,20 @@ function stripAllPromptMentions() {
   });
 }
 
-function onRefDragEnter(e) { e.preventDefault(); document.getElementById("refArea").classList.add("dragover"); }
-function onRefDragLeave(e) { document.getElementById("refArea").classList.remove("dragover"); }
+// Counter avoids flashing the border when the cursor crosses a child element
+let _refAreaDragDepth = 0;
+function onRefDragEnter(e) {
+  e.preventDefault();
+  _refAreaDragDepth++;
+  document.getElementById("refArea").classList.add("dragover");
+}
+function onRefDragLeave(e) {
+  _refAreaDragDepth = Math.max(0, _refAreaDragDepth - 1);
+  if (_refAreaDragDepth === 0) document.getElementById("refArea").classList.remove("dragover");
+}
 async function onRefDrop(e) {
   e.preventDefault();
+  _refAreaDragDepth = 0;
   document.getElementById("refArea").classList.remove("dragover");
   const files = e.dataTransfer?.files;
   if (!files?.length) return;
@@ -1212,29 +1229,54 @@ function stopPolling() {
 window.addEventListener("pagehide", stopPolling);
 window.addEventListener("beforeunload", stopPolling);
 
+// Coalesce many image_done events into a single refreshGallery call per
+// poll tick. A 100-image batch used to trigger 100 full /api/gallery fetches
+// which made the grid stutter even on fast machines.
+let _galleryRefreshPending = false;
+function scheduleGalleryRefresh() {
+  if (_galleryRefreshPending) return;
+  _galleryRefreshPending = true;
+  requestAnimationFrame(() => {
+    _galleryRefreshPending = false;
+    refreshGallery();
+  });
+}
+
 async function pollEvents() {
   const d = await api("/api/events");
   if (!d.events?.length) return;
+  let anyDone = false, anyFailed = false;
+  let lastDone = 0, lastFailed = 0, lastTotal = 0, lastOutstanding;
   for (const ev of d.events) {
     if (ev.type === "image_done") {
+      anyDone = true;
+      lastDone = ev.done;
+      lastTotal = ev.total;
+      lastOutstanding = ev.outstanding;
       const sk = document.querySelector(".skeleton");
       if (sk) sk.remove();
-      refreshGallery();
-      updateProgress(ev.done, ev.total, ev.outstanding);
-      if (typeof ev.outstanding === "number") updateGenUI(true, ev.outstanding);
     } else if (ev.type === "image_failed") {
+      anyFailed = true;
+      lastDone = ev.done || 0;
+      lastFailed = ev.failed || 0;
+      lastTotal = ev.total;
+      lastOutstanding = ev.outstanding;
       const sk = document.querySelector(".skeleton");
       if (sk) sk.remove();
-      updateProgress((ev.done || 0) + (ev.failed || 0), ev.total, ev.outstanding);
-      if (typeof ev.outstanding === "number") updateGenUI(true, ev.outstanding);
     } else if (ev.type === "done") {
       document.querySelectorAll(".skeleton").forEach(s => s.remove());
       updateGenUI(false, 0);
-      refreshGallery();
+      scheduleGalleryRefresh();
       document.getElementById("progressLabel").textContent = `Done  ok ${ev.done || 0}  fail ${ev.failed || 0}`;
       document.getElementById("progressFill").style.width = (ev.done || 0) > 0 ? "100%" : "0%";
       document.getElementById("statusLabel").textContent = `Completed  ${ev.done || 0} image(s) saved`;
+      return;
     }
+  }
+  if (anyDone || anyFailed) {
+    scheduleGalleryRefresh();
+    updateProgress(lastDone + lastFailed, lastTotal, lastOutstanding);
+    if (typeof lastOutstanding === "number") updateGenUI(true, lastOutstanding);
   }
 }
 

@@ -157,9 +157,6 @@ class AppState:
         self.progress_events = []
         self.progress_lock = threading.Lock()
 
-        # Skip delete confirm for session
-        self.skip_delete_confirm = False
-
         # Close-requested flag (set by launcher when user clicks X)
         self.close_requested = False
 
@@ -755,15 +752,20 @@ class AppState:
         try:
             if os.path.exists(filepath):
                 os.remove(filepath)
-            if filepath in self.generated_paths:
-                self.generated_paths.remove(filepath)
-            self.favorites.discard(filepath)
-            self.gallery_items.pop(filepath, None)
-            # Also remove from refs if present
+            # Dict/set mutations must be serialized against HTTP threads
+            # iterating over gallery_items (e.g. /api/gallery snapshot).
+            with self.gallery_lock:
+                if filepath in self.generated_paths:
+                    self.generated_paths.remove(filepath)
+                self.favorites.discard(filepath)
+                self.gallery_items.pop(filepath, None)
+            # Also remove from refs if present — remove_ref grabs ref_lock.
             removed_ref_idx = None
-            ref_count_before = len(self.ref_path_list)
-            if filepath in self.ref_path_list:
-                removed_ref_idx = self.ref_path_list.index(filepath)
+            with self.ref_lock:
+                ref_count_before = len(self.ref_path_list)
+                if filepath in self.ref_path_list:
+                    removed_ref_idx = self.ref_path_list.index(filepath)
+            if removed_ref_idx is not None:
                 self.remove_ref(removed_ref_idx)
             self.project_dirty = True
             return True, "Deleted", {"removed_ref_idx": removed_ref_idx, "ref_count_before": ref_count_before}
@@ -771,27 +773,43 @@ class AppState:
             return False, str(e)[:80], None
 
     def toggle_favorite(self, filepath):
-        if filepath in self.favorites:
-            self.favorites.discard(filepath)
-            if filepath in self.gallery_items:
-                self.gallery_items[filepath]["favorite"] = False
-            return False
-        else:
+        with self.gallery_lock:
+            if filepath in self.favorites:
+                self.favorites.discard(filepath)
+                if filepath in self.gallery_items:
+                    self.gallery_items[filepath]["favorite"] = False
+                return False
             self.favorites.add(filepath)
             if filepath in self.gallery_items:
                 self.gallery_items[filepath]["favorite"] = True
             return True
 
     def prune_missing_files(self):
-        missing = [p for p in list(self.gallery_items.keys()) if not os.path.exists(p)]
-        for fp in missing:
-            self.favorites.discard(fp)
-            if fp in self.generated_paths:
-                self.generated_paths.remove(fp)
-            self.gallery_items.pop(fp, None)
-            if fp in self.ref_path_list:
-                idx = self.ref_path_list.index(fp)
-                self.remove_ref(idx)
+        # Snapshot keys under the lock so we don't walk a dict that a worker
+        # thread is simultaneously adding to. Disk I/O (os.path.exists) is
+        # done OUTSIDE the lock because it's potentially slow on network
+        # drives and would otherwise serialize all /api/gallery polls.
+        with self.gallery_lock:
+            keys = list(self.gallery_items.keys())
+        missing = [p for p in keys if not os.path.exists(p)]
+        if not missing:
+            return 0
+        # Second pass: remove them, again under the lock.
+        refs_to_remove = []
+        with self.gallery_lock:
+            for fp in missing:
+                self.favorites.discard(fp)
+                if fp in self.generated_paths:
+                    self.generated_paths.remove(fp)
+                self.gallery_items.pop(fp, None)
+        with self.ref_lock:
+            for fp in missing:
+                if fp in self.ref_path_list:
+                    refs_to_remove.append(self.ref_path_list.index(fp))
+        # remove_ref acquires ref_lock itself — call outside the snapshot lock
+        # and iterate high→low so indices stay valid.
+        for idx in sorted(refs_to_remove, reverse=True):
+            self.remove_ref(idx)
         return len(missing)
 
     # --- Project ---
@@ -932,11 +950,19 @@ class AppState:
             if os.path.exists(rp):
                 self.add_ref_image(rp, pinned=rp in pinned)
 
-        # Clear and restore gallery
-        self.gallery_items.clear()
-        self.generated_paths.clear()
-        self.favorites.clear()
-        self.gallery_order_counter = 0
+        # Clear and restore gallery (under the lock so /api/gallery polls
+        # don't see half-cleared state)
+        with self.gallery_lock:
+            self.gallery_items.clear()
+            self.generated_paths.clear()
+            self.favorites.clear()
+            self.gallery_order_counter = 0
+        # Reset run-scoped counters so the progress bar from a previous
+        # session doesn't carry over visually
+        self.done_count = 0
+        self.fail_count = 0
+        self.discarded_count = 0
+        self.queue_count = 0
 
         saved_items = data.get("gallery_items", [])
         restored = 0
@@ -1658,7 +1684,9 @@ def upload_refs():
 def browse_replace_ref():
     d = request.json or {}
     idx = d.get("index", -1)
-    if idx < 0 or idx >= len(state.ref_images):
+    with state.ref_lock:
+        in_range = 0 <= idx < len(state.ref_images)
+    if not in_range:
         return jsonify({"ok": False, "error": "Invalid index"})
     try:
         from tkinter import filedialog
@@ -1673,25 +1701,13 @@ def browse_replace_ref():
         root.destroy()
         if not fp:
             return jsonify({"ok": False})
-        # Replace the ref at index
-        try:
-            with Image.open(fp) as img:
-                pil = img.convert("RGB")
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)[:80]})
-        old_path = state.ref_path_list[idx]
-        old_img = state.ref_images[idx]
-        state.ref_images[idx] = pil
-        state.ref_path_list[idx] = fp
-        try:
-            old_img.close()
-        except Exception:
-            pass
-        if old_path != fp:
-            state.cleanup_temp_ref_path(old_path)
-        state.project_dirty = True
-        state.log(f"Replaced ref {idx + 1}: {os.path.basename(fp)}")
-        return jsonify({"ok": True})
+        # Delegate to the locked state method — avoids a second unlocked
+        # code path that used to race with /api/refs concurrent reads.
+        ok = state.replace_ref(idx, fp)
+        if ok:
+            state.log(f"Replaced ref {idx + 1}: {os.path.basename(fp)}")
+            return jsonify({"ok": True})
+        return jsonify({"ok": False, "error": "Replace failed"})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)[:80]})
 
@@ -1800,11 +1816,19 @@ def _is_path_allowed(fp):
     exfiltration from a malicious local webpage hitting 127.0.0.1.
 
     Allowlist (resolved real paths):
-      - anything currently in state.gallery_items
       - anything under state.output_dir
       - anything under state.temp_ref_dir (clipboard / uploaded refs)
       - project save dir (for thumbnails of recent-project previews)
-      - explicitly registered ref paths
+      - legacy Desktop project location
+      - explicit gallery/ref paths (prefix check handles most; this is the
+        escape hatch for cases where the user moved their output dir after
+        generating)
+
+    Directory check is done FIRST because it's the cheap case and handles the
+    99% path. The exact-match fallback was previously resolving realpath for
+    every gallery+ref item on every request — O(n) per /api/gallery/image and
+    /api/gallery/thumb, which destroys perf once the gallery grows past a few
+    hundred images.
     """
     if not fp:
         return False
@@ -1814,35 +1838,46 @@ def _is_path_allowed(fp):
         return False
     if not os.path.isfile(real):
         return False
-    # Known-good exact paths
-    if real in (os.path.realpath(p) for p in list(state.gallery_items.keys()) + list(state.ref_path_list)):
-        return True
-    # Allowed parent directories
+
+    # Check allowed parent directories first — cheap, covers the common case.
     allowed_dirs = []
-    try:
-        allowed_dirs.append(os.path.realpath(state.output_dir))
-    except Exception: pass
-    try:
-        allowed_dirs.append(os.path.realpath(state.temp_ref_dir))
-    except Exception: pass
-    try:
-        allowed_dirs.append(os.path.realpath(state.get_project_save_dir()))
-    except Exception: pass
-    # legacy Desktop location for recent projects
-    try:
-        allowed_dirs.append(os.path.realpath(
-            os.path.join(os.path.expanduser("~/Desktop"), "NanoBanana_Output", "NanoBanana JSON")
-        ))
-    except Exception: pass
-    for d in allowed_dirs:
-        if not d:
-            continue
+    for getter in (
+        lambda: state.output_dir,
+        lambda: state.temp_ref_dir,
+        lambda: state.get_project_save_dir(),
+        lambda: os.path.join(os.path.expanduser("~/Desktop"), "NanoBanana_Output", "NanoBanana JSON"),
+    ):
         try:
-            common = os.path.commonpath([real, d])
-            if common == d:
+            d = os.path.realpath(getter())
+            if d:
+                allowed_dirs.append(d)
+        except Exception:
+            continue
+    for d in allowed_dirs:
+        try:
+            if os.path.commonpath([real, d]) == d:
                 return True
         except ValueError:
+            # Different drive letters (C: vs D:) — commonpath raises, just skip.
             continue
+
+    # Exact-match fallback for paths outside the allowed dirs (user-picked
+    # refs, moved output folder). Snapshot under locks, then do the cheap
+    # string compare WITHOUT calling realpath on every item (the original
+    # code did n realpaths per request — perf cliff at ~500 items).
+    with state.gallery_lock:
+        gallery_paths = list(state.gallery_items.keys())
+    with state.ref_lock:
+        ref_paths = list(state.ref_path_list)
+    # Normcase for case-insensitive match on Windows; no realpath needed
+    # because the incoming `real` already resolved symlinks.
+    real_lower = os.path.normcase(real)
+    for p in gallery_paths:
+        if os.path.normcase(p) == real_lower:
+            return True
+    for p in ref_paths:
+        if os.path.normcase(p) == real_lower:
+            return True
     return False
 
 
@@ -2044,7 +2079,11 @@ def start_generate():
 
     with state.pending_jobs_lock:
         state.pending_jobs.extend(new_jobs)
-    state.queue_count += count
+        # Keep queue_count paired with pending_jobs mutations so a second
+        # /api/generate hitting before the first one returns doesn't lose an
+        # increment (int += is not atomic under the GIL for multi-threaded
+        # Flask).
+        state.queue_count += count
 
     if not was_generating:
         state.is_generating = True
@@ -2095,19 +2134,32 @@ def new_project():
     """Reset to a blank project. Clears prompts, refs, gallery items, favorites,
     current project path, and naming counter. Does NOT touch output_dir or
     on-disk files (generated images stay on disk; gallery just forgets them)."""
-    # Clear refs + close PIL handles
-    for img in state.ref_images:
-        try: img.close()
-        except Exception: pass
-    state.ref_images.clear()
-    state.ref_path_list.clear()
-    state.ref_pinned.clear()
+    # Refuse while generation is live — clearing state mid-run would leave
+    # the worker writing to freed lists.
+    if state.is_generating:
+        return jsonify({"ok": False, "error": "Cannot start new project while generating"})
 
-    # Clear gallery state (but don't delete files)
-    state.gallery_items.clear()
-    state.generated_paths.clear()
-    state.favorites.clear()
-    state.gallery_order_counter = 0
+    # Clear refs + close PIL handles (under ref_lock)
+    with state.ref_lock:
+        for img in state.ref_images:
+            try: img.close()
+            except Exception: pass
+        state.ref_images.clear()
+        state.ref_path_list.clear()
+        state.ref_pinned.clear()
+
+    # Clear gallery state (under gallery_lock) — but don't delete files
+    with state.gallery_lock:
+        state.gallery_items.clear()
+        state.generated_paths.clear()
+        state.favorites.clear()
+        state.gallery_order_counter = 0
+
+    # Reset counters that drive the progress bar so the UI starts clean
+    state.done_count = 0
+    state.fail_count = 0
+    state.discarded_count = 0
+    state.queue_count = 0
 
     # Reset prompts + settings to defaults
     state.fixed_prompt = ""
@@ -2117,7 +2169,8 @@ def new_project():
     state.resolution = "4K"
     state.count = 1
     state.naming_enabled = False
-    state.file_counter = 0
+    with state.file_counter_lock:
+        state.file_counter = 0
 
     state.current_project_path = None
     state.project_dirty = False

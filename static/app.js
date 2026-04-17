@@ -236,15 +236,10 @@ function showUpdateConfirmModal(current, remote) {
         <span style="color:#636366">지금 설치하면 앱이 자동으로 다시 열립니다.</span>
       </div>
       <div style="display:flex;justify-content:flex-end;gap:8px">
-        <button id="nbUpdateLater" style="background:#3A3A3C;color:#F5F5F7;border:none;border-radius:8px;height:34px;padding:0 16px;font-size:12px;font-weight:600;cursor:pointer">나중에</button>
         <button id="nbUpdateNow" style="background:#D4A574;color:#1C1C1E;border:none;border-radius:8px;height:34px;padding:0 18px;font-size:12px;font-weight:700;cursor:pointer">지금 설치</button>
       </div>
     </div>`;
   document.body.appendChild(w);
-  document.getElementById("nbUpdateLater").addEventListener("click", () => {
-    w.remove();
-    _updateConfirmShown = false;
-  });
   document.getElementById("nbUpdateNow").addEventListener("click", async () => {
     w.remove();
     _updateConfirmShown = false;

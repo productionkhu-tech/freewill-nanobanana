@@ -1781,6 +1781,41 @@ def _sanitize_project_name(name):
     return cleaned[:80]
 
 
+@app.route("/api/project/new", methods=["POST"])
+def new_project():
+    """Reset to a blank project. Clears prompts, refs, gallery items, favorites,
+    current project path, and naming counter. Does NOT touch output_dir or
+    on-disk files (generated images stay on disk; gallery just forgets them)."""
+    # Clear refs + close PIL handles
+    for img in state.ref_images:
+        try: img.close()
+        except Exception: pass
+    state.ref_images.clear()
+    state.ref_path_list.clear()
+    state.ref_pinned.clear()
+
+    # Clear gallery state (but don't delete files)
+    state.gallery_items.clear()
+    state.generated_paths.clear()
+    state.favorites.clear()
+    state.gallery_order_counter = 0
+
+    # Reset prompts + settings to defaults
+    state.fixed_prompt = ""
+    state.prompt_sections = [""]
+    state.model = "gemini-3-pro-image-preview"
+    state.aspect = "16:9"
+    state.resolution = "4K"
+    state.count = 1
+    state.naming_enabled = False
+    state.file_counter = 0
+
+    state.current_project_path = None
+    state.project_dirty = False
+    state.log("New project — cleared workspace")
+    return jsonify({"ok": True})
+
+
 @app.route("/api/project/save", methods=["POST"])
 def save_project():
     d = request.json or {}

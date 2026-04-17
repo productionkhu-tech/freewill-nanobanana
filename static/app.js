@@ -86,6 +86,16 @@ function setupKeyboardShortcuts() {
       saveProject();
       return;
     }
+    if (e.ctrlKey && (e.key === "n" || e.key === "N")) {
+      e.preventDefault();
+      newProject();
+      return;
+    }
+    if (e.ctrlKey && (e.key === "o" || e.key === "O")) {
+      e.preventDefault();
+      loadProject();
+      return;
+    }
 
     const tag = document.activeElement?.tagName;
     const isText = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
@@ -1087,6 +1097,11 @@ async function refreshApiStatus() {
   if (d.is_generating) updateGenUI(true, d.outstanding || 0);
   if (!d.is_generating && isGenerating) { updateGenUI(false, 0); refreshGallery(); }
   if (d.close_requested) showCloseDialog();
+  // Keep window title in sync with project dirty state
+  const projName = d.current_project
+    ? d.current_project.split(/[\\/]/).pop().replace(/\.json$/i, "")
+    : "";
+  updateTitleDirty(!!d.project_dirty, projName);
 }
 
 // ==========================================
@@ -1098,6 +1113,72 @@ async function browseFolder() {
     document.getElementById("folderInput").value = d.folder;
     showToast("Folder set", "success");
   }
+}
+
+// ==========================================
+// New Project — Ctrl+N, sidebar button
+// ==========================================
+async function newProject() {
+  // Fetch dirty state + current project name
+  let info = {};
+  try { info = await api("/api/close-info"); } catch (e) {}
+  const dirty = !!info.project_dirty;
+  const hasContent = !!info.has_content;
+
+  // Nothing to lose — just reset
+  if (!hasContent || (!dirty && !info.current_project)) {
+    await _doNewProject();
+    return;
+  }
+
+  // Show confirmation modal
+  const cur = document.getElementById("newProjectCurrent");
+  if (info.current_project_name) {
+    cur.style.display = "block";
+    cur.textContent = `현재 프로젝트: ${info.current_project_name}`;
+  } else {
+    cur.style.display = "none";
+  }
+  document.getElementById("newProjectModal").classList.remove("hidden");
+}
+
+async function _doNewProject() {
+  // Clear server state
+  await api("/api/project/new", { method: "POST" });
+  // Reload UI from fresh server state
+  await loadSettings();
+  await refreshGallery();
+  await refreshRefs();
+  updateTitleDirty(false, "");
+  showToast("New project started", "success");
+}
+
+function newProjectCancel() {
+  document.getElementById("newProjectModal").classList.add("hidden");
+}
+
+async function newProjectDiscard() {
+  document.getElementById("newProjectModal").classList.add("hidden");
+  await _doNewProject();
+}
+
+async function newProjectSaveAndContinue() {
+  document.getElementById("newProjectModal").classList.add("hidden");
+  await saveSettings();
+  const d = await api("/api/project/save", { method: "POST", body: {} });
+  if (!d.ok) {
+    showToast(d.error || "저장 실패", "error");
+    return;
+  }
+  await _doNewProject();
+}
+
+// Keep the window title in sync with project state ("NanoBanana — name *")
+function updateTitleDirty(dirty, projectName) {
+  let base = "NanoBanana";
+  if (projectName) base += ` — ${projectName}`;
+  if (dirty) base += " *";
+  document.title = base;
 }
 
 async function saveProject() {

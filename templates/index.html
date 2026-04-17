@@ -98,8 +98,9 @@
         <button class="btn-sm" onclick="browseFolder()">Browse</button>
       </div>
       <div class="btn-row">
-        <button class="btn-sm" onclick="saveProject()">Save Project</button>
-        <button class="btn-sm" onclick="loadProject()">Load Project</button>
+        <button class="btn-sm" onclick="newProject()" title="Ctrl+N">New</button>
+        <button class="btn-sm" onclick="saveProject()" title="Ctrl+S">Save</button>
+        <button class="btn-sm" onclick="loadProject()" title="Ctrl+O">Load</button>
       </div>
 
       <!-- File Naming -->
@@ -220,6 +221,20 @@
     "></div>
     <div class="close-buttons">
       <button class="btn-accent-sm" onclick="closeReleaseNotes()">확인</button>
+    </div>
+  </div>
+</div>
+
+<!-- NEW PROJECT CONFIRM MODAL -->
+<div id="newProjectModal" class="close-modal hidden">
+  <div class="close-dialog">
+    <h2>Start a new project?</h2>
+    <p class="close-desc" id="newProjectDesc">현재 작업 중인 프로젝트에 저장하지 않은 변경사항이 있어요. 먼저 저장하시겠어요?</p>
+    <p class="close-current" id="newProjectCurrent" style="display:none"></p>
+    <div class="close-buttons">
+      <button class="btn-sm" onclick="newProjectCancel()">Cancel</button>
+      <button class="btn-sm" onclick="newProjectDiscard()">Don't Save</button>
+      <button class="btn-accent-sm" onclick="newProjectSaveAndContinue()">Save & New</button>
     </div>
   </div>
 </div>

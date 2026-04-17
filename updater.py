@@ -157,17 +157,35 @@ def _find_release_assets(version_tag):
     return exe_url, (inline_sha or remote_sha)
 
 
-def _download_with_retry(url, dest_path, attempts=3):
-    """Stream download with a short retry loop. A truncated mid-stream
-    download would otherwise pass the size check but crash on launch."""
+def _download_with_retry(url, dest_path, attempts=3, on_progress=None):
+    """Stream download with retry. Calls on_progress(bytes_done, total)
+    periodically so the UI can show a real progress bar during the ~10s
+    download instead of just a spinner."""
     last_err = None
     for i in range(attempts):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "NanoBanana-Updater"})
             with urllib.request.urlopen(req, timeout=120) as resp:
                 total = int(resp.headers.get("Content-Length") or 0)
+                done = 0
+                chunk_size = 1 << 15  # 32KB
+                last_reported = 0
                 with open(dest_path, "wb") as f:
-                    shutil.copyfileobj(resp, f)
+                    while True:
+                        chunk = resp.read(chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        done += len(chunk)
+                        # Throttle callbacks to ~20 updates over the whole
+                        # download — calling into the Flask event queue
+                        # every 32KB would spam the frontend.
+                        if on_progress and (done - last_reported >= 512 * 1024 or done == total):
+                            try:
+                                on_progress(done, total)
+                            except Exception:
+                                pass
+                            last_reported = done
             got = os.path.getsize(dest_path)
             if total and got != total:
                 raise IOError(f"Short read: got {got}, expected {total}")
@@ -191,22 +209,34 @@ def _sha256_of(path, chunk=1 << 20):
     return h.hexdigest()
 
 
-def apply_update_and_relaunch(version_tag):
-    """Download the new EXE, write a swap-and-relaunch .bat, spawn it, exit.
+def apply_update_and_relaunch(version_tag, on_progress=None):
+    """Download the new EXE, then spawn it in --updater mode so IT does
+    the swap from a clean Python process. Returns True on success
+    (caller must immediately os._exit(0)).
 
-    Returns True on success (caller should immediately sys.exit(0)).
-    Raises on network / download / filesystem errors.
+    This is a ground-up rewrite vs the pre-v1732 batch-script approach.
+    Old design: write a .bat, rely on cmd.exe to rename/move/start the
+    new EXE. That had endless problems on Korean Windows:
+      - cp949 codepage mangling paths
+      - _MEIPASS2 env var leaking through cmd to the new EXE
+      - AV interrupting `start`, no real way to recover
+      - visible cmd/find windows from tasklist checks
+      - orphaned .old/.new.exe files when any step silently failed
+
+    New design: the newly-downloaded EXE itself IS the updater. We spawn
+    it with `NanoBanana.new.exe --updater <old_path>`, it waits for the
+    old process to exit, atomically replaces the old file with its own
+    bytes, and launches the result. No bat, no environment tricks, pure
+    Python. Because the updater process has its own fresh _MEI extraction
+    folder, the _MEIPASS2 issue can't exist.
     """
     if not getattr(sys, "frozen", False):
-        # Dev mode — not much we can do to "replace" anything.
         raise RuntimeError("Auto-update is only supported on the frozen EXE.")
 
     exe_path = sys.executable
     exe_dir = os.path.dirname(exe_path)
-    exe_name = os.path.basename(exe_path)
 
-    # If the EXE lives under Program Files we'd need UAC to overwrite it.
-    # Surface that clearly so the user can move the install elsewhere.
+    # Program Files installs need UAC to overwrite themselves — refuse.
     pf1 = os.environ.get("ProgramFiles", "")
     pf2 = os.environ.get("ProgramFiles(x86)", "")
     exe_real = os.path.realpath(exe_path)
@@ -223,15 +253,12 @@ def apply_update_and_relaunch(version_tag):
 
     new_exe_path = os.path.join(exe_dir, "NanoBanana.new.exe")
     print(f"  Downloading {version_tag} EXE...")
-    _download_with_retry(url, new_exe_path)
+    _download_with_retry(url, new_exe_path, on_progress=on_progress)
     size = os.path.getsize(new_exe_path)
     if size < 1_000_000:
         try: os.remove(new_exe_path)
         except Exception: pass
         raise RuntimeError(f"Downloaded file too small ({size} bytes)")
-    # Integrity check — if the release publishes a sha256 (inline in body or
-    # sidecar asset) we verify here. A mismatch aborts the swap so we never
-    # replace a working EXE with a corrupted download.
     if expected_sha:
         got_sha = _sha256_of(new_exe_path)
         if got_sha.lower() != expected_sha.lower():
@@ -243,158 +270,22 @@ def apply_update_and_relaunch(version_tag):
         print(f"  SHA256 verified")
     print(f"  Downloaded {size/1024/1024:.1f} MB")
 
-    # Write the swap script into %TEMP% so antivirus doesn't flag a bat
-    # sitting next to the EXE.
-    swap_bat = os.path.join(
-        tempfile.gettempdir(),
-        f"nanobanana_update_{int(time.time())}.bat",
-    )
-
-    # The .bat:
-    #   1. Wait up to ~15s for the old EXE to release its file handle
-    #   2. Move NanoBanana.new.exe over NanoBanana.exe (replaces atomically on Windows)
-    #   3. Launch the new EXE
-    #   4. Delete itself
-    # Pass our PID to the bat so it can force-kill the lingering process if
-    # the polite exit didn't release the EXE handle.
-    #
-    # KEY FIX vs v1723 and earlier: `chcp 65001` at the top of the bat.
-    # On Korean Windows the console default codepage is 949 (EUC-KR). When
-    # cmd.exe reads a UTF-8 encoded .bat file in cp949 mode, any Korean
-    # character in a path like "C:\Users\...\나노바나나 api\NanoBanana.exe"
-    # gets mangled into garbage bytes. Every `ren`/`move`/`start` then
-    # silently fails because the mangled path doesn't exist, and the bat
-    # falls through to :fail with no diagnostic. Switching to UTF-8
-    # codepage BEFORE the path variables are expanded fixes this.
-    #
-    # Also writes a log to %TEMP%\nanobanana_update.log so future failures
-    # are debuggable instead of mysterious.
-    our_pid = os.getpid()
-    bat_body = f"""@echo off
-chcp 65001 >nul 2>&1
-setlocal EnableDelayedExpansion
-set "OLD={exe_path}"
-set "NEW={new_exe_path}"
-set "PID={our_pid}"
-set "BACKUP=%OLD%.old"
-set "LOG=%TEMP%\\nanobanana_update.log"
-
-echo ==== %DATE% %TIME% ==== >> "%LOG%"
-echo OLD="%OLD%" >> "%LOG%"
-echo NEW="%NEW%" >> "%LOG%"
-echo PID=%PID% >> "%LOG%"
-
-set "TRIES=0"
-:wait_loop
-REM Probe: if the running EXE releases its file handle, rename succeeds.
-ren "%OLD%" "{exe_name}.old" >nul 2>&1
-if not errorlevel 1 goto :do_move
-set /a TRIES+=1
-echo wait_loop try=!TRIES! rc=%errorlevel% >> "%LOG%"
-if !TRIES! GEQ 6 goto :force_kill
-ping -n 2 127.0.0.1 >nul
-goto :wait_loop
-
-:force_kill
-echo force_kill PID=%PID% >> "%LOG%"
-taskkill /F /PID %PID% >nul 2>&1
-ping -n 2 127.0.0.1 >nul
-ren "%OLD%" "{exe_name}.old" >nul 2>&1
-if not errorlevel 1 goto :do_move
-echo taskkill by name (last resort) >> "%LOG%"
-taskkill /F /IM "{exe_name}" >nul 2>&1
-ping -n 2 127.0.0.1 >nul
-ren "%OLD%" "{exe_name}.old" >nul 2>&1
-if errorlevel 1 (
-    echo rename still failing after both taskkills >> "%LOG%"
-    goto :fail
-)
-
-:do_move
-REM OLD has been renamed to OLD.old; the OLD position is empty.
-REM Move NEW into that position (disk-move, not copy, so it's atomic on same volume).
-echo moving "%NEW%" -^> "%OLD%" >> "%LOG%"
-move /y "%NEW%" "%OLD%" >nul 2>&1
-if errorlevel 1 (
-    echo move failed rc=%errorlevel%, restoring backup >> "%LOG%"
-    if exist "%BACKUP%" ren "%BACKUP%" "{exe_name}" >nul 2>&1
-    goto :fail
-)
-echo move ok, cleaning backup >> "%LOG%"
-REM Force-delete the backup. If Windows is still holding a reference to
-REM the renamed-away file (rare but happens on some AV configs), wait a
-REM beat and retry so we don't leave NanoBanana.exe.old orphaned in the
-REM user's folder forever.
-del /F /Q "%BACKUP%" >nul 2>&1
-if exist "%BACKUP%" (
-    echo backup still present, retrying after 1s >> "%LOG%"
-    ping -n 2 127.0.0.1 >nul
-    del /F /Q "%BACKUP%" >nul 2>&1
-)
-if exist "%BACKUP%" echo WARN backup could not be removed >> "%LOG%"
-REM Belt-and-suspenders: clear PyInstaller's _MEIPASS* env vars so the
-REM new EXE's bootloader re-extracts instead of trying to reuse the old
-REM process's (now-dead) _MEI temp folder. The Python-side Popen also
-REM strips these, but if anything along the chain reintroduces them
-REM we nuke them here too before `start`.
-set "_MEIPASS="
-set "_MEIPASS2="
-REM Brief pause so AV scanners can finish their "freshly-written binary"
-REM scan before we try to run it. Without this some AV configs reject
-REM the launch for a couple seconds after a move, which showed up as
-REM "update completed but app didn't reopen".
-ping -n 3 127.0.0.1 >nul
-echo launching new EXE >> "%LOG%"
-start "NanoBanana" "%OLD%"
-REM Verify it actually started. If `start` returned fine but the process
-REM didn't stay up (AV quarantined, missing DLL, etc.) we retry once.
-ping -n 3 127.0.0.1 >nul
-tasklist /FI "IMAGENAME eq {exe_name}" 2>nul | find /I "{exe_name}" >nul
-if errorlevel 1 (
-    echo first start did not stick, retrying >> "%LOG%"
-    start "NanoBanana" "%OLD%"
-    ping -n 3 127.0.0.1 >nul
-    tasklist /FI "IMAGENAME eq {exe_name}" 2>nul | find /I "{exe_name}" >nul
-    if errorlevel 1 echo WARN new EXE not running after two start attempts >> "%LOG%"
-)
-echo SUCCESS >> "%LOG%"
-goto :cleanup
-
-:fail
-echo FAIL >> "%LOG%"
-REM Try to leave the user SOMETHING runnable.
-if exist "%OLD%" start "" "%OLD%" & goto :cleanup
-if exist "%BACKUP%" (
-    ren "%BACKUP%" "{exe_name}" >nul 2>&1
-    if exist "%OLD%" start "" "%OLD%"
-)
-
-:cleanup
-(goto) 2>nul & del "%~f0"
-"""
-    # No BOM — cmd's `chcp 65001` directive at the top switches the
-    # codepage BEFORE the variable assignments are parsed. Writing with
-    # utf-8-sig would put a BOM at byte 0 which cmd treats as garbage
-    # before even seeing @echo off.
-    with open(swap_bat, "w", encoding="utf-8") as f:
-        f.write(bat_body)
-
-    print(f"  Launching swap script: {swap_bat}")
-    # Detached, no console
+    # Spawn the fresh EXE in --updater mode. Its own bootloader extracts
+    # its own _MEI folder independently of ours. Pass a cleaned env so
+    # even if something re-introduces _MEIPASS2 elsewhere, the new process
+    # doesn't inherit it.
     DETACHED_PROCESS = 0x00000008
     CREATE_NO_WINDOW = 0x08000000
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
     import subprocess
-    # CRITICAL: strip PyInstaller's _MEIPASS* env vars before the bat
-    # inherits them. Otherwise the new NanoBanana.exe we launch via
-    # `start` sees _MEIPASS2 pointing at OUR _MEI folder, tries to reuse
-    # it instead of extracting its own runtime, and dies with
-    # "Failed to load Python DLL ..._MEI<old>\\python312.dll".
     clean_env = {k: v for k, v in os.environ.items() if not k.startswith("_MEI")}
+    print(f"  Spawning updater: {new_exe_path} --updater {exe_path}")
     subprocess.Popen(
-        ["cmd", "/c", swap_bat],
-        creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
+        [new_exe_path, "--updater", exe_path],
+        creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
         close_fds=True,
         env=clean_env,
+        cwd=exe_dir,
     )
     return True
 

@@ -1381,6 +1381,18 @@ async function pollEvents() {
       // user still sees whether the check ran and what it found.
       const kind = ev.has_update ? "success" : (ev.message && ev.message.includes("failed") ? "warn" : "info");
       showToast(ev.message || "Update check complete", kind);
+    } else if (ev.type === "update_progress") {
+      // Live download progress during auto-update. Drives the overlay
+      // that launcher.py injected when the user clicked Yes on the
+      // update prompt.
+      const pct = typeof ev.pct === "number" ? ev.pct : 0;
+      const mb = ev.total ? `${(ev.done/1048576).toFixed(1)}/${(ev.total/1048576).toFixed(1)}MB` : "";
+      const bar = document.getElementById("nbUpdateBar");
+      const lbl = document.getElementById("nbUpdateLabel");
+      const sub = document.getElementById("nbUpdateSub");
+      if (bar) bar.style.width = pct + "%";
+      if (lbl) lbl.textContent = pct >= 100 ? "설치 준비 중…" : "다운로드 중…";
+      if (sub) sub.textContent = pct >= 100 ? "곧 재시작됩니다" : `${pct}% · ${mb}`;
     } else if (ev.type === "done") {
       document.querySelectorAll(".skeleton").forEach(s => s.remove());
       updateGenUI(false, 0);

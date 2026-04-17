@@ -465,8 +465,122 @@ def start_flask_server(port):
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True, use_reloader=False)
 
 
+def _run_as_updater(target_path):
+    """Run as the updater child process. We were spawned as
+    `NanoBanana.new.exe --updater <target_path>`. Our job:
+      1. Wait for the old NanoBanana.exe at target_path to release its
+         file handle (old process exiting)
+      2. Atomically copy our own bytes to target_path
+      3. Launch target_path as a normal app
+      4. Exit — our extraction folder gets cleaned up naturally
+
+    Because we're a separately-spawned process with our OWN PyInstaller
+    extraction, we don't inherit the parent's _MEIPASS2 env var, we're
+    not running from a bat script, and we can use Python's full
+    shutil/subprocess toolbox instead of fighting cmd.exe quirks.
+    """
+    import time
+    import shutil
+    import subprocess as _sub
+    our_path = sys.executable
+    log_path = os.path.join(
+        os.environ.get("TEMP", os.path.expanduser("~")),
+        "nanobanana_update.log",
+    )
+
+    def _log(msg):
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+        except Exception:
+            pass
+        print(msg)
+
+    _log(f"=== --updater start ===")
+    _log(f"  our_path={our_path}")
+    _log(f"  target  ={target_path}")
+
+    # Wait for target to be unlocked. Probe by attempting a rename onto
+    # itself — if that succeeds, the handle is free.
+    target_dir = os.path.dirname(target_path)
+    probe = os.path.join(target_dir, ".nanobanana_lock_probe")
+    for i in range(30):
+        try:
+            if not os.path.exists(target_path):
+                break
+            os.replace(target_path, probe)
+            os.replace(probe, target_path)
+            break
+        except (OSError, PermissionError):
+            time.sleep(1)
+    else:
+        _log("  target still locked after 30s — force-killing by name")
+        try:
+            _sub.run(
+                ["taskkill", "/F", "/IM", os.path.basename(target_path)],
+                timeout=5, creationflags=0x08000000,  # CREATE_NO_WINDOW
+            )
+        except Exception as e:
+            _log(f"  taskkill failed: {e}")
+        time.sleep(2)
+
+    # Copy ourselves to target via a temp file + atomic replace. If the
+    # copy fails halfway we don't damage the existing target.
+    tmp = target_path + ".replacing"
+    try:
+        _log(f"  copy self -> {tmp}")
+        shutil.copy2(our_path, tmp)
+        _log(f"  os.replace {tmp} -> {target_path}")
+        os.replace(tmp, target_path)
+    except Exception as e:
+        _log(f"  FAIL copy/replace: {e}")
+        try: os.remove(tmp)
+        except Exception: pass
+        # The existing target was not touched, so launching it should work.
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                f"업데이트 적용 실패:\n{e}\n\n기존 버전으로 실행합니다.",
+                "NanoBanana", 0x10,
+            )
+        except Exception: pass
+        try:
+            _sub.Popen(
+                [target_path],
+                cwd=target_dir,
+                creationflags=0x00000008 | 0x08000000,  # DETACHED | NO_WINDOW
+                close_fds=True,
+            )
+        except Exception: pass
+        sys.exit(1)
+
+    # Clean up our own file (NanoBanana.new.exe) — we can't delete ourselves
+    # while running, but the launched target's next startup will do it via
+    # orphan cleanup. Just launch and exit.
+    _log(f"  launching {target_path}")
+    try:
+        _sub.Popen(
+            [target_path],
+            cwd=target_dir,
+            creationflags=0x00000008 | 0x08000000,  # DETACHED | NO_WINDOW
+            close_fds=True,
+        )
+        _log("  launched OK")
+    except Exception as e:
+        _log(f"  launch failed: {e}")
+    sys.exit(0)
+
+
 def main():
     global _window
+
+    # --updater mode: we were invoked as NanoBanana.new.exe to do the swap.
+    # Check BEFORE any UI / Flask / mutex work — this is a short-lived
+    # headless helper process.
+    if len(sys.argv) >= 3 and sys.argv[1] == "--updater":
+        return _run_as_updater(sys.argv[2])
+
     print("=" * 50)
     print("  NanoBanana - AI Image Studio")
     print("=" * 50)
@@ -605,20 +719,35 @@ def main():
                                 var o=document.createElement('div');
                                 o.id='nbUpdateOverlay';
                                 o.style.cssText='position:fixed;inset:0;background:rgba(12,12,14,0.96);z-index:99999;display:flex;align-items:center;justify-content:center;color:#F5F5F7;font-family:Malgun Gothic,Segoe UI,sans-serif';
-                                o.innerHTML='<div style=\"text-align:center;padding:40px\"><div style=\"font-size:22px;font-weight:600;margin-bottom:14px\">업데이트 설치 중…</div><div style=\"font-size:13px;color:#A1A1A6;line-height:1.7\">새 버전을 다운로드하고 있어요.<br>잠시 후 앱이 자동으로 다시 열립니다.</div><div style=\"margin-top:22px;width:220px;height:3px;background:#2C2C2E;border-radius:999px;overflow:hidden\"><div style=\"height:100%;background:#D4A574;animation:nbp 1.2s ease-in-out infinite\"></div></div></div><style>@keyframes nbp{0%{width:0;margin-left:0}50%{width:100%;margin-left:0}100%{width:0;margin-left:100%}}</style>';
+                                o.innerHTML='<div style=\"text-align:center;padding:40px;min-width:320px\"><div id=\"nbUpdateLabel\" style=\"font-size:22px;font-weight:600;margin-bottom:10px\">업데이트 준비 중…</div><div id=\"nbUpdateSub\" style=\"font-size:13px;color:#A1A1A6;line-height:1.7;margin-bottom:20px\">서버에서 새 버전을 받아오고 있습니다.</div><div style=\"width:280px;height:6px;background:#2C2C2E;border-radius:999px;overflow:hidden;margin:0 auto\"><div id=\"nbUpdateBar\" style=\"height:100%;width:0%;background:#D4A574;transition:width .2s linear;border-radius:999px\"></div></div><div style=\"margin-top:16px;font-size:11px;color:#636366\">잠시 후 앱이 자동으로 다시 열립니다.</div></div>';
                                 document.body.appendChild(o);
                             })();
                         """)
                     except Exception:
                         pass
                 try:
-                    apply_update_and_relaunch(remote)
+                    # Progress callback pushes update_progress events to the
+                    # frontend so the overlay shows a real progress bar
+                    # during the ~10s download instead of a spinner.
+                    def _on_dl_progress(done, total):
+                        try:
+                            from app import state
+                            pct = int(done * 100 / total) if total else 0
+                            state.push_event({
+                                "type": "update_progress",
+                                "done": done, "total": total, "pct": pct,
+                            })
+                        except Exception:
+                            pass
+                    apply_update_and_relaunch(remote, on_progress=_on_dl_progress)
+                    # Give the progress poll one last tick to deliver the
+                    # "100% / launching" frame before we die.
+                    time.sleep(0.3)
                     # Force immediate process termination. sys.exit(0) from a
                     # daemon thread only kills the thread - the main pywebview
-                    # loop keeps running and holds the EXE handle, which
-                    # causes swap.bat to time out waiting to rename. os._exit
-                    # terminates the whole process with no unwind so the file
-                    # lock is released immediately and the bat can swap.
+                    # loop keeps running and holds the EXE handle. os._exit
+                    # releases the handle immediately so the updater child
+                    # can replace us.
                     os._exit(0)
                 except Exception as e:
                     # Remove the overlay so the user can see/use the app again

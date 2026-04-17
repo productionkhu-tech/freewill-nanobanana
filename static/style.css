@@ -1270,3 +1270,52 @@ footer {
 }
 .btn-accent-sm:hover { background: var(--accent-h); }
 .btn-accent-sm:active { transform: scale(.96); }
+
+/* Release-notes modal — clean, friendly styling */
+.rn-dialog {
+  width: 520px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+.rn-dialog h2 {
+  font-size: 18px;
+  font-weight: bold;
+  margin-bottom: 10px;
+  color: var(--text);
+}
+.rn-version-line {
+  font-size: 12px;
+  color: var(--text2);
+  margin-bottom: 14px;
+}
+.rn-version-line strong {
+  color: var(--accent);
+  font-size: 13px;
+  font-family: 'Cascadia Code','Consolas',monospace;
+  margin-right: 6px;
+}
+.rn-notes {
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+  max-height: 340px;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text);
+  margin-bottom: 16px;
+  font-family: inherit;
+}
+.rn-notes p  { margin: 0 0 8px 0; color: var(--text); }
+.rn-notes p:last-child  { margin-bottom: 0; }
+.rn-notes ul { margin: 0 0 8px 0; padding-left: 18px; }
+.rn-notes ul:last-child  { margin-bottom: 0; }
+.rn-notes li {
+  margin-bottom: 4px;
+  color: var(--text);
+  list-style: disc;
+}
+.rn-notes li::marker { color: var(--accent); }
+.rn-empty  { color: var(--text3); text-align: center; padding: 8px 0; }

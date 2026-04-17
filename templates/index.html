@@ -153,7 +153,7 @@
     <div class="gallery-header">
       <span class="gallery-title">Generated Images</span>
       <div class="gallery-actions">
-        <input type="text" id="gallerySearch" placeholder="Search prompts..." oninput="filterGallery()">
+        <input type="text" id="gallerySearch" placeholder="Search prompts..." oninput="filterGallery()" oncompositionend="filterGalleryImmediate()">
         <div class="layout-btns">
           <button class="layout-btn" data-cols="1" onclick="setColumns(1)">1</button>
           <button class="layout-btn active" data-cols="2" onclick="setColumns(2)">2</button>
@@ -199,26 +199,13 @@
 
 <!-- RELEASE NOTES MODAL (shown once after an update) -->
 <div id="releaseNotesModal" class="close-modal hidden">
-  <div class="close-dialog" style="width:580px;max-height:80vh">
-    <h2>🎉 업데이트 완료!</h2>
-    <p class="close-desc">
-      <strong id="rnVersion" style="color:var(--accent)"></strong> 버전이 적용되었어요.
-      <span id="rnPrevious" style="color:var(--text3);font-size:10px"></span>
+  <div class="close-dialog rn-dialog">
+    <h2>업데이트 완료</h2>
+    <p class="close-desc rn-version-line">
+      <strong id="rnVersion"></strong>
+      <span id="rnPrevious"></span>
     </p>
-    <div id="rnNotes" style="
-      background:var(--input-bg);
-      border:1px solid var(--border);
-      border-radius:10px;
-      padding:14px 16px;
-      max-height:320px;
-      overflow-y:auto;
-      font-size:11px;
-      line-height:1.7;
-      white-space:pre-wrap;
-      color:var(--text);
-      margin-bottom:16px;
-      font-family:inherit;
-    "></div>
+    <div id="rnNotes" class="rn-notes"></div>
     <div class="close-buttons">
       <button class="btn-accent-sm" onclick="closeReleaseNotes()">확인</button>
     </div>
@@ -293,13 +280,13 @@
 <div id="projectsModal" class="projects-modal hidden">
   <div class="projects-dialog">
     <div class="projects-dialog-header">
-      <h2>Open a recent project?</h2>
-      <p>Choose a recent JSON project or start with a blank workspace.</p>
+      <h2 id="projectsModalTitle">프로젝트 열기</h2>
+      <p id="projectsModalDesc">최근 프로젝트에서 선택하거나 다른 위치의 JSON 파일을 열 수 있어요.</p>
     </div>
     <div class="projects-dialog-body" id="projectsList"></div>
     <div class="projects-dialog-footer">
-      <button class="btn-sm" onclick="loadProjectFromBrowser()">Open Other JSON</button>
-      <button class="btn-sm" onclick="closeProjectsModal()">Start Fresh</button>
+      <button class="btn-sm" onclick="loadProjectFromBrowser()">다른 파일 찾기</button>
+      <button class="btn-sm" onclick="closeProjectsModal()" id="projectsModalCancelBtn">취소</button>
     </div>
   </div>
 </div>

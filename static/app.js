@@ -47,14 +47,40 @@ async function checkReleaseNotes() {
     if (!d.show) return;
     document.getElementById("rnVersion").textContent = d.version || "";
     const prevEl = document.getElementById("rnPrevious");
-    if (d.previous) {
-      prevEl.textContent = `  (이전: ${d.previous})`;
-    } else {
-      prevEl.textContent = "";
-    }
-    document.getElementById("rnNotes").textContent = d.notes || "새로운 버전이 적용되었습니다.";
+    prevEl.textContent = "";  // previous version 표시는 제거 (일반 사용자에겐 불필요)
+    document.getElementById("rnNotes").innerHTML = _renderReleaseNotes(d.notes || "");
     document.getElementById("releaseNotesModal").classList.remove("hidden");
   } catch (e) { /* network/server down — skip silently */ }
+}
+
+// Render a friendly release-notes block from the raw body string.
+// Strips markdown noise (**, ##, backticks) and turns bullet lines into a clean list.
+function _renderReleaseNotes(raw) {
+  if (!raw) return "<div class='rn-empty'>새 버전이 적용되었어요.</div>";
+  const esc = (s) => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  const lines = raw.split(/\r?\n/);
+  const out = [];
+  let inList = false;
+  const flushList = () => { if (inList) { out.push("</ul>"); inList = false; } };
+
+  for (let raw_line of lines) {
+    // Strip markdown syntax the user called out — **, ##, backticks
+    let line = raw_line
+      .replace(/`([^`]+)`/g, "$1")   // inline code
+      .replace(/\*\*([^*]+)\*\*/g, "$1")  // **bold**
+      .replace(/^#{1,6}\s*/, "")      // ## heading → plain
+      .trim();
+    if (!line) { flushList(); continue; }
+    if (/^[-*]\s+/.test(line)) {
+      if (!inList) { out.push("<ul>"); inList = true; }
+      out.push(`<li>${esc(line.replace(/^[-*]\s+/, ""))}</li>`);
+    } else {
+      flushList();
+      out.push(`<p>${esc(line)}</p>`);
+    }
+  }
+  flushList();
+  return out.join("");
 }
 
 function closeReleaseNotes() {
@@ -259,6 +285,9 @@ function addPromptSection(initialText = "") {
     syncPromptHighlight(ta);
     scheduleSettingsSave();
   });
+  // Also try on keyup so direct `@` key press triggers the menu even if
+  // the input event fired before selectionStart moved.
+  ta.addEventListener("keyup", () => _tryShowMention(ta));
   ta.addEventListener("scroll", () => syncPromptHighlight(ta));
   ta.addEventListener("keydown", (e) => onPromptKeydown(e, ta));
   wrap.appendChild(ta);
@@ -283,14 +312,21 @@ function _buildHighlightedHTML(text) {
     + "\n";  // keep trailing line so final newline is rendered
 }
 
+// rAF-coalesced highlight update — at most one DOM rewrite per frame,
+// even if user types very fast (Korean IME emits many events per second).
+const _pendingHighlights = new WeakSet();
 function syncPromptHighlight(textarea) {
-  const wrap = textarea.closest(".prompt-wrap");
-  if (!wrap) return;
-  const hl = wrap.querySelector(".prompt-highlight");
-  if (!hl) return;
-  hl.innerHTML = _buildHighlightedHTML(textarea.value);
-  // Keep scroll positions in sync
-  hl.scrollTop = textarea.scrollTop;
+  if (_pendingHighlights.has(textarea)) return;
+  _pendingHighlights.add(textarea);
+  requestAnimationFrame(() => {
+    _pendingHighlights.delete(textarea);
+    const wrap = textarea.closest(".prompt-wrap");
+    if (!wrap) return;
+    const hl = wrap.querySelector(".prompt-highlight");
+    if (!hl) return;
+    hl.innerHTML = _buildHighlightedHTML(textarea.value);
+    hl.scrollTop = textarea.scrollTop;
+  });
 }
 
 function setupFixedPromptMention() {
@@ -301,6 +337,7 @@ function setupFixedPromptMention() {
       syncPromptHighlight(fp);
       scheduleSettingsSave();
     });
+    fp.addEventListener("keyup", () => _tryShowMention(fp));
     fp.addEventListener("scroll", () => syncPromptHighlight(fp));
     fp.addEventListener("keydown", (e) => onPromptKeydown(e, fp));
     syncPromptHighlight(fp);
@@ -338,11 +375,41 @@ function resetSetup() {
 // ==========================================
 // @Mention System for [Image N] tags
 // ==========================================
-function onPromptInput(e, textarea) {
+// Trigger the mention menu whenever the textarea's current value ends with `@`
+// at the cursor position — regardless of whether the event came from input,
+// keyup, or an IME composition end. Fixes two bugs:
+//   - Korean IME: `input` events are suppressed during composition; the menu
+//     was only appearing after the user pressed space.
+//   - Direct `@` press: sometimes the first `@` char landed but input fired
+//     before selectionStart updated, so the lookup saw the wrong position.
+function _tryShowMention(textarea) {
+  if (_imeComposing) return;   // wait until composition ends
   const pos = textarea.selectionStart;
-  if (pos > 0 && textarea.value[pos - 1] === "@" && refCount > 0) showMentionMenu(textarea, pos);
-  else if (mentionMenu && textarea.value.substring(0, pos).lastIndexOf("@") === -1) closeMentionMenu();
+  if (pos > 0 && textarea.value[pos - 1] === "@" && refCount > 0) {
+    showMentionMenu(textarea, pos);
+  } else if (mentionMenu) {
+    // Close if the cursor moved away from `@`
+    if (textarea.value.substring(0, pos).lastIndexOf("@") === -1) {
+      closeMentionMenu();
+    }
+  }
 }
+
+function onPromptInput(e, textarea) {
+  _tryShowMention(textarea);
+}
+
+// Global IME state — set by compositionstart/compositionend on all textareas
+let _imeComposing = false;
+document.addEventListener("compositionstart", () => { _imeComposing = true; }, true);
+document.addEventListener("compositionend", (e) => {
+  _imeComposing = false;
+  // After IME commit, re-check in case the last composed char is `@`
+  const t = e.target;
+  if (t && (t.id === "fixedPrompt" || t.classList?.contains("prompt-section-box"))) {
+    setTimeout(() => _tryShowMention(t), 0);
+  }
+}, true);
 
 function onPromptKeydown(e, textarea) {
   if (e.key === "Tab" && !mentionMenu) {
@@ -793,8 +860,16 @@ function getThumbSize() {
 }
 
 function filterGallery() {
+  // Skip mid-composition — Hangul characters buffer up and trigger this on
+  // every keystroke, hammering refreshGallery. Real filter runs on commit.
+  if (_imeComposing) return;
   if (searchDebounce) clearTimeout(searchDebounce);
-  searchDebounce = setTimeout(() => refreshGallery(), 150);
+  searchDebounce = setTimeout(() => refreshGallery(), 250);
+}
+// Called on Korean IME compositionend — flush immediately.
+function filterGalleryImmediate() {
+  if (searchDebounce) clearTimeout(searchDebounce);
+  refreshGallery();
 }
 
 function toggleFavFilter() {
@@ -1210,13 +1285,29 @@ async function confirmSaveProject() {
 }
 
 async function loadProject() {
-  const d = await api("/api/browse-project", { method: "POST" });
-  if (d.ok) {
-    await loadSettings();
-    refreshGallery();
-    refreshRefs();
-    showToast("Project loaded", "success");
+  // Show the Recent Projects modal instead of a file dialog — recent list
+  // is more useful than navigating the filesystem. "Open Other JSON" link
+  // in the modal still falls through to the OS file dialog.
+  let projects = [];
+  try {
+    const d = await api("/api/project/recent");
+    projects = d.projects || [];
+  } catch (e) {}
+  if (projects.length === 0) {
+    const d = await api("/api/browse-project", { method: "POST" });
+    if (d.ok) {
+      await loadSettings();
+      refreshGallery();
+      refreshRefs();
+      showToast("Project loaded", "success");
+    }
+    return;
   }
+  document.getElementById("projectsModalTitle").textContent = "프로젝트 열기";
+  document.getElementById("projectsModalDesc").textContent =
+    "최근 프로젝트에서 선택하거나 다른 위치의 JSON 파일을 열 수 있어요.";
+  document.getElementById("projectsModalCancelBtn").textContent = "취소";
+  showProjectsModal(projects);
 }
 
 // ==========================================
@@ -1225,7 +1316,14 @@ async function loadProject() {
 async function checkRecentProjects() {
   if (allGalleryPaths.length > 0) return;
   const d = await api("/api/project/recent");
-  if (d.projects?.length) showProjectsModal(d.projects);
+  if (d.projects?.length) {
+    // First launch: offer to restore recent, else start blank
+    document.getElementById("projectsModalTitle").textContent = "최근 프로젝트를 여시겠어요?";
+    document.getElementById("projectsModalDesc").textContent =
+      "이전에 작업하던 프로젝트에서 이어갈 수 있어요. 처음부터 시작하려면 '빈 프로젝트로 시작'을 누르세요.";
+    document.getElementById("projectsModalCancelBtn").textContent = "빈 프로젝트로 시작";
+    showProjectsModal(d.projects);
+  }
 }
 
 function showProjectsModal(projects) {

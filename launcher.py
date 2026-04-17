@@ -279,7 +279,20 @@ def main():
                     try:
                         download_and_overlay()
                         print("  Update applied, restarting...")
-                        os.execv(sys.executable, [sys.executable] + sys.argv)
+                        # For onefile EXE, spawn a NEW process and exit this one.
+                        # os.execv reuses the current _MEIxxx temp dir which still
+                        # holds the old bundled files — the overlay wouldn't
+                        # actually take effect until the next cold start.
+                        if getattr(sys, "frozen", False):
+                            import subprocess
+                            subprocess.Popen(
+                                [sys.executable],
+                                creationflags=0x00000008,  # DETACHED_PROCESS
+                                close_fds=True,
+                            )
+                            sys.exit(0)
+                        else:
+                            os.execv(sys.executable, [sys.executable] + sys.argv)
                     except Exception as e:
                         ctypes.windll.user32.MessageBoxW(
                             0, f"업데이트 실패:\n{e}\n\n현재 버전으로 계속 진행합니다.",

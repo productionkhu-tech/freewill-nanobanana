@@ -1155,7 +1155,16 @@ def add_no_cache(response):
 
 
 def _read_version():
-    # Try multiple locations: frozen (PyInstaller) and dev
+    # Priority 1: auto-updater overlay (post-update, next to EXE)
+    if getattr(sys, "frozen", False):
+        overlay = os.path.join(os.path.dirname(sys.executable), "user_updates", "VERSION")
+        if os.path.isfile(overlay):
+            try:
+                with open(overlay, "r", encoding="utf-8") as f:
+                    return f.read().strip()
+            except Exception:
+                pass
+    # Priority 2: bundled VERSION (frozen) or dev copy
     candidates = [
         os.path.join(getattr(sys, '_MEIPASS', ''), "VERSION"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"),
@@ -1163,7 +1172,7 @@ def _read_version():
     ]
     for vf in candidates:
         try:
-            with open(vf, "r") as f:
+            with open(vf, "r", encoding="utf-8") as f:
                 return f.read().strip()
         except Exception:
             continue

@@ -145,20 +145,29 @@ try:
 except Exception as _e:
     print(f"  orphan cleanup: {_e}")
 
-# Clean up stale _MEIxxxxx extraction folders in %TEMP%. When the app
-# exits via os._exit (our update path), PyInstaller's atexit cleanup is
-# bypassed and the extracted runtime folder stays behind. Without this
-# sweep, every update leaves another ~200MB _MEI folder in temp. We only
-# delete folders whose owning process is no longer running.
-try:
-    if getattr(sys, "frozen", False) and sys.platform == "win32":
+# NOTE: _MEI* temp folder sweep was moved OUT of module-init into a
+# deferred background thread (see _sweep_stale_mei below). Running shutil
+# operations on temp at the exact moment PyInstaller is still finishing
+# its own runtime extraction caused intermittent ModuleNotFoundError
+# crashes on launch (imports like `_socket` failed because the sweep was
+# racing the extractor). The sweep is pure housekeeping — it doesn't need
+# to happen before the app starts.
+_sweep_stale_mei_done = False
+def _sweep_stale_mei():
+    global _sweep_stale_mei_done
+    if _sweep_stale_mei_done:
+        return
+    _sweep_stale_mei_done = True
+    try:
+        if not (getattr(sys, "frozen", False) and sys.platform == "win32"):
+            return
         import tempfile as _tempfile
         import shutil as _shutil
         import re as _re
         _temp = _tempfile.gettempdir()
-        # Our own _MEI folder — skip so we don't saw off the branch we sit on
-        _our_mei = getattr(sys, "_MEIPASS", "")
-        _our_mei = os.path.normcase(_our_mei) if _our_mei else ""
+        _our_mei = os.path.normcase(getattr(sys, "_MEIPASS", "") or "")
+        if not _our_mei:
+            return  # belt-and-suspenders: never sweep when we can't identify ourselves
         for _name in os.listdir(_temp):
             if not _re.match(r"^_MEI[0-9a-fA-F]+$", _name):
                 continue
@@ -167,15 +176,12 @@ try:
                 continue
             if not os.path.isdir(_path):
                 continue
-            # If the folder has a python3xx.dll we can try to delete it.
-            # shutil.rmtree will skip files still locked by a running process
-            # (the folder owning a live NanoBanana will refuse deletion).
             try:
                 _shutil.rmtree(_path, ignore_errors=True)
             except Exception:
                 pass
-except Exception as _e:
-    print(f"  _MEI sweep: {_e}")
+    except Exception as _e:
+        print(f"  _MEI sweep: {_e}")
 
 
 # --- Close flow state ---
@@ -537,24 +543,34 @@ def main():
     # shows later if an update is available. Fixes the "8s black screen"
     # startup delay on flaky networks.
     def _bg_update_check():
+        # Run the _MEI sweep AFTER the main Python runtime has had time to
+        # settle. Running it at module-init was racing with the extractor
+        # and caused occasional ModuleNotFoundError on launch.
+        try:
+            _sweep_stale_mei()
+        except Exception:
+            pass
         try:
             time.sleep(2)  # let the UI settle first
             from updater import check_for_update, apply_update_and_relaunch
             has_update, current, remote = check_for_update()
             print(f"  Local={current}  Remote={remote}  HasUpdate={has_update}")
-            # Mirror the result into the in-app log panel so the user can see
-            # why the popup did or didn't appear without reading stdout.
+            # Mirror the result into the in-app log panel AND as a toast the
+            # first time we check, so a user who doesn't see the modal popup
+            # can still see whether we checked, succeeded, or failed.
             try:
                 from app import state
-                if not remote or remote == current:
-                    if remote == current:
-                        state.log(f"Update check: up to date ({current})")
-                    else:
-                        state.log(f"Update check: remote version unavailable (local {current})")
+                if not remote:
+                    msg = f"Update check failed (local {current}) - network blocked?"
+                elif remote == current:
+                    msg = f"Already on latest version ({current})"
                 elif has_update:
-                    state.log(f"Update available: {current} -> {remote}")
+                    msg = f"Update available: {current} -> {remote}"
                 else:
-                    state.log(f"Update check: local {current} >= remote {remote}")
+                    msg = f"Local {current} >= remote {remote} (no update)"
+                state.log(msg)
+                # Also push a toast event so the frontend can show it
+                state.push_event({"type": "update_status", "message": msg, "has_update": bool(has_update)})
             except Exception:
                 pass
             if not has_update:

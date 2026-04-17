@@ -200,6 +200,21 @@ async function loadVersion() {
   } catch (e) { document.getElementById("versionLabel").textContent = "offline"; }
 }
 
+// Manual update check — user clicks the version label in the footer to
+// force the background check to re-run. Useful when the automatic check
+// didn't fire (network flake, user dismissed the popup, etc.) and they
+// want to know whether they're actually on the latest.
+async function manualCheckUpdate() {
+  showToast("업데이트 확인 중...", "info");
+  const r = await api("/api/check-update", { method: "POST" });
+  if (!r.ok) {
+    showToast(r.error || "Update check failed", "error");
+    return;
+  }
+  const kind = r.status === "available" ? "success" : r.status === "error" ? "warn" : "info";
+  showToast(r.message, kind);
+}
+
 // ==========================================
 // Settings
 // ==========================================
@@ -1360,6 +1375,12 @@ async function pollEvents() {
       lastOutstanding = ev.outstanding;
       const sk = document.querySelector(".skeleton");
       if (sk) sk.remove();
+    } else if (ev.type === "update_status") {
+      // Surface the background update check result — so if the modal
+      // popup didn't fire (network flake, user dismissed too fast), the
+      // user still sees whether the check ran and what it found.
+      const kind = ev.has_update ? "success" : (ev.message && ev.message.includes("failed") ? "warn" : "info");
+      showToast(ev.message || "Update check complete", kind);
     } else if (ev.type === "done") {
       document.querySelectorAll(".skeleton").forEach(s => s.remove());
       updateGenUI(false, 0);

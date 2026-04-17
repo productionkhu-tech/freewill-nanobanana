@@ -1614,6 +1614,34 @@ def api_version():
     return jsonify({"version": _read_version()})
 
 
+@app.route("/api/check-update", methods=["POST"])
+def api_check_update():
+    """Manual "Check for updates" trigger from the UI. Runs the same check
+    the background thread runs at startup and returns the outcome so the
+    frontend can show a toast even if the modal popup flow is blocked
+    (network hiccup, user dismissed too fast, etc.)."""
+    try:
+        from updater import check_for_update
+        has_update, current, remote = check_for_update()
+        if not remote:
+            msg = f"Update check failed (local {current}) - network blocked?"
+            status = "error"
+        elif has_update:
+            msg = f"Update available: {current} -> {remote}"
+            status = "available"
+        else:
+            msg = f"Already on latest version ({current})"
+            status = "current"
+        state.log(f"Manual {msg}")
+        return jsonify({
+            "ok": True, "status": status, "message": msg,
+            "current": current, "remote": remote, "has_update": bool(has_update),
+        })
+    except Exception as e:
+        state.log(f"Manual update check error: {str(e)[:80]}")
+        return jsonify({"ok": False, "error": str(e)[:120]})
+
+
 @app.route("/api/status")
 def api_status():
     outstanding = state.get_queue_outstanding()

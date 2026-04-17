@@ -370,11 +370,30 @@ function showMentionMenu(textarea, cursorPos) {
     });
     mentionMenu.appendChild(btn);
   }
-  const rect = textarea.getBoundingClientRect();
-  mentionMenu.style.left = `${rect.left + 20}px`;
-  mentionMenu.style.bottom = `${window.innerHeight - rect.top + 4}px`;
-  mentionMenu.style.top = "auto";
+  // Append first (hidden) to measure menu height, then position
+  mentionMenu.style.visibility = "hidden";
+  mentionMenu.style.left = "0px";
+  mentionMenu.style.top = "0px";
   document.body.appendChild(mentionMenu);
+
+  const rect = textarea.getBoundingClientRect();
+  const menuH = mentionMenu.offsetHeight || (refCount * 28 + 10);
+  const menuW = mentionMenu.offsetWidth || 160;
+  const vh = window.innerHeight;
+  const vw = window.innerWidth;
+
+  // Prefer below the textarea; flip above only if not enough space
+  const below = rect.bottom + 4;
+  const above = rect.top - menuH - 4;
+  let top = (below + menuH <= vh) ? below : (above >= 0 ? above : Math.max(4, vh - menuH - 4));
+  let left = rect.left + 20;
+  if (left + menuW > vw) left = Math.max(4, vw - menuW - 4);
+  if (left < 4) left = 4;
+
+  mentionMenu.style.left = `${left}px`;
+  mentionMenu.style.top = `${top}px`;
+  mentionMenu.style.bottom = "auto";
+  mentionMenu.style.visibility = "visible";
 }
 
 function navigateMention(dir) {

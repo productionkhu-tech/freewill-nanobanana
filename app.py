@@ -25,6 +25,31 @@ from PIL import Image, ImageGrab
 from google import genai
 from google.genai import types
 
+
+def _to_rgb_flatten(img, bg_color=(255, 255, 255)):
+    """Convert a PIL image to RGB, flattening any alpha channel over
+    bg_color. Calling .convert('RGB') on an RGBA/LA image silently turns
+    every transparent pixel BLACK — PNG logos/icons with alpha become
+    unrecognizable black blobs. This helper composites the image onto a
+    neutral background so the user sees the actual artwork.
+    """
+    try:
+        if img.mode == "P":
+            # Palette mode — expand to RGBA so mode-based alpha detection works
+            img = img.convert("RGBA")
+        if img.mode in ("RGBA", "LA"):
+            bg = Image.new("RGB", img.size, bg_color)
+            alpha = img.split()[-1]
+            bg.paste(img, mask=alpha)
+            return bg
+        if img.mode != "RGB":
+            return img.convert("RGB")
+        return img
+    except Exception:
+        # If anything goes sideways, fall back to the old behavior rather
+        # than refusing the image outright.
+        return img.convert("RGB")
+
 # ==========================================
 # API Credentials — read from environment variables
 # Run setup_env.bat to configure these.
@@ -356,7 +381,7 @@ class AppState:
             return None
         for part in resp.candidates[0].content.parts:
             if hasattr(part, "inline_data") and part.inline_data and part.inline_data.data:
-                return Image.open(io.BytesIO(part.inline_data.data)).convert("RGB")
+                return _to_rgb_flatten(Image.open(io.BytesIO(part.inline_data.data)))
         return None
 
     def diagnose_empty_response(self, resp, provider_label=""):
@@ -477,7 +502,7 @@ class AppState:
                 return False
             try:
                 with Image.open(filepath) as img:
-                    pil = img.convert("RGB")
+                    pil = _to_rgb_flatten(img)
                 self.ref_images.append(pil)
                 self.ref_path_list.append(filepath)
                 self.ref_pinned.append(bool(pinned))
@@ -511,7 +536,7 @@ class AppState:
                 return False
             try:
                 with Image.open(filepath) as img:
-                    pil = img.convert("RGB")
+                    pil = _to_rgb_flatten(img)
             except Exception as e:
                 self.log(f"Replace failed: {str(e)[:80]}")
                 return False
@@ -579,7 +604,7 @@ class AppState:
             os.makedirs(self.temp_ref_dir, exist_ok=True)
             fn = f"clipboard_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
             fp = os.path.join(self.temp_ref_dir, fn)
-            clip.convert("RGB").save(fp, "PNG")
+            _to_rgb_flatten(clip).save(fp, "PNG")
             self.temp_ref_paths.add(fp)
             self.add_ref_image(fp)
             return True, "Pasted image as reference"
@@ -1901,7 +1926,7 @@ def serve_gallery_thumb():
         return "", 404
     try:
         with Image.open(fp) as img:
-            pil = img.convert("RGB")
+            pil = _to_rgb_flatten(img)
             pil.thumbnail((size, size), Image.LANCZOS)
             buf = io.BytesIO()
             pil.save(buf, "JPEG", quality=85)
@@ -2464,7 +2489,7 @@ def copy_to_clipboard():
         import ctypes
         from ctypes import wintypes
         with Image.open(fp) as img:
-            image = img.convert("RGB")
+            image = _to_rgb_flatten(img)
         output = io.BytesIO()
         image.save(output, "BMP")
         data = output.getvalue()[14:]

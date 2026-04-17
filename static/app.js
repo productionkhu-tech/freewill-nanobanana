@@ -374,7 +374,16 @@ function updateRemovePromptBtn() {
 
 function resetSetup() {
   document.getElementById("modelSelect").value = "gemini-3-pro-image-preview";
-  document.getElementById("fixedPrompt").value = "";
+  // Close the mention menu if it was open over a box we're about to wipe —
+  // otherwise the menu keeps referencing a detached textarea and the next
+  // keystroke throws because mentionTarget.textarea is no longer in the DOM.
+  closeMentionMenu();
+  const fp = document.getElementById("fixedPrompt");
+  fp.value = "";
+  // Explicitly sync the highlight overlay — setting .value doesn't fire
+  // an input event, so the colored [Image N] chunks would otherwise
+  // linger in the overlay layer even though the textarea is empty.
+  if (typeof syncPromptHighlight === "function") syncPromptHighlight(fp);
   document.getElementById("promptSections").innerHTML = "";
   promptSectionCount = 0;
   addPromptSection("");

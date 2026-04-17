@@ -1493,11 +1493,50 @@ function closeSaveModal() {
   document.getElementById("saveModal").classList.add("hidden");
 }
 
+// Pending save name while the conflict modal is open (so the user's choice
+// knows what name to retry with).
+let _pendingSaveName = "";
+let _pendingSuggestedName = "";
+
 async function confirmSaveProject() {
   const name = document.getElementById("saveProjectName").value.trim();
   closeSaveModal();
   const d = await api("/api/project/save", { method: "POST", body: { name } });
-  showToast(d.ok ? `Saved: ${d.name || "project"}` : (d.error || "Save failed"), d.ok ? "success" : "error");
+  if (d.ok) {
+    showToast(`Saved: ${d.name || "project"}`, "success");
+    return;
+  }
+  if (d.conflict) {
+    // Server found an existing file with the same name (not the currently
+    // loaded project). Ask the user what to do instead of silently clobbering.
+    _pendingSaveName = name;
+    _pendingSuggestedName = d.suggested || (name + "_2");
+    document.getElementById("saveConflictDesc").textContent =
+      `"${d.existing_name}"이(가) 이미 저장 폴더에 있습니다. 덮어쓸까요, 아니면 "${_pendingSuggestedName}.json"으로 저장할까요?`;
+    document.getElementById("saveConflictSuffixBtn").textContent =
+      `"${_pendingSuggestedName}"(으)로 저장`;
+    document.getElementById("saveConflictModal").classList.remove("hidden");
+    return;
+  }
+  showToast(d.error || "Save failed", "error");
+}
+
+function closeSaveConflict() {
+  document.getElementById("saveConflictModal").classList.add("hidden");
+  _pendingSaveName = "";
+  _pendingSuggestedName = "";
+}
+
+async function confirmSaveConflict(strategy) {
+  const name = _pendingSaveName;
+  closeSaveConflict();
+  if (!name) return;
+  const d = await api("/api/project/save", { method: "POST", body: { name, strategy } });
+  if (d.ok) {
+    showToast(`Saved: ${d.name || "project"}`, "success");
+  } else {
+    showToast(d.error || "Save failed", "error");
+  }
 }
 
 async function loadProject() {

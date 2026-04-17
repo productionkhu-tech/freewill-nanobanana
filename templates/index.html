@@ -277,6 +277,19 @@
   </div>
 </div>
 
+<!-- SAVE CONFLICT MODAL (same name already exists) -->
+<div id="saveConflictModal" class="close-modal hidden">
+  <div class="close-dialog">
+    <h2>이미 같은 이름이 있어요</h2>
+    <p class="close-desc" id="saveConflictDesc"></p>
+    <div class="close-buttons">
+      <button class="btn-sm" onclick="closeSaveConflict()">취소</button>
+      <button class="btn-sm" onclick="confirmSaveConflict('overwrite')">덮어쓰기</button>
+      <button class="btn-accent-sm" id="saveConflictSuffixBtn" onclick="confirmSaveConflict('suffix')">다른 이름으로 저장</button>
+    </div>
+  </div>
+</div>
+
 <!-- RECENT PROJECTS MODAL -->
 <div id="projectsModal" class="projects-modal hidden">
   <div class="projects-dialog">

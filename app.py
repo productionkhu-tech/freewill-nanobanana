@@ -2129,6 +2129,18 @@ def _sanitize_project_name(name):
     return cleaned[:80]
 
 
+def _suggest_unique_name(base_name, save_dir):
+    """Return a name (no extension) that doesn't collide with an existing
+    .json file in save_dir. 'foo' -> 'foo_2' if 'foo.json' exists, else
+    'foo_3', etc. Caps at 999; falls back to a timestamp suffix beyond that
+    (should never happen in practice but keeps us from looping forever)."""
+    for i in range(2, 1000):
+        candidate = f"{base_name}_{i}"
+        if not os.path.exists(os.path.join(save_dir, f"{candidate}.json")):
+            return candidate
+    return f"{base_name}_{int(time.time())}"
+
+
 @app.route("/api/project/new", methods=["POST"])
 def new_project():
     """Reset to a blank project. Clears prompts, refs, gallery items, favorites,
@@ -2180,16 +2192,46 @@ def new_project():
 
 @app.route("/api/project/save", methods=["POST"])
 def save_project():
+    """Save the current project.
+
+    Conflict handling: if the user typed a name that already exists AND
+    they aren't re-saving the currently loaded project, the first call
+    returns {ok: False, conflict: True, suggested: "name_2"} without
+    writing anything. The frontend then asks the user to pick a strategy
+    and re-sends with strategy="overwrite" or strategy="suffix". Previously
+    the server silently overwrote any matching filename.
+    """
     d = request.json or {}
     fp = d.get("filepath", "")
     name = _sanitize_project_name(d.get("name", ""))
+    strategy = (d.get("strategy") or "").lower()  # "", "overwrite", "suffix"
+
     if not fp:
         save_dir = state.get_project_save_dir()
         os.makedirs(save_dir, exist_ok=True)
         if name:
-            fp = os.path.join(save_dir, f"{name}.json")
+            target = os.path.join(save_dir, f"{name}.json")
+            current = state.current_project_path or ""
+            try:
+                is_same_as_current = bool(current) and (
+                    os.path.normcase(os.path.realpath(target)) ==
+                    os.path.normcase(os.path.realpath(current))
+                )
+            except Exception:
+                is_same_as_current = False
+            if os.path.exists(target) and not is_same_as_current and strategy not in ("overwrite", "suffix"):
+                return jsonify({
+                    "ok": False,
+                    "conflict": True,
+                    "suggested": _suggest_unique_name(name, save_dir),
+                    "existing_name": f"{name}.json",
+                })
+            if os.path.exists(target) and strategy == "suffix" and not is_same_as_current:
+                name = _suggest_unique_name(name, save_dir)
+                target = os.path.join(save_dir, f"{name}.json")
+            fp = target
         elif state.current_project_path and os.path.basename(state.current_project_path):
-            # Overwrite existing named project
+            # Overwrite existing named project (user hit Save without a name)
             fp = state.current_project_path
         else:
             fp = os.path.join(save_dir, state.default_project_filename())

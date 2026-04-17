@@ -913,12 +913,20 @@ textarea.prompt-box { min-height: 82px; }
   border: 1px solid transparent;
 }
 
-/* 8-col compact: hide card body, show only image */
+/* 8-col compact view = contact sheet. Force every tile to the same square
+   footprint so portrait + landscape images don't produce a jagged grid
+   where short cards sit next to tall ones. Images are cropped to cover
+   the square (center-cropped) which is the expected behavior for
+   thumbnail grids. */
 .gallery-grid.cols-8 .card-body { display: none; }
 .gallery-grid.cols-8 .card { border-radius: 6px; }
 .gallery-grid.cols-8 .media-frame {
   border-radius: 6px;
   width: 100%;
+  padding-bottom: 100%;   /* override per-card --card-ar */
+}
+.gallery-grid.cols-8 .card-img {
+  object-fit: cover !important;  /* fill the square, crop overflow */
 }
 
 /* 4-col: smaller buttons */

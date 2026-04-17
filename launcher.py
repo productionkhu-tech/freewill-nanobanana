@@ -500,21 +500,32 @@ def _run_as_updater(target_path):
     _log(f"  our_path={our_path}")
     _log(f"  target  ={target_path}")
 
-    # Wait for target to be unlocked. Probe by attempting a rename onto
-    # itself — if that succeeds, the handle is free.
+    # Wait for target to be unlocked. CRITICAL: on Windows, a running EXE
+    # can still be RENAMED (os.replace source), but it CANNOT be OVERWRITTEN
+    # by os.replace as the destination. An earlier version probed with
+    # `os.replace(target, probe)` which always succeeded and gave a false
+    # "it's unlocked" signal — then the real replace call to OVERWRITE
+    # the running EXE hit AccessDenied.
+    #
+    # The correct probe: attempt to open target_path in append-write mode.
+    # If the EXE is currently executing, Windows denies write access; once
+    # the parent has truly exited the open succeeds.
     target_dir = os.path.dirname(target_path)
-    probe = os.path.join(target_dir, ".nanobanana_lock_probe")
+    target_unlocked = False
     for i in range(30):
         try:
             if not os.path.exists(target_path):
+                target_unlocked = True
                 break
-            os.replace(target_path, probe)
-            os.replace(probe, target_path)
+            with open(target_path, "ab"):
+                pass
+            target_unlocked = True
             break
         except (OSError, PermissionError):
             time.sleep(1)
-    else:
-        _log("  target still locked after 30s — force-killing by name")
+
+    if not target_unlocked:
+        _log("  target still locked after 30s - force-killing by name")
         try:
             _sub.run(
                 ["taskkill", "/F", "/IM", os.path.basename(target_path)],
@@ -524,14 +535,38 @@ def _run_as_updater(target_path):
             _log(f"  taskkill failed: {e}")
         time.sleep(2)
 
-    # Copy ourselves to target via a temp file + atomic replace. If the
-    # copy fails halfway we don't damage the existing target.
+    # Copy ourselves to target via a temp file + atomic replace.
+    # Retry the os.replace specifically on AccessDenied — even after our
+    # probe confirmed writability, the OS sometimes takes a beat longer to
+    # fully release the image handle after a process exits.
     tmp = target_path + ".replacing"
     try:
         _log(f"  copy self -> {tmp}")
         shutil.copy2(our_path, tmp)
-        _log(f"  os.replace {tmp} -> {target_path}")
-        os.replace(tmp, target_path)
+        replaced = False
+        for attempt in range(20):
+            try:
+                _log(f"  os.replace attempt {attempt+1}: {tmp} -> {target_path}")
+                os.replace(tmp, target_path)
+                replaced = True
+                break
+            except PermissionError as pe:
+                _log(f"  replace denied (attempt {attempt+1}): {pe}")
+                if attempt < 19:
+                    time.sleep(1)
+                    # After a few tries, escalate to taskkill
+                    if attempt == 5:
+                        _log("  escalating to taskkill")
+                        try:
+                            _sub.run(
+                                ["taskkill", "/F", "/IM", os.path.basename(target_path)],
+                                timeout=5, creationflags=0x08000000,
+                            )
+                        except Exception:
+                            pass
+                        time.sleep(2)
+        if not replaced:
+            raise RuntimeError("os.replace never succeeded after 20 retries")
     except Exception as e:
         _log(f"  FAIL copy/replace: {e}")
         try: os.remove(tmp)

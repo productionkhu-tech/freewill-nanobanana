@@ -306,6 +306,13 @@ if exist "%BACKUP%" (
     del /F /Q "%BACKUP%" >nul 2>&1
 )
 if exist "%BACKUP%" echo WARN backup could not be removed >> "%LOG%"
+REM Belt-and-suspenders: clear PyInstaller's _MEIPASS* env vars so the
+REM new EXE's bootloader re-extracts instead of trying to reuse the old
+REM process's (now-dead) _MEI temp folder. The Python-side Popen also
+REM strips these, but if anything along the chain reintroduces them
+REM we nuke them here too before `start`.
+set "_MEIPASS="
+set "_MEIPASS2="
 REM Brief pause so AV scanners can finish their "freshly-written binary"
 REM scan before we try to run it. Without this some AV configs reject
 REM the launch for a couple seconds after a move, which showed up as
@@ -351,10 +358,17 @@ if exist "%BACKUP%" (
     DETACHED_PROCESS = 0x00000008
     CREATE_NO_WINDOW = 0x08000000
     import subprocess
+    # CRITICAL: strip PyInstaller's _MEIPASS* env vars before the bat
+    # inherits them. Otherwise the new NanoBanana.exe we launch via
+    # `start` sees _MEIPASS2 pointing at OUR _MEI folder, tries to reuse
+    # it instead of extracting its own runtime, and dies with
+    # "Failed to load Python DLL ..._MEI<old>\\python312.dll".
+    clean_env = {k: v for k, v in os.environ.items() if not k.startswith("_MEI")}
     subprocess.Popen(
         ["cmd", "/c", swap_bat],
         creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
         close_fds=True,
+        env=clean_env,
     )
     return True
 

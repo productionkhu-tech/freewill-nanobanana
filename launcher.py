@@ -145,6 +145,38 @@ try:
 except Exception as _e:
     print(f"  orphan cleanup: {_e}")
 
+# Clean up stale _MEIxxxxx extraction folders in %TEMP%. When the app
+# exits via os._exit (our update path), PyInstaller's atexit cleanup is
+# bypassed and the extracted runtime folder stays behind. Without this
+# sweep, every update leaves another ~200MB _MEI folder in temp. We only
+# delete folders whose owning process is no longer running.
+try:
+    if getattr(sys, "frozen", False) and sys.platform == "win32":
+        import tempfile as _tempfile
+        import shutil as _shutil
+        import re as _re
+        _temp = _tempfile.gettempdir()
+        # Our own _MEI folder — skip so we don't saw off the branch we sit on
+        _our_mei = getattr(sys, "_MEIPASS", "")
+        _our_mei = os.path.normcase(_our_mei) if _our_mei else ""
+        for _name in os.listdir(_temp):
+            if not _re.match(r"^_MEI[0-9a-fA-F]+$", _name):
+                continue
+            _path = os.path.join(_temp, _name)
+            if os.path.normcase(_path) == _our_mei:
+                continue
+            if not os.path.isdir(_path):
+                continue
+            # If the folder has a python3xx.dll we can try to delete it.
+            # shutil.rmtree will skip files still locked by a running process
+            # (the folder owning a live NanoBanana will refuse deletion).
+            try:
+                _shutil.rmtree(_path, ignore_errors=True)
+            except Exception:
+                pass
+except Exception as _e:
+    print(f"  _MEI sweep: {_e}")
+
 
 # --- Close flow state ---
 _force_close = False

@@ -26,23 +26,45 @@ from google import genai
 from google.genai import types
 
 
-def _to_rgb_flatten(img, bg_color=(255, 255, 255)):
-    """Convert a PIL image to RGB, flattening any alpha channel over
-    bg_color. Calling .convert('RGB') on an RGBA/LA image silently turns
-    every transparent pixel BLACK — PNG logos/icons with alpha become
-    unrecognizable black blobs. This helper composites the image onto a
-    neutral background so the user sees the actual artwork.
+def _to_display_image(img):
+    """Normalize a PIL image for in-app display / storage while PRESERVING
+    the alpha channel if present. Used for reference images and generated
+    images — both go through endpoints that can serve PNG (alpha-capable).
 
-    CRITICAL: must always return a NEW image object. Callers typically do
-    `with Image.open(fp) as img: pil = _to_rgb_flatten(img)` and then rely
-    on `pil` remaining valid AFTER the `with` block closes `img`. If we
-    returned `img` itself for the RGB branch, the close would nuke the
-    stored reference and later thumbnail reads would get "image is closed"
-    errors (seen as broken-image placeholders in the ref panel).
+    - P (palette) mode with transparency → RGBA
+    - LA (luminance + alpha) → RGBA (so the rest of the code only deals with
+      RGB / RGBA)
+    - RGBA / RGB → cloned (never return the caller's original object, since
+      callers typically use `with Image.open()` which closes the source on
+      exit and we'd be left holding a closed handle)
+    - anything else (CMYK, I, F, etc.) → RGB (alpha isn't meaningful there)
+
+    This replaces the old _to_rgb_flatten for display paths. Flattening
+    transparent pixels to white looked wrong for PNG logos/icons — the user
+    expects a cutout over the dark UI background, not a white halo.
     """
     try:
         if img.mode == "P":
-            # Palette mode — expand to RGBA so mode-based alpha detection works
+            # Palette mode may have transparency — expanding to RGBA preserves it
+            img = img.convert("RGBA")
+        if img.mode == "LA":
+            img = img.convert("RGBA")
+        if img.mode == "RGBA":
+            return img.copy()
+        if img.mode == "RGB":
+            return img.copy()
+        return img.convert("RGB")
+    except Exception:
+        return img.convert("RGB")
+
+
+def _to_rgb_flatten(img, bg_color=(255, 255, 255)):
+    """Same as _to_display_image but collapses any alpha onto bg_color.
+    Only use this for encoders that can't carry alpha (JPEG, BMP) — for
+    display/PNG paths use _to_display_image so transparency is preserved.
+    """
+    try:
+        if img.mode == "P":
             img = img.convert("RGBA")
         if img.mode in ("RGBA", "LA"):
             bg = Image.new("RGB", img.size, bg_color)
@@ -50,10 +72,9 @@ def _to_rgb_flatten(img, bg_color=(255, 255, 255)):
             bg.paste(img, mask=alpha)
             return bg
         if img.mode != "RGB":
-            return img.convert("RGB")  # convert() already returns a new image
-        return img.copy()               # RGB: clone so the caller's `with` can close safely
+            return img.convert("RGB")
+        return img.copy()
     except Exception:
-        # Fall back to the old behavior rather than refusing the image outright.
         return img.convert("RGB")
 
 # ==========================================
@@ -387,7 +408,8 @@ class AppState:
             return None
         for part in resp.candidates[0].content.parts:
             if hasattr(part, "inline_data") and part.inline_data and part.inline_data.data:
-                return _to_rgb_flatten(Image.open(io.BytesIO(part.inline_data.data)))
+                # Preserve alpha if the model ever returns RGBA output.
+                return _to_display_image(Image.open(io.BytesIO(part.inline_data.data)))
         return None
 
     def diagnose_empty_response(self, resp, provider_label=""):
@@ -508,7 +530,9 @@ class AppState:
                 return False
             try:
                 with Image.open(filepath) as img:
-                    pil = _to_rgb_flatten(img)
+                    # Preserve alpha — PNG logos/icons should stay as
+                    # cutouts, not get a white halo.
+                    pil = _to_display_image(img)
                 self.ref_images.append(pil)
                 self.ref_path_list.append(filepath)
                 self.ref_pinned.append(bool(pinned))
@@ -542,7 +566,7 @@ class AppState:
                 return False
             try:
                 with Image.open(filepath) as img:
-                    pil = _to_rgb_flatten(img)
+                    pil = _to_display_image(img)
             except Exception as e:
                 self.log(f"Replace failed: {str(e)[:80]}")
                 return False
@@ -610,7 +634,8 @@ class AppState:
             os.makedirs(self.temp_ref_dir, exist_ok=True)
             fn = f"clipboard_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
             fp = os.path.join(self.temp_ref_dir, fn)
-            _to_rgb_flatten(clip).save(fp, "PNG")
+            # PNG supports alpha — preserve clipboard transparency if any
+            _to_display_image(clip).save(fp, "PNG")
             self.temp_ref_paths.add(fp)
             self.add_ref_image(fp)
             return True, "Pasted image as reference"
@@ -1809,13 +1834,18 @@ def paste_ref():
 
 @app.route("/api/refs/thumb/<int:idx>")
 def ref_thumb(idx):
-    if idx < 0 or idx >= len(state.ref_images):
-        return "", 404
-    pil = state.ref_images[idx]
-    thumb = pil.copy()
-    thumb.thumbnail((100, 100), Image.LANCZOS)
+    # Snapshot the PIL image under the ref lock so a concurrent remove/
+    # replace can't shrink the list between the bounds check and the index
+    # access, and can't close the image object out from under us.
+    with state.ref_lock:
+        if idx < 0 or idx >= len(state.ref_images):
+            return "", 404
+        pil = state.ref_images[idx].copy()
+    pil.thumbnail((100, 100), Image.LANCZOS)
     buf = io.BytesIO()
-    thumb.save(buf, "PNG")
+    # PNG preserves alpha — PNG logos/icons stay as transparent cutouts
+    # against the dark ref-cell background instead of gaining a white halo.
+    pil.save(buf, "PNG")
     buf.seek(0)
     return send_file(buf, mimetype="image/png")
 

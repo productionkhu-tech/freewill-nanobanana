@@ -1642,6 +1642,68 @@ def api_check_update():
         return jsonify({"ok": False, "error": str(e)[:120]})
 
 
+# Guard so the user clicking "Update" twice doesn't spawn two downloaders.
+_apply_update_lock = threading.Lock()
+_apply_update_running = [False]
+
+@app.route("/api/apply-update", methods=["POST"])
+def api_apply_update():
+    """Kicks off the download + --updater spawn flow on a background thread.
+
+    This is the frontend-driven replacement for the old Python-side
+    MessageBox prompt. Sequence from the UI:
+      1. frontend shows in-page "Update available" dialog
+      2. user clicks Yes -> frontend POSTs here
+      3. we start a bg thread that:
+           - downloads NanoBanana.new.exe (pushes update_progress events)
+           - spawns NanoBanana.new.exe --updater <our_path>
+           - os._exit(0)
+      4. frontend overlay watches update_progress + update_swap events
+      5. app disappears, new app launches, release-notes popup shows
+    """
+    with _apply_update_lock:
+        if _apply_update_running[0]:
+            return jsonify({"ok": False, "error": "Update already in progress"})
+        _apply_update_running[0] = True
+
+    def _worker():
+        try:
+            from updater import check_for_update, apply_update_and_relaunch
+            has_update, current, remote = check_for_update()
+            if not has_update:
+                state.push_event({"type": "update_swap", "phase": "noop",
+                                  "message": f"이미 최신 버전입니다 ({current})"})
+                _apply_update_running[0] = False
+                return
+
+            def _on_dl_progress(done, total):
+                pct = int(done * 100 / total) if total else 0
+                state.push_event({
+                    "type": "update_progress",
+                    "done": done, "total": total, "pct": pct,
+                })
+
+            state.push_event({"type": "update_swap", "phase": "downloading",
+                              "message": f"{remote} 다운로드 중..."})
+            apply_update_and_relaunch(remote, on_progress=_on_dl_progress)
+            state.push_event({"type": "update_swap", "phase": "handing_off",
+                              "message": "설치 준비 중..."})
+            # One poll tick (800ms) for the frontend to pick up the last
+            # event before our process dies.
+            time.sleep(1.0)
+            # os._exit releases our EXE file handle so the --updater
+            # child can atomically replace it.
+            os._exit(0)
+        except Exception as e:
+            state.log(f"apply-update failed: {str(e)[:120]}")
+            state.push_event({"type": "update_swap", "phase": "failed",
+                              "message": f"업데이트 실패: {str(e)[:120]}"})
+            _apply_update_running[0] = False
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return jsonify({"ok": True})
+
+
 @app.route("/api/status")
 def api_status():
     outstanding = state.get_queue_outstanding()

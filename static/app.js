@@ -200,10 +200,7 @@ async function loadVersion() {
   } catch (e) { document.getElementById("versionLabel").textContent = "offline"; }
 }
 
-// Manual update check — user clicks the version label in the footer to
-// force the background check to re-run. Useful when the automatic check
-// didn't fire (network flake, user dismissed the popup, etc.) and they
-// want to know whether they're actually on the latest.
+// Manual update check — user clicks the version label in the footer.
 async function manualCheckUpdate() {
   showToast("업데이트 확인 중...", "info");
   const r = await api("/api/check-update", { method: "POST" });
@@ -211,8 +208,74 @@ async function manualCheckUpdate() {
     showToast(r.error || "Update check failed", "error");
     return;
   }
-  const kind = r.status === "available" ? "success" : r.status === "error" ? "warn" : "info";
-  showToast(r.message, kind);
+  if (r.status === "available") {
+    showUpdateConfirmModal(r.current, r.remote);
+  } else {
+    const kind = r.status === "error" ? "warn" : "info";
+    showToast(r.message, kind);
+  }
+}
+
+// In-page "Update available — install?" dialog. Replaces the Win32
+// MessageBox that was unreliable in frozen --windowed EXEs. Lives in
+// the webview DOM so it's guaranteed visible and reacts to clicks.
+let _updateConfirmShown = false;
+function showUpdateConfirmModal(current, remote) {
+  if (_updateConfirmShown) return;
+  if (document.getElementById("nbUpdateConfirm")) return;
+  _updateConfirmShown = true;
+  const w = document.createElement("div");
+  w.id = "nbUpdateConfirm";
+  w.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:99998;display:flex;align-items:center;justify-content:center;font-family:Malgun Gothic,Segoe UI,sans-serif;";
+  w.innerHTML = `
+    <div style="background:#2C2C2E;border-radius:14px;padding:24px 28px;min-width:360px;max-width:460px;box-shadow:0 10px 40px rgba(0,0,0,.5);color:#F5F5F7">
+      <div style="font-size:17px;font-weight:600;margin-bottom:10px">새 버전이 나왔어요</div>
+      <div style="font-size:12px;color:#A1A1A6;line-height:1.7;margin-bottom:18px">
+        현재 버전: <strong style="color:#F5F5F7">${current}</strong><br>
+        최신 버전: <strong style="color:#D4A574">${remote}</strong><br>
+        <span style="color:#636366">지금 설치하면 앱이 자동으로 다시 열립니다.</span>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:8px">
+        <button id="nbUpdateLater" style="background:#3A3A3C;color:#F5F5F7;border:none;border-radius:8px;height:34px;padding:0 16px;font-size:12px;font-weight:600;cursor:pointer">나중에</button>
+        <button id="nbUpdateNow" style="background:#D4A574;color:#1C1C1E;border:none;border-radius:8px;height:34px;padding:0 18px;font-size:12px;font-weight:700;cursor:pointer">지금 설치</button>
+      </div>
+    </div>`;
+  document.body.appendChild(w);
+  document.getElementById("nbUpdateLater").addEventListener("click", () => {
+    w.remove();
+    _updateConfirmShown = false;
+  });
+  document.getElementById("nbUpdateNow").addEventListener("click", async () => {
+    w.remove();
+    _updateConfirmShown = false;
+    showUpdateOverlay();
+    const r = await api("/api/apply-update", { method: "POST" });
+    if (!r.ok) {
+      hideUpdateOverlay();
+      showToast(r.error || "업데이트 시작 실패", "error");
+    }
+  });
+}
+
+function showUpdateOverlay() {
+  if (document.getElementById("nbUpdateOverlay")) return;
+  const o = document.createElement("div");
+  o.id = "nbUpdateOverlay";
+  o.style.cssText = "position:fixed;inset:0;background:rgba(12,12,14,0.96);z-index:99999;display:flex;align-items:center;justify-content:center;color:#F5F5F7;font-family:Malgun Gothic,Segoe UI,sans-serif";
+  o.innerHTML = `
+    <div style="text-align:center;padding:40px;min-width:340px">
+      <div id="nbUpdateLabel" style="font-size:22px;font-weight:600;margin-bottom:10px">업데이트 준비 중…</div>
+      <div id="nbUpdateSub" style="font-size:13px;color:#A1A1A6;line-height:1.7;margin-bottom:22px">서버에서 새 버전을 받아오고 있습니다.</div>
+      <div style="width:280px;height:6px;background:#2C2C2E;border-radius:999px;overflow:hidden;margin:0 auto">
+        <div id="nbUpdateBar" style="height:100%;width:0%;background:#D4A574;transition:width .2s linear;border-radius:999px"></div>
+      </div>
+      <div style="margin-top:18px;font-size:11px;color:#636366">잠시 후 앱이 자동으로 다시 열립니다.</div>
+    </div>`;
+  document.body.appendChild(o);
+}
+function hideUpdateOverlay() {
+  const o = document.getElementById("nbUpdateOverlay");
+  if (o) o.remove();
 }
 
 // ==========================================
@@ -1376,15 +1439,15 @@ async function pollEvents() {
       const sk = document.querySelector(".skeleton");
       if (sk) sk.remove();
     } else if (ev.type === "update_status") {
-      // Surface the background update check result — so if the modal
-      // popup didn't fire (network flake, user dismissed too fast), the
-      // user still sees whether the check ran and what it found.
-      const kind = ev.has_update ? "success" : (ev.message && ev.message.includes("failed") ? "warn" : "info");
-      showToast(ev.message || "Update check complete", kind);
+      // Background check result. If an update is available, show the
+      // in-page confirm dialog (frontend-owned, no Python MessageBox).
+      if (ev.has_update) {
+        showUpdateConfirmModal(ev.current, ev.remote);
+      } else {
+        const kind = ev.kind === "error" ? "warn" : "info";
+        showToast(ev.message || "Update check complete", kind);
+      }
     } else if (ev.type === "update_progress") {
-      // Live download progress during auto-update. Drives the overlay
-      // that launcher.py injected when the user clicked Yes on the
-      // update prompt.
       const pct = typeof ev.pct === "number" ? ev.pct : 0;
       const mb = ev.total ? `${(ev.done/1048576).toFixed(1)}/${(ev.total/1048576).toFixed(1)}MB` : "";
       const bar = document.getElementById("nbUpdateBar");
@@ -1393,6 +1456,21 @@ async function pollEvents() {
       if (bar) bar.style.width = pct + "%";
       if (lbl) lbl.textContent = pct >= 100 ? "설치 준비 중…" : "다운로드 중…";
       if (sub) sub.textContent = pct >= 100 ? "곧 재시작됩니다" : `${pct}% · ${mb}`;
+    } else if (ev.type === "update_swap") {
+      const lbl = document.getElementById("nbUpdateLabel");
+      const sub = document.getElementById("nbUpdateSub");
+      if (ev.phase === "failed") {
+        hideUpdateOverlay();
+        showToast(ev.message || "업데이트 실패", "error");
+      } else if (ev.phase === "noop") {
+        hideUpdateOverlay();
+        showToast(ev.message || "이미 최신입니다", "info");
+      } else if (lbl && sub) {
+        if (ev.phase === "handing_off") {
+          lbl.textContent = "설치 준비 중…";
+          sub.textContent = ev.message || "곧 재시작됩니다";
+        }
+      }
     } else if (ev.type === "done") {
       document.querySelectorAll(".skeleton").forEach(s => s.remove());
       updateGenUI(false, 0);

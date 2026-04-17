@@ -653,113 +653,47 @@ def main():
             pass
         sys.exit(0)
 
-    # Async update check — does NOT block the window from opening. A popup
-    # shows later if an update is available. Fixes the "8s black screen"
-    # startup delay on flaky networks.
+    # Async update check — all it does now is PUSH the result to the frontend
+    # event queue. The UI (app.js) handles showing the prompt, confirming
+    # with the user, and triggering /api/apply-update. Getting out of the
+    # Win32 MessageBox business entirely means no more "why didn't the
+    # popup appear?" flakiness — the check result always lands on the
+    # event stream that the frontend polls every 800ms.
     def _bg_update_check():
-        # Run the _MEI sweep AFTER the main Python runtime has had time to
-        # settle. Running it at module-init was racing with the extractor
-        # and caused occasional ModuleNotFoundError on launch.
         try:
             _sweep_stale_mei()
         except Exception:
             pass
         try:
-            time.sleep(2)  # let the UI settle first
-            from updater import check_for_update, apply_update_and_relaunch
+            time.sleep(2)
+            from updater import check_for_update
             has_update, current, remote = check_for_update()
             print(f"  Local={current}  Remote={remote}  HasUpdate={has_update}")
-            # Mirror the result into the in-app log panel AND as a toast the
-            # first time we check, so a user who doesn't see the modal popup
-            # can still see whether we checked, succeeded, or failed.
             try:
                 from app import state
                 if not remote:
                     msg = f"Update check failed (local {current}) - network blocked?"
+                    kind = "error"
                 elif remote == current:
                     msg = f"Already on latest version ({current})"
+                    kind = "current"
                 elif has_update:
                     msg = f"Update available: {current} -> {remote}"
+                    kind = "available"
                 else:
                     msg = f"Local {current} >= remote {remote} (no update)"
+                    kind = "ahead"
                 state.log(msg)
-                # Also push a toast event so the frontend can show it
-                state.push_event({"type": "update_status", "message": msg, "has_update": bool(has_update)})
-            except Exception:
-                pass
-            if not has_update:
-                return
-            import ctypes
-            MB_YESNO = 0x04
-            MB_ICONINFO = 0x40
-            MB_TOPMOST = 0x00040000
-            IDYES = 6
-            msg = (
-                f"새 버전이 있어요!\n\n"
-                f"현재 버전: {current}\n"
-                f"최신 버전: {remote}\n\n"
-                f"지금 업데이트하시겠습니까?\n"
-                f"(앱이 자동으로 재시작됩니다)"
-            )
-            result = ctypes.windll.user32.MessageBoxW(
-                0, msg, "NanoBanana 업데이트",
-                MB_YESNO | MB_ICONINFO | MB_TOPMOST
-            )
-            if result == IDYES:
-                # Immediately show a full-screen "installing" overlay in the
-                # running app so the user isn't staring at a normal UI while
-                # we download 33MB in the background. Previously the click
-                # led to ~10s of visible silence, which read as "update
-                # didn't work, let me relaunch" — exactly the opposite of
-                # what we want.
-                if _window is not None:
-                    try:
-                        _window.evaluate_js("""
-                            (function(){
-                                var o=document.createElement('div');
-                                o.id='nbUpdateOverlay';
-                                o.style.cssText='position:fixed;inset:0;background:rgba(12,12,14,0.96);z-index:99999;display:flex;align-items:center;justify-content:center;color:#F5F5F7;font-family:Malgun Gothic,Segoe UI,sans-serif';
-                                o.innerHTML='<div style=\"text-align:center;padding:40px;min-width:320px\"><div id=\"nbUpdateLabel\" style=\"font-size:22px;font-weight:600;margin-bottom:10px\">업데이트 준비 중…</div><div id=\"nbUpdateSub\" style=\"font-size:13px;color:#A1A1A6;line-height:1.7;margin-bottom:20px\">서버에서 새 버전을 받아오고 있습니다.</div><div style=\"width:280px;height:6px;background:#2C2C2E;border-radius:999px;overflow:hidden;margin:0 auto\"><div id=\"nbUpdateBar\" style=\"height:100%;width:0%;background:#D4A574;transition:width .2s linear;border-radius:999px\"></div></div><div style=\"margin-top:16px;font-size:11px;color:#636366\">잠시 후 앱이 자동으로 다시 열립니다.</div></div>';
-                                document.body.appendChild(o);
-                            })();
-                        """)
-                    except Exception:
-                        pass
-                try:
-                    # Progress callback pushes update_progress events to the
-                    # frontend so the overlay shows a real progress bar
-                    # during the ~10s download instead of a spinner.
-                    def _on_dl_progress(done, total):
-                        try:
-                            from app import state
-                            pct = int(done * 100 / total) if total else 0
-                            state.push_event({
-                                "type": "update_progress",
-                                "done": done, "total": total, "pct": pct,
-                            })
-                        except Exception:
-                            pass
-                    apply_update_and_relaunch(remote, on_progress=_on_dl_progress)
-                    # Give the progress poll one last tick to deliver the
-                    # "100% / launching" frame before we die.
-                    time.sleep(0.3)
-                    # Force immediate process termination. sys.exit(0) from a
-                    # daemon thread only kills the thread - the main pywebview
-                    # loop keeps running and holds the EXE handle. os._exit
-                    # releases the handle immediately so the updater child
-                    # can replace us.
-                    os._exit(0)
-                except Exception as e:
-                    # Remove the overlay so the user can see/use the app again
-                    if _window is not None:
-                        try:
-                            _window.evaluate_js("var o=document.getElementById('nbUpdateOverlay');o&&o.remove();")
-                        except Exception:
-                            pass
-                    ctypes.windll.user32.MessageBoxW(
-                        0, f"업데이트 실패:\n{e}\n\n현재 버전으로 계속 진행합니다.",
-                        "NanoBanana", 0x10
-                    )
+                state.push_event({
+                    "type": "update_status",
+                    "kind": kind,
+                    "message": msg,
+                    "current": current,
+                    "remote": remote,
+                    "has_update": bool(has_update),
+                })
+            except Exception as e:
+                print(f"  update_status push: {e}")
         except Exception as e:
             print(f"  Update check: {e}")
 

@@ -65,33 +65,56 @@ def get_current_version():
 
 
 def get_remote_version(max_attempts=3):
-    """Fetch remote VERSION with retry/backoff. Previously a single 8s
-    timeout: a blip on GitHub's CDN or the user's network meant the
-    update popup silently never appeared. Now retries 3x with increasing
-    timeout/backoff so transient network issues don't swallow updates."""
+    """Fetch the latest release tag from the GitHub Releases API.
+
+    PREVIOUSLY: we read raw.githubusercontent.com/.../main/VERSION. That
+    endpoint goes through Fastly's CDN which can serve a STALE version of
+    the file for several minutes after a push. Symptom: we push v1736,
+    upload its release asset, a user clicks "check update" seconds later,
+    the raw file still returns v1735, our app says "Already on latest
+    version" even though we literally just released a new one.
+
+    The Releases API (/releases/latest) is consistent with reality
+    immediately after the upload completes, so that's what we use now.
+    Falls back to the raw URL only if the API is unreachable.
+    """
     last_err = None
+    urls = [
+        # Primary: the Releases API — authoritative, no CDN caching.
+        (f"https://api.github.com/repos/{REPO}/releases/latest", "api"),
+        # Fallback: the raw VERSION file. May be stale but better than
+        # nothing if api.github.com is blocked.
+        (REMOTE_VERSION_URL, "raw"),
+    ]
     for i in range(max_attempts):
-        try:
-            req = urllib.request.Request(
-                REMOTE_VERSION_URL,
-                headers={
+        for url, kind in urls:
+            try:
+                headers = {
                     "User-Agent": "NanoBanana-Updater",
-                    # Bust any intermediate proxy/CDN caches so we don't
-                    # read a stale VERSION from a corporate cache.
                     "Cache-Control": "no-cache",
                     "Pragma": "no-cache",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                v = resp.read().decode("utf-8").strip()
-                if v:
-                    return v
-                raise IOError("empty response")
-        except Exception as e:
-            last_err = e
-            print(f"  remote version fetch attempt {i+1}/{max_attempts} failed: {e}")
-            if i < max_attempts - 1:
-                time.sleep(2 ** i)  # 1s, 2s, 4s
+                }
+                if kind == "api":
+                    headers["Accept"] = "application/vnd.github+json"
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    body = resp.read().decode("utf-8")
+                    if kind == "api":
+                        data = json.loads(body)
+                        tag = (data.get("tag_name") or "").strip()
+                        if tag:
+                            return tag
+                        raise IOError("empty tag in release API response")
+                    else:
+                        v = body.strip()
+                        if v:
+                            return v
+                        raise IOError("empty raw VERSION response")
+            except Exception as e:
+                last_err = e
+                print(f"  remote version fetch attempt {i+1}/{max_attempts} via {kind} failed: {e}")
+        if i < max_attempts - 1:
+            time.sleep(2 ** i)  # 1s, 2s, 4s
     raise last_err if last_err else IOError("remote version fetch failed")
 
 

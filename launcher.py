@@ -481,6 +481,21 @@ def main():
             from updater import check_for_update, apply_update_and_relaunch
             has_update, current, remote = check_for_update()
             print(f"  Local={current}  Remote={remote}  HasUpdate={has_update}")
+            # Mirror the result into the in-app log panel so the user can see
+            # why the popup did or didn't appear without reading stdout.
+            try:
+                from app import state
+                if not remote or remote == current:
+                    if remote == current:
+                        state.log(f"Update check: up to date ({current})")
+                    else:
+                        state.log(f"Update check: remote version unavailable (local {current})")
+                elif has_update:
+                    state.log(f"Update available: {current} -> {remote}")
+                else:
+                    state.log(f"Update check: local {current} >= remote {remote}")
+            except Exception:
+                pass
             if not has_update:
                 return
             import ctypes

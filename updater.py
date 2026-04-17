@@ -64,23 +64,49 @@ def get_current_version():
         return "v0000-00-0000"
 
 
-def get_remote_version():
-    req = urllib.request.Request(
-        REMOTE_VERSION_URL,
-        headers={"User-Agent": "NanoBanana-Updater"},
-    )
-    with urllib.request.urlopen(req, timeout=8) as resp:
-        return resp.read().decode("utf-8").strip()
+def get_remote_version(max_attempts=3):
+    """Fetch remote VERSION with retry/backoff. Previously a single 8s
+    timeout: a blip on GitHub's CDN or the user's network meant the
+    update popup silently never appeared. Now retries 3x with increasing
+    timeout/backoff so transient network issues don't swallow updates."""
+    last_err = None
+    for i in range(max_attempts):
+        try:
+            req = urllib.request.Request(
+                REMOTE_VERSION_URL,
+                headers={
+                    "User-Agent": "NanoBanana-Updater",
+                    # Bust any intermediate proxy/CDN caches so we don't
+                    # read a stale VERSION from a corporate cache.
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                v = resp.read().decode("utf-8").strip()
+                if v:
+                    return v
+                raise IOError("empty response")
+        except Exception as e:
+            last_err = e
+            print(f"  remote version fetch attempt {i+1}/{max_attempts} failed: {e}")
+            if i < max_attempts - 1:
+                time.sleep(2 ** i)  # 1s, 2s, 4s
+    raise last_err if last_err else IOError("remote version fetch failed")
 
 
 def check_for_update():
-    """Returns (has_update, current, remote)."""
+    """Returns (has_update, current, remote).
+    On fetch failure returns (False, current, "") so the launcher can log
+    the difference between "up to date" and "couldn't even reach GitHub"."""
     current = get_current_version()
     try:
         remote = get_remote_version()
     except Exception as e:
         print(f"  remote version fetch failed: {e}")
-        return False, current, current
+        # Signal "unknown" (not "same") with an empty remote so the caller
+        # can distinguish a network failure from genuinely being up to date.
+        return False, current, ""
     if not remote or remote == current:
         return False, current, remote
     cur_t = _version_tuple(current)

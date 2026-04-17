@@ -554,6 +554,16 @@ function onPromptKeydown(e, textarea) {
 }
 
 function showMentionMenu(textarea, cursorPos) {
+  // Idempotent: if the menu is already open for this exact `@` position,
+  // don't tear it down. Previously every keyup (including arrow keys)
+  // rebuilt the menu, which reset dataset.selected back to 0 — the user
+  // could never navigate to Image 2 because navigateMention's increment
+  // was undone by the very next keyup.
+  if (mentionMenu && mentionTarget &&
+      mentionTarget.textarea === textarea &&
+      mentionTarget.cursorPos === cursorPos) {
+    return;
+  }
   closeMentionMenu();
   if (refCount <= 0) return;
   mentionTarget = { textarea, cursorPos };
@@ -1225,6 +1235,18 @@ async function generate() {
   if (!d.ok) {
     showToast(d.error || "Cannot generate", "error");
     return;
+  }
+  // Fresh batch (not tacked onto an in-flight run): reset the progress bar
+  // that the previous batch left pinned at 100%. Without this, the bar
+  // stayed full and the "Completed" label never changed, so the second
+  // and later runs looked frozen even though generation was fine.
+  if (!d.queued) {
+    const pf = document.getElementById("progressFill");
+    if (pf) pf.style.width = "0%";
+    const pl = document.getElementById("progressLabel");
+    if (pl) pl.textContent = `Starting ${d.count} image(s)...`;
+    const sl = document.getElementById("statusLabel");
+    if (sl) sl.textContent = `Generating… 0/${d.count} done`;
   }
   const verb = d.queued ? "Queued" : "Generating";
   showToast(`${verb} ${d.count} image(s) (outstanding ${d.outstanding || d.count}/100)`, "success");

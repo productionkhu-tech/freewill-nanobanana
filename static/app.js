@@ -285,11 +285,12 @@ function addPromptSection(initialText = "") {
     syncPromptHighlight(ta);
     scheduleSettingsSave();
   });
-  // Also try on keyup so direct `@` key press triggers the menu even if
-  // the input event fired before selectionStart moved.
   ta.addEventListener("keyup", () => _tryShowMention(ta));
   ta.addEventListener("scroll", () => syncPromptHighlight(ta));
-  ta.addEventListener("keydown", (e) => onPromptKeydown(e, ta));
+  ta.addEventListener("keydown", (e) => {
+    _onAtKeydown(e, ta);     // detect @ directly from the keystroke
+    onPromptKeydown(e, ta);
+  });
   wrap.appendChild(ta);
 
   const hl = document.createElement("div");
@@ -339,7 +340,10 @@ function setupFixedPromptMention() {
     });
     fp.addEventListener("keyup", () => _tryShowMention(fp));
     fp.addEventListener("scroll", () => syncPromptHighlight(fp));
-    fp.addEventListener("keydown", (e) => onPromptKeydown(e, fp));
+    fp.addEventListener("keydown", (e) => {
+      _onAtKeydown(e, fp);
+      onPromptKeydown(e, fp);
+    });
     syncPromptHighlight(fp);
   }
 }
@@ -383,12 +387,10 @@ function resetSetup() {
 //   - Direct `@` press: sometimes the first `@` char landed but input fired
 //     before selectionStart updated, so the lookup saw the wrong position.
 function _tryShowMention(textarea) {
-  if (_imeComposing) return;   // wait until composition ends
   const pos = textarea.selectionStart;
   if (pos > 0 && textarea.value[pos - 1] === "@" && refCount > 0) {
     showMentionMenu(textarea, pos);
   } else if (mentionMenu) {
-    // Close if the cursor moved away from `@`
     if (textarea.value.substring(0, pos).lastIndexOf("@") === -1) {
       closeMentionMenu();
     }
@@ -399,17 +401,41 @@ function onPromptInput(e, textarea) {
   _tryShowMention(textarea);
 }
 
-// Global IME state — set by compositionstart/compositionend on all textareas
+// Global IME state (only used by the gallery search debounce)
 let _imeComposing = false;
 document.addEventListener("compositionstart", () => { _imeComposing = true; }, true);
 document.addEventListener("compositionend", (e) => {
   _imeComposing = false;
-  // After IME commit, re-check in case the last composed char is `@`
   const t = e.target;
   if (t && (t.id === "fixedPrompt" || t.classList?.contains("prompt-section-box"))) {
     setTimeout(() => _tryShowMention(t), 0);
   }
 }, true);
+
+// Direct `@` keypress handler — works even when the Korean IME is active.
+// On a Korean keyboard `@` is Shift+2; with Hangul mode on, the IME can
+// hold the char in composition state and the mention menu wouldn't trigger
+// until Space commits it. We intercept the keystroke itself and schedule a
+// re-check after the browser has written the char into the textarea.
+function _onAtKeydown(e, textarea) {
+  // Match both the Shift+2 physical key and the produced character
+  const isAt = e.key === "@" || (e.shiftKey && (e.key === "2" || e.code === "Digit2"));
+  if (!isAt) return;
+  // Don't preventDefault — let the @ land in the textarea naturally.
+  // Then poll a few frames until it actually appears (handles IME delay).
+  let tries = 0;
+  const check = () => {
+    tries++;
+    const pos = textarea.selectionStart;
+    const valueHasAt = pos > 0 && textarea.value[pos - 1] === "@";
+    if (valueHasAt) {
+      _tryShowMention(textarea);
+      return;
+    }
+    if (tries < 20) setTimeout(check, 25);  // up to 500ms
+  };
+  setTimeout(check, 0);
+}
 
 function onPromptKeydown(e, textarea) {
   if (e.key === "Tab" && !mentionMenu) {

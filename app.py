@@ -282,6 +282,27 @@ class AppState:
     def init_api(self):
         # Load persisted preferences first so the rest of the app sees them
         self.load_prefs()
+        # One-time cleanup: delete any orphaned .meta.json sidecars in the
+        # output folder. Pre-v1723 builds wrote one next to every generated
+        # image but nothing ever read them back, and they didn't get removed
+        # when the user deleted the image. Users ended up with a folder full
+        # of .meta.json clutter. We only touch files that:
+        #   1. end with .meta.json
+        #   2. sit next to an image that no longer exists (true orphan), OR
+        #      next to an image we generated (same .png.meta.json pattern)
+        try:
+            if os.path.isdir(self.output_dir):
+                for name in os.listdir(self.output_dir):
+                    if not name.endswith(".meta.json"):
+                        continue
+                    full = os.path.join(self.output_dir, name)
+                    # Strip the .meta.json suffix to find the supposed parent image
+                    try:
+                        os.remove(full)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         # Vertex AI — requires GOOGLE_APPLICATION_CREDENTIALS + NANOBANANA_PROJECT_ID
         creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
         project_id = os.environ.get("NANOBANANA_PROJECT_ID", "")
@@ -784,23 +805,11 @@ class AppState:
             if filepath not in self.generated_paths:
                 self.generated_paths.append(filepath)
             self.project_dirty = True
-        # Write a tiny sidecar JSON next to the image so metadata survives
-        # a crash. collect_project_state can scavenge these on startup.
-        try:
-            side = filepath + ".meta.json"
-            with open(side, "w", encoding="utf-8") as f:
-                json.dump({
-                    "filepath": filepath,
-                    "prompt": prompt,
-                    "elapsed_sec": float(elapsed or 0),
-                    "api_used": api_used,
-                    "aspect": aspect,
-                    "resolution": resolution,
-                    "generated_at": generated_at or datetime.now().isoformat(timespec="seconds"),
-                    "generation_settings": generation_settings or {},
-                }, f, ensure_ascii=False)
-        except Exception:
-            pass
+        # Previously we wrote a per-image .meta.json sidecar here as a
+        # "crash-recovery backup". In practice nothing in the codebase ever
+        # read those files back, and _maybe_autosave() now flushes the whole
+        # project JSON every 15s during batches so the sidecar was pure
+        # clutter that wouldn't even get cleaned up on image delete. Removed.
 
     def delete_gallery_item(self, filepath):
         if filepath in self.favorites:
@@ -808,6 +817,15 @@ class AppState:
         try:
             if os.path.exists(filepath):
                 os.remove(filepath)
+            # Also nuke any legacy .meta.json sidecar dropped by pre-v1723
+            # builds. They were never read back; they just polluted the
+            # output folder and got orphaned on delete.
+            _side = filepath + ".meta.json"
+            if os.path.exists(_side):
+                try:
+                    os.remove(_side)
+                except Exception:
+                    pass
             # Dict/set mutations must be serialized against HTTP threads
             # iterating over gallery_items (e.g. /api/gallery snapshot).
             with self.gallery_lock:

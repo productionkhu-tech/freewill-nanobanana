@@ -164,10 +164,18 @@ def _sweep_stale_mei():
         import tempfile as _tempfile
         import shutil as _shutil
         import re as _re
+        import time as _time
         _temp = _tempfile.gettempdir()
         _our_mei = os.path.normcase(getattr(sys, "_MEIPASS", "") or "")
         if not _our_mei:
             return  # belt-and-suspenders: never sweep when we can't identify ourselves
+        now = _time.time()
+        # Skip any _MEI folder modified in the last 5 minutes. A concurrent
+        # NanoBanana launch is actively extracting into its own _MEI and any
+        # rmtree we do there will corrupt its runtime (e.g. "ModuleNotFoundError:
+        # No module named 'unicodedata'" mid-import). 5 minutes is well past
+        # any reasonable PyInstaller extraction + run-to-stable window.
+        FRESH_WINDOW_SEC = 300
         for _name in os.listdir(_temp):
             if not _re.match(r"^_MEI[0-9a-fA-F]+$", _name):
                 continue
@@ -175,6 +183,13 @@ def _sweep_stale_mei():
             if os.path.normcase(_path) == _our_mei:
                 continue
             if not os.path.isdir(_path):
+                continue
+            try:
+                mtime = os.path.getmtime(_path)
+                if now - mtime < FRESH_WINDOW_SEC:
+                    # Might be another live NanoBanana process - leave alone.
+                    continue
+            except OSError:
                 continue
             try:
                 _shutil.rmtree(_path, ignore_errors=True)
@@ -284,7 +299,20 @@ def acquire_single_instance():
         )
         err = ctypes.get_last_error()
         if err == ERROR_ALREADY_EXISTS:
-            _focus_existing_nanobanana_window()
+            # RETRY WINDOW: the first instance may have already acquired the
+            # mutex but not yet created its pywebview window (PyInstaller
+            # extraction + Flask + WebView2 init takes 3-5s on first launch).
+            # Without this loop, the second click during that window would
+            # silently exit because EnumWindows couldn't find a
+            # "NanoBanana..." titled window yet. Poll every 200ms for up
+            # to 4 seconds so the user's second click eventually focuses
+            # the original once its window appears.
+            for _ in range(20):  # 20 * 200ms = 4.0s
+                if _focus_existing_nanobanana_window():
+                    return False
+                time.sleep(0.2)
+            # Still no visible window after 4s — original is stuck or
+            # dying. Exit silently either way.
             return False
         return True
     except Exception as e:

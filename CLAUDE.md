@@ -12,7 +12,13 @@ Google Gemini API 기반 AI 이미지 생성 데스크톱 앱 (Flask + pywebview
 - **백엔드**: Flask 127.0.0.1:5656, `app.py` 단일 파일에 상태+라우트
 - **배포**: GitHub Release에 EXE asset 업로드 → 기존 사용자는 실행 시 자동 업데이트
 - **버전**: `vYYYY-MM-DDNN` — 같은 날 `NN`은 증가, 날짜 바뀌면 `01`부터 재시작
-- **자동 업데이트**: `main` 브랜치 `VERSION` vs 로컬 tuple 비교 → 전체 EXE 교체 + `os._exit` + swap.bat
+- **자동 업데이트 (v1732+ 아키텍처)**:
+  1. 런처가 `GitHub Releases API`에서 최신 태그 조회 (raw.githubusercontent CDN 스테일 회피)
+  2. 결과를 `state.push_event({"type":"update_status",...})`로 **프론트엔드에 푸시**
+  3. 프론트가 앱 내 DOM 다이얼로그 표시 (Win32 MessageBox 사용 안 함 — 신뢰 불가)
+  4. 사용자 "지금 설치" 클릭 → `POST /api/apply-update`
+  5. 백엔드: `NanoBanana.new.exe` 다운로드 → `[new_exe, "--updater", old_path]` 스폰 → `os._exit(0)`
+  6. `--updater` 모드의 새 EXE: write-probe로 부모 exit 대기 → `os.replace` (retry + taskkill 에스컬레이션) → 런치
 
 ---
 
@@ -131,41 +137,78 @@ gen_worker 루프:
   └── 배치 끝나면 "done" 이벤트
 ```
 
-### 자동 업데이트 흐름 (현재 모델)
+### 자동 업데이트 흐름 (v1732+ 현재 모델 — bat 완전 제거)
+
+**1단계: 체크 (launcher.py `_bg_update_check`)**
 ```
-런처 백그라운드:
-  ├── 2초 sleep (UI 안정화 대기)
-  ├── raw.githubusercontent.com/.../main/VERSION fetch (15s timeout, 3회 재시도, no-cache 헤더)
-  ├── tuple 변환 후 비교 (v2026-04-1730 → (2026,4,17,30))
-  ├── 결과를 state.log()로 앱 Log 창에 기록 ("Update available: ..." / "up to date" / "unavailable")
-  └── has_update=True면 MessageBox "업데이트하시겠습니까?" 표시
+런처 백그라운드 스레드:
+  ├── 2초 sleep (UI 안정화)
+  ├── _sweep_stale_mei()  (고아 _MEI 폴더 청소, 레이스 회피용 bg에서)
+  ├── updater.get_remote_version() — 다음 순서로 시도:
+  │    1. GitHub Releases API (/repos/.../releases/latest) — ★ 1순위 (CDN 캐시 없음)
+  │    2. raw.githubusercontent.com/.../main/VERSION — 폴백 (CDN 스테일 가능)
+  │    (각 15s timeout, 최대 3회 재시도 with backoff, no-cache 헤더)
+  ├── tuple 변환 후 비교: (2026,4,17,37) vs (2026,4,17,38)
+  └── state.push_event({"type":"update_status", "has_update":..., "current":..., "remote":...})
+     ↑ Win32 MessageBox 절대 안 씀 (v1735에서 제거) — 이벤트만 푸시
+```
 
-사용자가 "예" 클릭 시:
-  ├── pywebview 창에 "업데이트 설치 중…" 전체 오버레이 띄움 (사용자 피드백)
-  ├── apply_update_and_relaunch(remote)
-  │    ├── Program Files 설치면 거부 (UAC 필요)
-  │    ├── Release API로 NanoBanana.exe asset URL + expected sha256 수집
-  │    ├── NanoBanana.new.exe 로 다운로드 (Content-Length 검증, 3회 재시도)
-  │    ├── sha256 미스매치 시 파일 삭제하고 중단
-  │    ├── %TEMP%\nanobanana_update_*.bat 작성
-  │    │    - 헤더: chcp 65001 (한글 경로 지원)
-  │    │    - 단계별 log 기록
-  │    │    - set "_MEIPASS="; set "_MEIPASS2="  (새 EXE가 옛 _MEI 폴더 참조 방지)
-  │    │    - 6회 polite rename 시도 → 실패 시 taskkill /PID → 마지막 수단 taskkill /IM
-  │    │    - move /y NEW OLD → del /F /Q BACKUP (재시도 1회)
-  │    │    - ping 2초 대기 (AV 스캔 시간)
-  │    │    - start "NanoBanana" "%OLD%"
-  │    │    - tasklist로 런칭 확인 → 안 떠 있으면 start 한 번 더
-  │    └── subprocess.Popen(bat, env=_MEI* 제거한 복사본, DETACHED)
-  └── os._exit(0) — 데몬 스레드에서 sys.exit(0)은 프로세스 안 죽이니 반드시 os._exit
+**2단계: 사용자 확인 (app.js 프론트)**
+```
+프론트가 /api/events 폴링 (800ms) → update_status 이벤트 수신
+  → has_update 이면: showUpdateConfirmModal() — 앱 내 DOM 다이얼로그
+  → has_update 아님: 토스트 (조용히 "이미 최신" 또는 "확인 실패")
 
-새 EXE 기동:
+사용자 "지금 설치" 클릭:
+  → showUpdateOverlay() — 전체화면 오버레이 (프로그레스 바 빈 상태)
+  → POST /api/apply-update
+```
+
+**3단계: 다운로드 + 스폰 (app.py `/api/apply-update`)**
+```
+Flask bg 스레드:
+  ├── apply_update_and_relaunch(remote, on_progress=push_event)
+  │    ├── Program Files 검사 (UAC 불가 → 거부)
+  │    ├── Release API로 asset URL + sha256 수집
+  │    ├── NanoBanana.new.exe 스트리밍 다운로드
+  │    │    └── on_progress 콜백이 update_progress 이벤트 푸시 (~512KB마다)
+  │    ├── Content-Length 검증 + sha256 매칭
+  │    └── subprocess.Popen([new_exe, "--updater", old_exe_path],
+  │                         env=_MEI* 제거 복사본,
+  │                         creationflags=DETACHED|NO_WINDOW|NEW_PROCESS_GROUP)
+  ├── state.push_event({"type":"update_swap", "phase":"handing_off"})
+  ├── time.sleep(1) — 프론트가 마지막 이벤트 poll할 시간
+  └── os._exit(0) — 프로세스 핸들 즉시 해제
+```
+
+**4단계: 스왑 (launcher.py `_run_as_updater`)**
+```
+새 EXE (자기 PyInstaller 런타임) 가 `--updater <old_path>` 로 실행:
+  ├── write-probe로 old_path 잠금 해제 대기
+  │    └── open(old_path, "ab") 시도 — running EXE면 Windows가 write 거부 → sleep 후 재시도
+  │        (v1739 이전엔 rename으로 probe했는데 Windows는 running EXE rename은 허용해서
+  │         거짓 성공 → replace 단계에서 AccessDenied. 반드시 write-probe 써야 함)
+  ├── shutil.copy2(our_path, target.replacing)  — 자기 바이트 복사
+  ├── os.replace(target.replacing, target_path) — 최대 20회 retry
+  │    └── 5회 실패 시 taskkill /F /IM 에스컬레이션
+  ├── subprocess.Popen([target_path], DETACHED|NO_WINDOW)
+  └── sys.exit(0) — 우리 _MEI 폴더는 atexit으로 정리됨
+
+새 target이 기동:
   ├── stdout/stderr UTF-8 재설정 + print 래퍼
   ├── 고아 청소 (new.exe, exe.old, 오래된 _MEI*)
-  ├── 정상 기동
-  └── JS가 /api/release-notes-check 호출 → last_seen_version.txt vs 현재 VERSION 비교
-       → 다르면 "업데이트 완료" 팝업 (sha256/hash 라인은 필터링)
+  ├── Flask + pywebview 기동
+  └── JS가 /api/release-notes-check 호출 → "업데이트 완료 vXXX" 팝업 (sha256 라인 필터)
 ```
+
+**왜 v1731까지의 아키텍처를 버렸는가 (역사)**
+| 버전 | 방식 | 근본 문제 |
+|---|---|---|
+| ~v1731 | swap.bat + Win32 MessageBox | cp949 경로 깨짐, MessageBox가 ncr 상태에서 안 뜸, evaluate_js flaky |
+| v1732 | --updater 서브커맨드 + MessageBox 유지 | MessageBox는 여전히 신뢰 불가 |
+| v1735 | MessageBox 제거 → 프론트 DOM 다이얼로그 | 여전히 raw.githubusercontent CDN 스테일 문제 |
+| v1737 | Releases API 우선 사용 | probe가 rename 기반이라 거짓 성공 → replace 단계 AccessDenied |
+| **v1739** | write-probe + os.replace retry | ★ 현재 안정 버전. E2E 실전 검증 완료 |
 
 ---
 
@@ -178,13 +221,17 @@ gen_worker 루프:
 2. **PyInstaller 캐시 재사용 금지.** 매 빌드 전 `build/` `dist/` 삭제.
 3. **`os.execv()` / `sys.exit(0)` (데몬 스레드에서) 재시작 금지.** 전자는 `_MEI` 재사용 문제, 후자는 **스레드만 죽이고 프로세스는 계속 실행**되어 파일 핸들 잡고 swap 실패. 업데이트 경로는 무조건 `os._exit(0)`.
 4. **Overlay/user_updates 폴더 접근 금지.** 구버전 잔재. 현재 업데이트는 EXE 통째 교체 방식.
-5. **병렬 워커 공유 상태 락 없이 접근 금지.** `file_counter_lock`, `ref_lock`, `gallery_lock`, `pending_jobs_lock`, `log_lock`, `progress_lock` 반드시 사용.
-6. **`send_file(user_path)` 금지.** 반드시 `_is_path_allowed(fp)`로 allowlist 체크 후 전달.
-7. **`print()` / 로그 문자열에 em-dash(`—`), curly quote, emoji 등 non-ASCII 금지.** 한국어 Windows 콘솔이 cp949라 `UnicodeEncodeError`로 앱 크래시. 주석은 OK, 실행 문자열은 ASCII. (안전망으로 `print` 래퍼 + stdout reconfigure 있지만 이중 방어용)
-8. **`Image.convert("RGB")` 를 ref/생성 이미지 경로에 직접 사용 금지.** PNG 투명 픽셀이 검정으로 변함. `_to_display_image()`(알파 보존) 또는 `_to_rgb_flatten()`(JPEG/BMP 인코더 전용) 사용.
-9. **swap.bat에 `chcp 65001` 제거 금지.** 한글 경로가 cp949에서 깨져 swap 전부 실패.
-10. **subprocess.Popen으로 자식 프로세스 띄울 때 `_MEIPASS*` 환경변수 상속 주의.** 자식이 onefile EXE면 옛 _MEI 폴더 재사용하려다 LoadLibrary 실패. `env=` 파라미터로 `_MEI*` 제거한 복사본 전달.
-11. **`.meta.json` 사이드카 다시 만들지 말 것.** 과거에 크래시 복구용으로 만들었지만 읽는 코드가 한 번도 없었음 + 삭제 로직 없어서 고아 파일 누적. `_maybe_autosave()`로 대체됨.
+5. **swap.bat 다시 쓰지 말 것.** v1731까지 쓰던 방식. cp949, `_MEIPASS2` 상속, `find /I` 창 노출, 무한 re-prompt 루프 등 수많은 버그의 원인. v1732부터 **`--updater` 서브커맨드로 통일**.
+6. **Win32 MessageBox를 업데이트 플로우에 쓰지 말 것.** frozen `--windowed` PyInstaller에서 window focus 상태 따라 안 뜨는 경우 있음. 업데이트 UI는 **반드시 프론트 DOM 다이얼로그**만 (v1735+).
+7. **업데이트 체크에 raw.githubusercontent 단독 사용 금지.** Fastly CDN이 푸시 후 수 분간 스테일. **Releases API (`/releases/latest`) 를 1순위**로 쓰고 raw는 폴백만 (v1737+).
+8. **`os.replace` 파일 락 probe를 rename으로 하지 말 것.** Windows는 running EXE rename을 **허용** → rename 성공해도 replace는 AccessDenied. 반드시 **`open(path, "ab")` 로 write-probe** (v1739+).
+9. **병렬 워커 공유 상태 락 없이 접근 금지.** `file_counter_lock`, `ref_lock`, `gallery_lock`, `pending_jobs_lock`, `log_lock`, `progress_lock` 반드시 사용.
+10. **`send_file(user_path)` 금지.** 반드시 `_is_path_allowed(fp)`로 allowlist 체크 후 전달.
+11. **`print()` / 로그 문자열에 em-dash(`—`), curly quote, emoji 등 non-ASCII 금지.** 한국어 Windows 콘솔이 cp949라 `UnicodeEncodeError`로 앱 크래시. 주석은 OK, 실행 문자열은 ASCII. (안전망으로 `print` 래퍼 + stdout reconfigure 있지만 이중 방어용)
+12. **`Image.convert("RGB")` 를 ref/생성 이미지 경로에 직접 사용 금지.** PNG 투명 픽셀이 검정으로 변함. `_to_display_image()`(알파 보존) 또는 `_to_rgb_flatten()`(JPEG/BMP 인코더 전용) 사용.
+13. **subprocess.Popen으로 자식 프로세스 띄울 때 `_MEIPASS*` 환경변수 상속 주의.** 자식이 onefile EXE면 옛 _MEI 폴더 재사용하려다 LoadLibrary 실패. `env=` 파라미터로 `_MEI*` 제거한 복사본 전달.
+14. **`.meta.json` 사이드카 다시 만들지 말 것.** 과거에 크래시 복구용으로 만들었지만 읽는 코드가 한 번도 없었음 + 삭제 로직 없어서 고아 파일 누적. `_maybe_autosave()`로 대체됨.
+15. **배포 후 이론만 믿고 종료 금지.** 매 업데이트 관련 변경 후 **실제 이전 버전 EXE를 로컬에서 실행하고, 새 릴리스 감지 → apply → swap → 새 버전 기동까지 E2E 검증**할 것. v1733~v1738은 이 검증 없이 "코드가 맞으니 되겠지"로 릴리스했다가 매번 실패했음.
 
 ### 버전 규칙
 - 포맷: `vYYYY-MM-DDNN`
@@ -372,8 +419,15 @@ PYEOF
 - CSRF guard (`X-NB-Token` 필수, GET/release-notes-check/version 제외)
 - `MAX_CONTENT_LENGTH=40MB` (업로드 OOM 방지)
 
-### `launcher.py` (pywebview 래퍼, ~580줄)
-- **모듈 로드 시점**: stdout UTF-8 재설정, print 래퍼, 고아 파일/폴더 청소
+### `launcher.py` (pywebview 래퍼, ~850줄) — v1739 기준
+- **모듈 로드 시점**: stdout UTF-8 재설정, print 래퍼, 고아 파일(.new.exe / .exe.old) 청소
+- **`main()` 최상단**: `sys.argv[1] == "--updater"` 체크 → `_run_as_updater(target_path)` 라우팅 후 리턴 (UI/Flask/mutex 없이 바로 swap)
+- `_run_as_updater(target_path)`: 스왑 전용 헬퍼
+  - write-probe로 target unlock 대기 (30초 × 1s)
+  - `shutil.copy2(our, target.replacing)` + `os.replace` (20회 retry, 5회차에 taskkill 에스컬레이션)
+  - `subprocess.Popen([target], DETACHED|NO_WINDOW)` 후 `sys.exit(0)`
+  - 모든 단계 `%TEMP%\nanobanana_update.log` 에 기록
+- `_sweep_stale_mei()`: 고아 `_MEI*` temp 폴더 정리 (bg 스레드에서만 실행 — 모듈 init에서 돌면 PyInstaller extraction과 레이스)
 - `_focus_existing_nanobanana_window()`: `EnumWindows` + title prefix 매칭으로 기존 창 찾아서 foreground
 - `acquire_single_instance()`: `WinDLL(use_last_error=True)` + `ctypes.get_last_error()` 로 mutex 안정 감지
 - `check_api_env()`: 환경변수 없으면 MessageBox 후 exit
@@ -381,28 +435,32 @@ PYEOF
 - Program Files 설치 감지 → 경고 (UAC 이슈)
 - 포트 충돌 fallback → 기존 창 포커스 후 silent exit
 - `class JsApi`: JS에서 호출되는 Python 함수 (창 제어, 뷰어 팝업 등)
-- `_bg_update_check()`: 백그라운드 업데이트 체크 스레드 (2초 지연, 결과 state.log로 노출)
-- 업데이트 승낙 시: pywebview에 "업데이트 설치 중…" overlay 주입 → `apply_update_and_relaunch()` → `os._exit(0)`
+- `_bg_update_check()`: **체크만** 하고 `update_status` 이벤트 push. MessageBox 없음, overlay 주입 없음.
 - Win32 아이콘 주입 (`WM_SETICON`)
 
-### `updater.py` (자동 업데이트)
-- `_version_tuple(v)`: 버전 문자열 → 숫자 튜플
-- `get_current_version()`: bundle의 VERSION
-- `get_remote_version()`: GitHub raw, **3회 재시도 + 15s timeout + Cache-Control: no-cache**
-- `check_for_update()`: tuple 비교, fetch 실패 시 remote="" 로 구분
-- `_find_release_assets()`: release body `sha256:` 파싱 + `.sha256` sidecar asset fallback
-- `_download_with_retry()`: 3회 재시도 + Content-Length 검증
+### `updater.py` (자동 업데이트) — v1739 기준
+- `_version_tuple(v)`: 버전 문자열 → 숫자 튜플 (`v2026-04-1739` → `(2026,4,17,39)`)
+- `get_current_version()`: bundle의 VERSION 파일 읽기
+- `get_remote_version()`: **Releases API 우선 → raw 폴백**, 각 15s timeout, 최대 3회 재시도 with backoff, no-cache 헤더
+- `check_for_update()`: tuple 비교, fetch 실패 시 `remote=""` 로 구분 (캐시-스테일 vs 진짜 최신)
+- `_find_release_assets()`: 릴리스 바디에서 `sha256:` 파싱 + `NanoBanana.exe.sha256` sidecar asset 폴백
+- `_download_with_retry(on_progress=...)`: 3회 재시도 + Content-Length 검증 + ~512KB마다 progress 콜백
 - `_sha256_of()`: 파일 해시 계산
-- `apply_update_and_relaunch()`:
+- `apply_update_and_relaunch(remote, on_progress=None)`:
   - Program Files 거부
-  - 다운로드 + sha256 검증
-  - swap.bat 작성 (UTF-8, `chcp 65001` 헤더)
-  - `subprocess.Popen(env=_MEI* 제거한 복사본)` DETACHED
-- `cleanup_legacy_overlay()`: 구버전 `user_updates/` 폴더 정리
+  - `NanoBanana.new.exe` 다운로드 + sha256 검증
+  - `subprocess.Popen([new_exe, "--updater", old_path], env=_MEI* 제거, DETACHED|NO_WINDOW|NEW_PROCESS_GROUP)`
+  - 반환 즉시 호출자는 `os._exit(0)` 해야 함
+- **bat 관련 모든 코드 제거됨** (v1732 이후). `cleanup_legacy_overlay()` 만 구버전 `user_updates/` 폴더 정리용으로 남음
 
-### `static/app.js` (프론트엔드, ~1800줄)
+### `static/app.js` (프론트엔드, ~1900줄) — v1739 기준
 - 모든 UI 로직: 갤러리 렌더링, 드래그 앤 드롭, 프롬프트 멘션, 모달, 폴링
 - `api()` helper: CSRF 토큰 자동 첨부 (`X-NB-Token`)
+- **업데이트 UI (완전히 프론트 소유)**:
+  - `pollEvents()` 가 `update_status` / `update_progress` / `update_swap` 이벤트 수신
+  - `showUpdateConfirmModal(current, remote)`: 앱 내 DOM 다이얼로그. "나중에" / "지금 설치" 버튼
+  - `showUpdateOverlay()` / `hideUpdateOverlay()`: 전체화면 오버레이 + 실제 % 진행률 바
+  - `manualCheckUpdate()`: 푸터 버전 라벨 클릭 시 강제 체크 (자동 체크 놓친 경우 대비)
 - IME 처리: `_tryShowMention`, compositionstart/end, blur/visibilitychange 리셋
 - `_atomicMentionEdit`: `[Image N]` 을 backspace/delete/arrow 에서 원자 단위로 처리
 - `insertMention()`: 실시간 커서 위치 재확인 + IME composition 중이면 compositionend 까지 defer
@@ -433,9 +491,12 @@ PYEOF
 | 한글 입력 시 @ 멘션 메뉴 안 뜸 | IME composition 중 input 이벤트 안 발생 | `keydown`에서 Shift+2 감지 후 폴링, `keyup`에서 idempotent 메뉴 표시 |
 | @ 멘션 방향키로 Image 2 선택 안 됨 (Image 1로 돌아감) | 매 keyup 마다 `showMentionMenu` 가 메뉴 rebuild → selected=0 리셋 | `showMentionMenu` idempotent 체크 추가 |
 | 커서가 `[Image N]` 태그 끝에서 약간 떠보임 | overlay의 `.mention` span에 font-weight 600 → textarea(400)와 글자 폭 어긋남 | span에 font-weight 지정 금지, 색상만 |
-| "업데이트 있습니다" 무한 팝업 | swap.bat 실패 (한글 경로 cp949 mangling / `os._exit` 놓침 / AV 간섭) | `chcp 65001`, `os._exit(0)`, PID taskkill, start 재시도, `_MEIPASS2` 차단 |
-| 업데이트 후 "Failed to load Python DLL _MEI*\\python312.dll" | 새 EXE가 부모의 `_MEIPASS2` 상속 → 옛 _MEI 폴더 로드 시도 | subprocess Popen `env=` 에서 `_MEI*` 제거 + bat에서도 `set _MEIPASS=` |
-| 업데이트 후 NanoBanana.exe.old 또는 .new.exe 남음 | bat del 실패 (AV hold) / swap 실패 | del /F /Q 재시도 + launcher 시작 시 orphan 청소 |
+| "업데이트 있습니다" 무한 팝업 | 구버전 swap.bat 실패 / raw CDN 스테일 | v1739부터 bat 제거 + Releases API 1순위. 구버전 사용자는 수동 교체 1회 |
+| 업데이트 후 "Failed to load Python DLL _MEI*\\python312.dll" | 새 EXE가 부모의 `_MEIPASS2` 상속 → 옛 _MEI 폴더 로드 시도 | subprocess Popen `env=` 에서 `_MEI*` 제거 |
+| 업데이트 후 NanoBanana.exe.old 또는 .new.exe 남음 | 구버전 bat swap 실패 / `.new.exe` 는 자체 ghost | launcher 시작 시 orphan 청소 (v1726+) |
+| 업데이트 Yes 클릭 후 아무 일 없음 | MessageBox가 frozen windowed EXE에서 안 뜬 것 | v1735부터 MessageBox 폐기, 프론트 DOM 다이얼로그만 사용 |
+| "이미 최신" 인데 사실은 아님 | raw.githubusercontent CDN 스테일 (푸시 후 수 분 지연) | v1737부터 Releases API 우선 (CDN 캐시 없음) |
+| os.replace → AccessDenied (WinError 5) | probe를 rename으로 해서 거짓 성공 (Windows는 running EXE rename 허용) | v1739부터 `open(path, "ab")` 로 write-probe + replace 20회 retry |
 | "UnicodeEncodeError: cp949 codec..." 앱 크래시 | print 문자열에 em-dash/한글/이모지 + stdout이 cp949 | 실행 문자열 ASCII화, stdout reconfigure, print 래퍼 |
 | 두 번째 double-click 시 새 창 + 포트 에러 | ctypes GetLastError 불안정 (mutex 감지 놓침) | `WinDLL(use_last_error=True)` + `ctypes.get_last_error()`, 포트 fallback |
 | 기존 창이 제목 바뀌어서 FindWindowW 실패 | JS가 타이틀을 `NanoBanana - name *` 로 변경 | `EnumWindows` + `startswith("NanoBanana")` 매칭 |
@@ -475,3 +536,48 @@ PYEOF
 2. `setup_env.bat` 더블클릭 → API 키가 환경변수로 설치됨 (1회만)
 3. `NanoBanana.exe` 더블클릭 → 실행 (작업표시줄에 고정해도 업데이트 후 유지됨 — 같은 경로·같은 파일명으로 덮어쓰기)
 4. 업데이트가 있으면 시작 시 팝업으로 안내, "예" 누르면 자동 다운로드 + 재시작
+
+---
+
+## 10. 업데이트가 "절대" 실패하지 않는가? — 솔직한 답변
+
+v1739 기준 업데이트 아키텍처는 지금까지 본 모든 일반적 실패 모드를 덮고 있고, E2E 실전 검증도 완료. 하지만 **"100% 절대"는 누구도 보장 못 함**. 남아있는 실패 가능성:
+
+### 우리가 통제 가능한 범위 안의 복구 경로
+| 상황 | 동작 |
+|---|---|
+| 네트워크 blip (DNS / TCP / TLS 순간 장애) | 1s→2s→4s backoff로 3회 재시도. 그래도 실패면 토스트 "Update check failed" |
+| GitHub Releases API 403 (rate limit) | raw.githubusercontent 폴백 |
+| 다운로드 중 끊김 | Content-Length 검증 + 3회 재시도 |
+| 받은 EXE 손상 | sha256 미스매치 → 파일 삭제하고 에러 |
+| 부모 EXE가 handle 늦게 release | write-probe 30초 대기 + taskkill 에스컬레이션 |
+| `os.replace` AccessDenied | 20회 retry (1초 간격), 5회차에 taskkill /F /IM |
+| AV가 새 EXE 검역 (하지만 손상은 안 시킴) | os.replace 재시도 사이에 AV 스캔 끝나기를 기다림 |
+| 스왑 실패 시 원본 손상 | `os.replace(tmp, target)` 는 원자적 — 실패해도 target 바이트는 안 바뀜 |
+
+### 우리가 막을 수 없는 **실패 가능성** (유저 환경 문제)
+| 상황 | 증상 | 해결 |
+|---|---|---|
+| 유저가 EXE 쓰기 권한 없는 폴더에 설치 (예: `C:\Program Files\`) | Program Files 감지해서 경고 메시지. 하지만 UAC 우회 불가 | 일반 폴더(바탕화면 등)로 옮기라는 안내 |
+| AV가 우리 EXE 자체를 **완전 격리** (삭제) | 다운로드한 `.new.exe` 가 사라짐 | 사용자가 AV 예외 추가 필요 |
+| 디스크 풀 (다운로드 중 공간 부족) | Content-Length 검증에서 실패 | 사용자가 공간 확보 후 재시도 |
+| 폴더가 OneDrive/Dropbox 로 동기화 중 | 동기화 클라이언트가 락 잡아서 os.replace 실패 | 동기화 폴더 밖으로 이동 권장 |
+| 방화벽/프록시가 api.github.com AND raw.githubusercontent 둘 다 차단 | "Update check failed" 토스트 반복 | 회사 IT에 요청해 예외 추가 또는 수동 다운로드 |
+| GitHub 서버 장애 | 업데이트 체크 / 다운로드 전부 불가 | GitHub 복구 대기 |
+| Windows 업데이트 설치 중 파일 잠금 | os.replace 무한 실패 | 재부팅 후 재시도 |
+| 사용자가 다운로드 중 PC 끔 | `.new.exe` 가 반쪽 — 다음 실행 시 orphan 청소로 삭제됨 | 재시작 후 다시 업데이트 시도 |
+| 유저 시스템 시각이 잘못돼서 HTTPS 인증서 검증 실패 | SSL 에러 | 시스템 시각 교정 |
+
+### 실패했을 때 **유저가 취할 수 있는 탈출구**
+1. **푸터 버전 번호 클릭** → 수동 업데이트 체크 재실행
+2. **[릴리스 페이지](https://github.com/productionkhu-tech/freewill-nanobanana/releases/latest) 에서 NanoBanana.exe 수동 다운로드** → 기존 파일 덮어쓰기 (setup_env.bat은 그대로)
+3. 최악에도 **원본 EXE는 os.replace atomic 덕에 절대 손상되지 않음** — 실패해도 이전 버전은 계속 실행됨
+
+### 요약
+
+"절대" 실패 안 한다는 건 거짓말이고, 네트워크·AV·디스크·OS 상태 같은 외부 변수는 우리 코드로 제어 불가. 하지만:
+- **자동 실패 복구 경로**가 다층으로 있고 (재시도, 폴백, 에스컬레이션)
+- **원본 EXE는 절대 파손되지 않아** 유저가 "업데이트 실패 → 앱 완전 망가짐" 상태에 빠질 수 없고
+- **수동 복구 경로**(버전 클릭 재체크, 수동 다운로드) 가 항상 열려 있음
+
+E2E 실전 검증(v1738 → v1739)으로 **일반적인 시나리오에서 잘 돌아간다**는 건 확인. 엣지 케이스에서 뭐라도 보이면 `%TEMP%\nanobanana_update.log` 보내주시면 단계별로 어디서 실패했는지 바로 진단 가능합니다.

@@ -2247,7 +2247,7 @@ def new_project():
 
     state.current_project_path = None
     state.project_dirty = False
-    state.log("New project — cleared workspace")
+    state.log("New project - cleared workspace")
     return jsonify({"ok": True})
 
 

@@ -6,27 +6,70 @@ NanoBanana Launcher - Native window via pywebview
 import os
 import sys
 
-# ────────────────────────────────────────────────────────────────────────
-# CRITICAL: fix stdout/stderr encoding BEFORE anything else runs.
-# Korean Windows defaults to cp949 for console streams. The frozen EXE
-# inherits that, and any print() containing an em-dash (U+2014), a curly
-# quote, or most emoji crashes the entire app with "cp949 codec can't
-# encode" before we ever reach main(). Two layers of defense:
-#   1. Reconfigure the existing streams to UTF-8 with replace-on-error.
-#   2. If that fails (very old Python), swap in a devnull sink so prints
-#      are silently dropped rather than crashing.
-# ────────────────────────────────────────────────────────────────────────
-try:
-    if sys.stdout is not None:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if sys.stderr is not None:
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
+# ============================================================
+# CRITICAL: make print() unkillable on Korean Windows BEFORE anything
+# else imports. Two layers:
+#
+#   1. Reconfigure sys.stdout/stderr to UTF-8. On a --windowed PyInstaller
+#      build the streams can still be cp949 or NoneType even after this
+#      (the bootloader initializes them oddly), so we try reconfigure, then
+#      fall back to wrapping .buffer with io.TextIOWrapper, then finally
+#      redirecting to os.devnull.
+#   2. Wrap builtins.print with a try/except that silently swallows
+#      UnicodeEncodeError. This is the belt under the reconfigure suspenders
+#      — even if step 1 somehow fails on a user's machine, a log string
+#      containing an em-dash or curly quote will no longer crash the app.
+#
+# Pre-v1722 builds crashed here with "'cp949' codec can't encode '\u2014'"
+# whenever the single-instance mutex caught a second launch, because the
+# "Another instance is already running —" print contained U+2014.
+# ============================================================
+
+def _fix_std_stream(attr):
+    s = getattr(sys, attr, None)
+    # First choice: reconfigure the existing stream.
     try:
-        sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="replace")
-        sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="replace")
+        if s is not None and hasattr(s, "reconfigure"):
+            s.reconfigure(encoding="utf-8", errors="replace")
+            return
     except Exception:
         pass
+    # Second choice: rewrap the binary buffer as UTF-8 text.
+    try:
+        import io as _io
+        if s is not None and getattr(s, "buffer", None) is not None:
+            setattr(sys, attr, _io.TextIOWrapper(
+                s.buffer, encoding="utf-8", errors="replace", line_buffering=True))
+            return
+    except Exception:
+        pass
+    # Last resort: send the output into a hole. Any cp949 path is dead.
+    try:
+        setattr(sys, attr, open(os.devnull, "w", encoding="utf-8", errors="replace"))
+    except Exception:
+        pass
+
+_fix_std_stream("stdout")
+_fix_std_stream("stderr")
+
+# Belt under the suspenders: wrap print so UnicodeEncodeError can never
+# propagate out. Worst case we drop the log line; we never crash the app
+# because of a debug message.
+import builtins as _builtins
+_real_print = _builtins.print
+def _safe_print(*args, **kwargs):
+    try:
+        _real_print(*args, **kwargs)
+    except UnicodeEncodeError:
+        try:
+            safe = [str(a).encode("ascii", "replace").decode("ascii") for a in args]
+            _real_print(*safe, **kwargs)
+        except Exception:
+            pass
+    except Exception:
+        # Any other I/O error on stdout (closed handle, broken pipe) — ignore.
+        pass
+_builtins.print = _safe_print
 
 if getattr(sys, 'frozen', False):
     os.environ['PATH'] = sys._MEIPASS + os.pathsep + os.environ.get('PATH', '')
@@ -291,7 +334,7 @@ class JsApi:
             safe_name = urllib.parse.quote(filename or "prompt", safe="")
             url = f"{APP_URL}/prompt-popup?b64={b64}&name={safe_name}"
             webview.create_window(
-                title=f"Prompt — {filename or ''}",
+                title=f"Prompt - {filename or ''}",
                 url=url,
                 width=600, height=420,
                 resizable=True,
@@ -331,9 +374,13 @@ def main():
     print("  NanoBanana - AI Image Studio")
     print("=" * 50)
 
-    # Single-instance guard — silently focus existing window if one is running.
+    # Single-instance guard - silently focus existing window if one is running.
+    # NOTE: keep the log strings ASCII-only. On Korean Windows a --windowed
+    # PyInstaller build can leave sys.stdout stuck on cp949 even after we
+    # reconfigure, and a single em-dash in this print used to crash the
+    # EXE before main() could hand off to the webview window.
     if not acquire_single_instance():
-        print("  Another instance is already running — focused and exiting.")
+        print("  Another instance is already running - focused and exiting.")
         sys.exit(0)
 
     # Verify API credentials — abort if missing

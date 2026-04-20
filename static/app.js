@@ -805,42 +805,47 @@ async function refreshRefs() {
     //   - Drop on cell after ~700ms hover-hold -> REPLACE this slot (implicit)
     //   - Drop on cell before hold fires -> fall through to refArea (ADD)
     //
-    // Hover-hold gives users a way to replace a slot without aiming at
-    // the small Change button, while the default (quick drop) still
-    // favors ADD so a cramped grid doesn't accidentally overwrite refs.
+    // v2006 used dragenter/dragleave + a depth counter, but Chromium fires
+    // leave-before-enter when the cursor crosses between child elements
+    // (img -> pin btn -> label...), which kept resetting the hold timer.
+    // v2007 switches to dragover + a stale timer: dragover fires continuously
+    // (~30-60 Hz) while the cursor is over a drop target, so we just reset
+    // a 200ms "still here" timer on every event and consider the cursor
+    // gone once that timer finally fires.
     let _holdTimer = null;
     let _holdActive = false;
-    let _cellDragDepth = 0;
+    let _staleTimer = null;
 
     const _clearHold = () => {
       if (_holdTimer) { clearTimeout(_holdTimer); _holdTimer = null; }
+      if (_staleTimer) { clearTimeout(_staleTimer); _staleTimer = null; }
       _holdActive = false;
       cell.classList.remove("drag-hover-hold", "drag-hold-replace");
     };
 
-    cell.addEventListener("dragenter", (e) => {
-      // Change button has its own dragenter listener + visual.
+    cell.addEventListener("dragover", (e) => {
+      // Change button has its own visual/drop-target handling.
       if (e.target.closest(".ref-change")) return;
       e.preventDefault();
-      _cellDragDepth++;
-      if (_cellDragDepth === 1) {
+
+      // Re-arm the stale timer — while dragover keeps firing we're still here.
+      if (_staleTimer) clearTimeout(_staleTimer);
+      _staleTimer = setTimeout(_clearHold, 200);
+
+      // Start the hold build-up on the first dragover of this hover session.
+      if (!_holdTimer && !_holdActive) {
         cell.classList.add("drag-hover-hold");
-        if (_holdTimer) clearTimeout(_holdTimer);
         _holdTimer = setTimeout(() => {
           _holdActive = true;
           cell.classList.add("drag-hold-replace");
+          _holdTimer = null;
         }, 700);
       }
-    });
-    cell.addEventListener("dragleave", () => {
-      _cellDragDepth = Math.max(0, _cellDragDepth - 1);
-      if (_cellDragDepth === 0) _clearHold();
     });
 
     cell.addEventListener("drop", async (e) => {
       const onChangeBtn = e.target.closest(".ref-change");
       const wasHold = _holdActive;
-      _cellDragDepth = 0;
       _clearHold();
       if (!onChangeBtn && !wasHold) {
         // No preventDefault / no stopPropagation -> bubbles to refArea's

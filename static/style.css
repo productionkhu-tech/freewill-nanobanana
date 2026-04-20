@@ -577,6 +577,15 @@ textarea.prompt-box { min-height: 82px; }
   letter-spacing: 0.3px;
 }
 .ref-cell .ref-change:hover { background: var(--accent); color: var(--bg); }
+/* Drag-over state: distinct "replace this slot" signal — brighter ring and
+   fill so it's obvious this is the REPLACE target, not the ADD area. */
+.ref-cell .ref-change.drop-target {
+  background: var(--accent);
+  color: var(--bg);
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  box-shadow: 0 0 0 3px rgba(212, 165, 116, 0.25);
+}
 
 /* ═══════════════════════════════════════════
    GALLERY

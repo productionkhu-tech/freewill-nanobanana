@@ -776,25 +776,21 @@ async function refreshRefs() {
     const cell = document.createElement("div");
     cell.className = "ref-cell" + (ref.pinned ? " pinned" : "");
 
-    // Drag-and-drop file onto cell to replace this ref.
-    // Counter pattern so dragleave firing on child elements (image, buttons)
-    // doesn't flash the drop-target highlight off and back on.
-    let _dragDepth = 0;
-    cell.addEventListener("dragenter", (e) => {
-      e.preventDefault();
-      _dragDepth++;
-      cell.classList.add("drop-target");
-    });
-    cell.addEventListener("dragover", (e) => { e.preventDefault(); });
-    cell.addEventListener("dragleave", () => {
-      _dragDepth = Math.max(0, _dragDepth - 1);
-      if (_dragDepth === 0) cell.classList.remove("drop-target");
-    });
+    // Drop policy:
+    //   - Drop lands on the Change button of this cell -> REPLACE this slot
+    //   - Drop lands anywhere else on the cell          -> let it bubble to
+    //     refArea, which handles ADD. This gives the user a generous "drop
+    //     here to add" target even when the grid is fully populated.
     cell.addEventListener("drop", async (e) => {
+      const onChangeBtn = e.target.closest(".ref-change");
+      if (!onChangeBtn) {
+        // No preventDefault / no stopPropagation -> bubbles to refArea's
+        // ondrop="onRefDrop(event)" which runs the ADD path.
+        return;
+      }
       e.preventDefault();
       e.stopPropagation();
-      _dragDepth = 0;
-      cell.classList.remove("drop-target");
+      onChangeBtn.classList.remove("drop-target");
 
       // Internal drag from a gallery card: replace this cell with the
       // gallery image (JSON body, no file upload needed). Server-side
@@ -865,11 +861,25 @@ async function refreshRefs() {
     lbl.textContent = `[Image ${i + 1}]`;
     cell.appendChild(lbl);
 
-    // Change button
+    // Change button — doubles as an explicit drop-to-replace target so the
+    // user can disambiguate ADD vs REPLACE without needing empty real estate.
     const chgBtn = document.createElement("button");
     chgBtn.className = "ref-change";
     chgBtn.textContent = "Change";
     chgBtn.addEventListener("click", () => replaceRef(i));
+    // Counter pattern — child-less button so this is mostly defensive, but
+    // matches the refArea dragDepth style.
+    let _chgDragDepth = 0;
+    chgBtn.addEventListener("dragenter", (e) => {
+      e.preventDefault();
+      _chgDragDepth++;
+      chgBtn.classList.add("drop-target");
+    });
+    chgBtn.addEventListener("dragover", (e) => { e.preventDefault(); });
+    chgBtn.addEventListener("dragleave", () => {
+      _chgDragDepth = Math.max(0, _chgDragDepth - 1);
+      if (_chgDragDepth === 0) chgBtn.classList.remove("drop-target");
+    });
     cell.appendChild(chgBtn);
 
     grid.appendChild(cell);

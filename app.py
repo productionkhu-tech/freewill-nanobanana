@@ -2741,31 +2741,68 @@ def _find_nanobanana_hwnd():
 
 
 def _apply_always_on_top(enabled):
-    """Push the HWND to topmost / not-topmost via SetWindowPos. Returns
-    True on success, False on any failure (wrong platform, window not
-    found, API error)."""
+    """Push the HWND to topmost / not-topmost via SetWindowPos, then verify
+    the WS_EX_TOPMOST bit on GWL_EXSTYLE actually flipped. Returns
+    (ok, err_msg). v2005 returned True without checking either the
+    SetWindowPos BOOL return or the actual ex-style, so a silent failure
+    (e.g. 64-bit HWND sentinel truncation) looked successful."""
     if sys.platform != "win32":
-        return False
+        return False, "Windows only"
     hwnd = _find_nanobanana_hwnd()
     if not hwnd:
-        return False
+        return False, "Window not found"
     try:
         import ctypes
+        from ctypes import wintypes
         user32 = ctypes.WinDLL("user32", use_last_error=True)
-        # HWND_TOPMOST = -1, HWND_NOTOPMOST = -2 (signed values expected by
-        # SetWindowPos). Python's ctypes int->HWND conversion handles the
-        # sign-extension on 64-bit.
-        hwnd_insert_after = -1 if enabled else -2
+
+        # Explicit argtypes. Without this, Python's default int->arg
+        # conversion can truncate negative HWND sentinel values (-1/-2) to
+        # 32 bits on 64-bit Windows, which passes a garbage HWND to
+        # SetWindowPos and the call silently no-ops. wintypes.HWND is a
+        # pointer type, so building wintypes.HWND(-1) yields the correct
+        # 0xFFFF...FFFF sentinel regardless of bitness.
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        user32.SetWindowPos.restype = wintypes.BOOL
+
+        HWND_TOPMOST = wintypes.HWND(-1)
+        HWND_NOTOPMOST = wintypes.HWND(-2)
         SWP_NOMOVE = 0x0002
         SWP_NOSIZE = 0x0001
         SWP_NOACTIVATE = 0x0010
-        user32.SetWindowPos(
-            hwnd, hwnd_insert_after, 0, 0, 0, 0,
+
+        insert_after = HWND_TOPMOST if enabled else HWND_NOTOPMOST
+        ok = user32.SetWindowPos(
+            wintypes.HWND(hwnd), insert_after, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         )
-        return True
-    except Exception:
-        return False
+        if not ok:
+            err = ctypes.get_last_error()
+            return False, f"SetWindowPos err={err}"
+
+        # Verify WS_EX_TOPMOST flipped — the authoritative signal that the
+        # window is actually topmost now (some drivers / shell extensions
+        # have been known to swallow the flag).
+        GWL_EXSTYLE = -20
+        WS_EX_TOPMOST = 0x00000008
+        # GetWindowLongPtrW is 64-bit safe; fall back to GetWindowLongW.
+        get_long = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
+        try:
+            get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+            get_long.restype = ctypes.c_ssize_t
+        except Exception:
+            pass
+        ex_style = get_long(wintypes.HWND(hwnd), GWL_EXSTYLE)
+        is_topmost = bool(ex_style & WS_EX_TOPMOST)
+        if is_topmost != bool(enabled):
+            return False, f"style-mismatch(ex=0x{ex_style & 0xFFFFFFFF:08x})"
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:80]
 
 
 @app.route("/api/always-on-top", methods=["GET"])
@@ -2779,9 +2816,10 @@ def set_always_on_top():
     enabled = bool(d.get("enabled"))
     if sys.platform != "win32":
         return jsonify({"ok": False, "error": "Windows only"})
-    ok = _apply_always_on_top(enabled)
+    ok, err = _apply_always_on_top(enabled)
     if not ok:
-        return jsonify({"ok": False, "error": "Window not found"})
+        state.log(f"Always-on-top toggle failed: {err}")
+        return jsonify({"ok": False, "error": err or "Toggle failed"})
     state.always_on_top = enabled
     state.log(f"Always-on-top: {'ON' if enabled else 'OFF'}")
     return jsonify({"ok": True, "enabled": enabled})

@@ -935,6 +935,17 @@ async function onRefDrop(e) {
   e.preventDefault();
   _refAreaDragDepth = 0;
   document.getElementById("refArea").classList.remove("dragover");
+
+  // Internal drag from a gallery card: dataTransfer has our custom type but
+  // no files. Route to use-as-ref instead of upload.
+  const internalPath = e.dataTransfer?.getData("application/x-nb-gallery-path");
+  if (internalPath) {
+    const d = await api("/api/gallery/use-as-ref", { method: "POST", body: { filepath: internalPath } });
+    if (d.ok) { refreshRefs(); showToast("Added as reference", "success"); }
+    else { showToast(d.error || "Failed to add", "error"); }
+    return;
+  }
+
   const files = e.dataTransfer?.files;
   if (!files?.length) return;
   const form = new FormData();
@@ -985,6 +996,18 @@ async function refreshGallery() {
     const card = document.createElement("div");
     card.className = "card" + (selectedPaths.includes(item.filepath) ? " selected" : "");
     card.dataset.path = item.filepath;
+
+    // Allow dragging the card onto the reference area to "Use as Ref".
+    // Custom MIME type so onRefDrop can distinguish internal drags from
+    // OS file drops (which use dataTransfer.files).
+    card.draggable = true;
+    card.addEventListener("dragstart", (e) => {
+      try {
+        e.dataTransfer.effectAllowed = "copy";
+        e.dataTransfer.setData("application/x-nb-gallery-path", item.filepath);
+        e.dataTransfer.setData("text/plain", item.filepath);
+      } catch (_) {}
+    });
 
     // --- Media frame ---
     // Rule 1: Dynamic aspect ratio. Parse generation aspect string ("16:9")
@@ -1298,19 +1321,42 @@ async function copyToClipboard(fp) {
   showToast(d.ok ? "Copied to clipboard" : (d.error || "Failed"), d.ok ? "success" : "error");
 }
 
-function showPromptPopup(prompt, filename) {
-  // Prefer native pywebview window; fall back to new tab in dev
-  if (window.pywebview && window.pywebview.api && window.pywebview.api.open_prompt_popup) {
-    try {
-      window.pywebview.api.open_prompt_popup(prompt || "", filename || "");
-      return;
-    } catch (e) {
-      console.error(e);
-    }
+async function showPromptPopup(prompt, filename) {
+  // Renamed behavior: instead of opening a popup window, copy the prompt
+  // straight to the clipboard and surface a toast + server log line.
+  const text = prompt || "";
+  if (!text) {
+    showToast("No prompt to copy", "warn");
+    return;
   }
-  const b64 = btoa(unescape(encodeURIComponent(prompt || "")));
-  const url = `/prompt-popup?b64=${b64}&name=${encodeURIComponent(filename || "")}`;
-  window.open(url, "_blank", "width=600,height=420");
+  let copied = false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    }
+  } catch (_) { /* fall through to execCommand */ }
+  if (!copied) {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      copied = document.execCommand("copy");
+      document.body.removeChild(ta);
+    } catch (_) {}
+  }
+  if (copied) {
+    showToast("Prompt copied", "success");
+    // Best-effort log line so the Log pane shows the action too.
+    try {
+      await api("/api/log-message", { method: "POST", body: { message: `Prompt copied: ${filename || ""}` } });
+    } catch (_) {}
+  } else {
+    showToast("Copy failed", "error");
+  }
 }
 
 // ==========================================

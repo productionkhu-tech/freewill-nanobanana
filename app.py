@@ -1345,12 +1345,20 @@ class AppState:
                         self.done_count += 1
 
                         gen_at = datetime.now().isoformat(timespec="seconds")
+                        # Save the actual batch size (from /api/generate) so
+                        # Load restores the count the user picked for that run,
+                        # not a hardcoded 1.
+                        saved_count = int(job.get("batch_count") or 1)
+                        if saved_count < 1:
+                            saved_count = 1
+                        if saved_count > 10:
+                            saved_count = 10
                         gen_settings = {
                             "prompt": prompt,
                             "fixed_prompt": self.fixed_prompt,
                             "prompt_sections": list(self.prompt_sections),
                             "model": model, "aspect": aspect, "resolution": resolution,
-                            "count": 1, "output_dir": job["output_dir"],
+                            "count": saved_count, "output_dir": job["output_dir"],
                             "naming": naming,
                             "ref_paths": list(job.get("ref_paths", [])),
                             "pinned_ref_paths": list(job.get("pinned_ref_paths", [])),
@@ -2156,10 +2164,43 @@ def load_setup():
     state.naming_index_prefix = naming.get("index_prefix", "I")
     state.naming_padding = int(naming.get("padding", 3))
 
-    # Restore refs
-    state.clear_refs()
+    # Restore refs.
+    #
+    # Drag-and-drop refs are cached under temp_ref_dir with digest-based names
+    # and tracked in state.temp_ref_paths. clear_refs() deletes any such files
+    # from disk (so temp refs don't accumulate). If the saved setup references
+    # those same paths, the subsequent add_ref_image(rp) would then fail the
+    # os.path.exists check. To keep drag-dropped refs loadable, snapshot their
+    # bytes before clearing and rewrite the files if clear removed them.
     ref_paths = [p for p in (saved.get("ref_paths") or []) if p]
     pinned = set(p for p in (saved.get("pinned_ref_paths") or []) if p)
+    buffered = {}
+    for rp in ref_paths:
+        if rp in buffered:
+            continue
+        try:
+            if os.path.isfile(rp):
+                with open(rp, "rb") as f:
+                    buffered[rp] = f.read()
+        except Exception:
+            pass
+
+    state.clear_refs()
+
+    for rp, data in buffered.items():
+        if os.path.exists(rp):
+            continue
+        try:
+            os.makedirs(os.path.dirname(rp), exist_ok=True)
+            with open(rp, "wb") as f:
+                f.write(data)
+            try:
+                state.temp_ref_paths.add(rp)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     for rp in ref_paths:
         if os.path.exists(rp):
             state.add_ref_image(rp, pinned=rp in pinned)
@@ -2244,6 +2285,9 @@ def start_generate():
             "output_dir": state.output_dir,
             "fixed_prompt": state.fixed_prompt,
             "prompt_sections": list(state.prompt_sections),
+            # Remembered so Load can restore the count the user picked for
+            # this batch (per-item gen_settings used to hardcode 1).
+            "batch_count": count,
         })
 
     with state.pending_jobs_lock:
@@ -2617,6 +2661,26 @@ def close_save():
         return jsonify({"ok": True, "filepath": fp})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)[:120]})
+
+
+# --- UI-driven log line (for Prompt clipboard copy etc.) ---
+@app.route("/api/log-message", methods=["POST"])
+def log_message():
+    d = request.json or {}
+    msg = str(d.get("message", "")).strip()
+    if not msg:
+        return jsonify({"ok": False})
+    # Keep the log readable and defensive: cap length, strip newlines, and
+    # ASCII-encode (execution strings must be ASCII — see CLAUDE.md rule 11).
+    msg = msg.replace("\r", " ").replace("\n", " ")
+    if len(msg) > 200:
+        msg = msg[:200] + "..."
+    try:
+        safe = msg.encode("ascii", "replace").decode("ascii")
+    except Exception:
+        safe = "".join(c if ord(c) < 128 else "?" for c in msg)
+    state.log(safe)
+    return jsonify({"ok": True})
 
 
 # --- Clipboard copy ---

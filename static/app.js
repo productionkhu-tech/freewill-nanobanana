@@ -634,10 +634,13 @@ function onPromptKeydown(e, textarea) {
     return;
   }
 
-  // Enter (without Shift) → queue a generation.
-  // Shift+Enter keeps the default newline behavior.
-  // When the mention menu is open, Enter still inserts the mention (handled below).
-  if (e.key === "Enter" && !e.shiftKey && !mentionMenu && !_imeComposing) {
+  // Enter (without Shift/Ctrl) → queue a generation.
+  //   - Shift+Enter: default newline behavior
+  //   - Ctrl+Enter:  handled by the document-level shortcut (setupKeyboardShortcuts).
+  //                  Excluding it here prevents a double-fire (both this listener
+  //                  and the document bubble-up would call generate() → 2× count).
+  //   - Mention menu open: falls through to the insert-mention handler below.
+  if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !mentionMenu && !_imeComposing) {
     e.preventDefault();
     generate();
     return;

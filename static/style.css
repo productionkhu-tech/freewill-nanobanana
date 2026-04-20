@@ -243,6 +243,14 @@ textarea.prompt-box { min-height: 82px; }
   color: transparent !important;
   caret-color: var(--text);
   margin-bottom: 0;
+  /* Match the overlay's line-wrapping rules exactly (see .prompt-highlight
+     below). On long pastes, even a 1px difference in available text width
+     makes the textarea and the overlay wrap at different characters, so the
+     caret drifts away from where the (colored) text is drawn. */
+  scrollbar-gutter: stable;
+  overflow-wrap: break-word;
+  word-break: normal;
+  box-sizing: border-box;
 }
 .prompt-wrap .prompt-highlight {
   position: absolute;
@@ -258,6 +266,14 @@ textarea.prompt-box { min-height: 82px; }
   white-space: pre-wrap;
   word-wrap: break-word;
   overflow-wrap: break-word;
+  word-break: normal;
+  /* Reserve the same scrollbar space as the textarea so both layers have
+     identical content-box widths. Without this, once the textarea content
+     overflows and its scrollbar appears, the textarea's text width shrinks
+     by ~15px while the overlay keeps the full width — every subsequent
+     line wraps differently, visibly offsetting the caret from the text. */
+  scrollbar-gutter: stable;
+  box-sizing: border-box;
   pointer-events: none;
   overflow: hidden;
   z-index: 1;

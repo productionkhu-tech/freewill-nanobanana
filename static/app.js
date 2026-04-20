@@ -795,6 +795,25 @@ async function refreshRefs() {
       e.stopPropagation();
       _dragDepth = 0;
       cell.classList.remove("drop-target");
+
+      // Internal drag from a gallery card: replace this cell with the
+      // gallery image (JSON body, no file upload needed). Server-side
+      // duplicate guard keeps ref_path_list unique.
+      const internalPath = e.dataTransfer?.getData("application/x-nb-gallery-path");
+      if (internalPath) {
+        const r = await api(`/api/refs/replace-from-path/${i}`, {
+          method: "POST",
+          body: { filepath: internalPath },
+        });
+        if (r.ok) {
+          if (!r.unchanged) await refreshRefs();
+          showToast(r.unchanged ? "Same image — no change" : "Reference replaced", "success");
+        } else {
+          showToast(r.error || "Replace failed", "error");
+        }
+        return;
+      }
+
       const files = e.dataTransfer?.files;
       if (!files || !files.length) return;
       const f = files[0];
@@ -956,6 +975,7 @@ async function onRefDrop(e) {
   if (![...form.entries()].length) { showToast("No supported images", "warn"); return; }
   const d = await api("/api/refs/upload", { method: "POST", body: form });
   if (d.added > 0) { refreshRefs(); showToast(`Added ${d.added} image(s)`, "success"); }
+  else { showToast("Slots are full — drop onto a slot to replace it", "warn"); }
 }
 
 // ==========================================

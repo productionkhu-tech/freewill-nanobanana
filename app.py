@@ -2135,8 +2135,43 @@ def use_as_ref():
     d = request.json or {}
     fp = d.get("filepath", "")
     if not fp or not os.path.exists(fp):
-        return jsonify({"ok": False})
+        return jsonify({"ok": False, "error": "File not found"})
+    # Give the client a specific reason when the drop silently failed — the
+    # add_ref_image() early-outs logged only to server log, so the user never
+    # saw WHY nothing happened.
+    with state.ref_lock:
+        if fp in state.ref_path_list:
+            return jsonify({"ok": False, "error": "Already a reference"})
+        limit = state.get_ref_limit()
+        if len(state.ref_images) >= limit:
+            return jsonify({
+                "ok": False,
+                "error": f"Max {limit} reference images (drop on a slot to replace)",
+                "limit_reached": True,
+            })
     ok = state.add_ref_image(fp)
+    return jsonify({"ok": ok})
+
+
+@app.route("/api/refs/replace-from-path/<int:idx>", methods=["POST"])
+def replace_ref_from_path(idx):
+    """Replace the ref at `idx` with an image referenced by filepath (e.g.
+    a gallery item dragged onto the cell). JSON body: {filepath}."""
+    d = request.json or {}
+    fp = d.get("filepath", "")
+    if not fp or not os.path.exists(fp):
+        return jsonify({"ok": False, "error": "File not found"})
+    with state.ref_lock:
+        if not (0 <= idx < len(state.ref_path_list)):
+            return jsonify({"ok": False, "error": "Invalid slot"})
+        # Dropping the same path onto its own cell is a no-op success.
+        if state.ref_path_list[idx] == fp:
+            return jsonify({"ok": True, "unchanged": True})
+        # Prevent creating a duplicate ref by replacing cell A with the path
+        # that is already at cell B.
+        if fp in state.ref_path_list:
+            return jsonify({"ok": False, "error": "Already a reference in another slot"})
+    ok = state.replace_ref(idx, fp)
     return jsonify({"ok": ok})
 
 

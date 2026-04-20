@@ -243,14 +243,23 @@ textarea.prompt-box { min-height: 82px; }
   color: transparent !important;
   caret-color: var(--text);
   margin-bottom: 0;
-  /* Match the overlay's line-wrapping rules exactly (see .prompt-highlight
-     below). On long pastes, even a 1px difference in available text width
-     makes the textarea and the overlay wrap at different characters, so the
-     caret drifts away from where the (colored) text is drawn. */
-  scrollbar-gutter: stable;
-  overflow-wrap: break-word;
+  /* Force the scrollbar to be reserved ALWAYS (not just when content
+     overflows). v2009 tried scrollbar-gutter: stable, but that property
+     has no effect on overflow:hidden, which the overlay was using, so the
+     two layers still had different content-box widths on paste. Forcing
+     overflow-y:scroll makes both layers scroll containers with the same
+     thin-scrollbar reservation, and every line wraps at the same char. */
+  overflow-y: scroll;
+  scrollbar-width: thin;
+  overflow-wrap: anywhere;
   word-break: normal;
   box-sizing: border-box;
+  /* Textareas and divs apply font-shaping differently in Chromium (divs
+     kern/ligate, textareas don't), which accumulates per line and drifts
+     the caret. Disable both explicitly on both layers so glyph widths are
+     identical character-for-character. */
+  font-kerning: none;
+  font-variant-ligatures: none;
 }
 .prompt-wrap .prompt-highlight {
   position: absolute;
@@ -265,18 +274,28 @@ textarea.prompt-box { min-height: 82px; }
   border-radius: 8px;
   white-space: pre-wrap;
   word-wrap: break-word;
-  overflow-wrap: break-word;
+  overflow-wrap: anywhere;
   word-break: normal;
-  /* Reserve the same scrollbar space as the textarea so both layers have
-     identical content-box widths. Without this, once the textarea content
-     overflows and its scrollbar appears, the textarea's text width shrinks
-     by ~15px while the overlay keeps the full width — every subsequent
-     line wraps differently, visibly offsetting the caret from the text. */
-  scrollbar-gutter: stable;
+  /* Must be a scroll container with the same reservation as the textarea
+     above. Also scrolling — app.js syncs hl.scrollTop to textarea.scrollTop
+     so the visible line in the overlay stays aligned with the caret. */
+  overflow-y: scroll;
+  scrollbar-width: thin;
   box-sizing: border-box;
+  font-kerning: none;
+  font-variant-ligatures: none;
   pointer-events: none;
-  overflow: hidden;
   z-index: 1;
+}
+
+/* The overlay sits at z=1 and is pointer-events:none, so the user never
+   interacts with its scrollbar. The textarea at z=2 owns the visible one;
+   render the overlay's scrollbar as transparent so both layers reserve the
+   same width without showing a second track through the transparent textarea. */
+.prompt-wrap .prompt-highlight::-webkit-scrollbar-track,
+.prompt-wrap .prompt-highlight::-webkit-scrollbar-thumb,
+.prompt-wrap .prompt-highlight::-webkit-scrollbar-corner {
+  background: transparent !important;
 }
 .prompt-wrap .prompt-highlight .mention {
   color: #5B9FFF;

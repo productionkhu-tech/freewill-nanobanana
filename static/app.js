@@ -800,54 +800,16 @@ async function refreshRefs() {
     const cell = document.createElement("div");
     cell.className = "ref-cell" + (ref.pinned ? " pinned" : "");
 
-    // Drop policy (v2005+):
-    //   - Drop on Change button          -> REPLACE this slot (explicit)
-    //   - Drop on cell after ~700ms hover-hold -> REPLACE this slot (implicit)
-    //   - Drop on cell before hold fires -> fall through to refArea (ADD)
+    // Drop policy (v2008):
+    //   - Drop on the Change button of this slot -> REPLACE this slot
+    //   - Drop anywhere else on the cell         -> fall through to refArea (ADD)
     //
-    // v2006 used dragenter/dragleave + a depth counter, but Chromium fires
-    // leave-before-enter when the cursor crosses between child elements
-    // (img -> pin btn -> label...), which kept resetting the hold timer.
-    // v2007 switches to dragover + a stale timer: dragover fires continuously
-    // (~30-60 Hz) while the cursor is over a drop target, so we just reset
-    // a 200ms "still here" timer on every event and consider the cursor
-    // gone once that timer finally fires.
-    let _holdTimer = null;
-    let _holdActive = false;
-    let _staleTimer = null;
-
-    const _clearHold = () => {
-      if (_holdTimer) { clearTimeout(_holdTimer); _holdTimer = null; }
-      if (_staleTimer) { clearTimeout(_staleTimer); _staleTimer = null; }
-      _holdActive = false;
-      cell.classList.remove("drag-hover-hold", "drag-hold-replace");
-    };
-
-    cell.addEventListener("dragover", (e) => {
-      // Change button has its own visual/drop-target handling.
-      if (e.target.closest(".ref-change")) return;
-      e.preventDefault();
-
-      // Re-arm the stale timer — while dragover keeps firing we're still here.
-      if (_staleTimer) clearTimeout(_staleTimer);
-      _staleTimer = setTimeout(_clearHold, 200);
-
-      // Start the hold build-up on the first dragover of this hover session.
-      if (!_holdTimer && !_holdActive) {
-        cell.classList.add("drag-hover-hold");
-        _holdTimer = setTimeout(() => {
-          _holdActive = true;
-          cell.classList.add("drag-hold-replace");
-          _holdTimer = null;
-        }, 700);
-      }
-    });
-
+    // Earlier builds (v2005-v2007) also supported a "hover-hold" on the
+    // cell image to replace, but the UX was unreliable and confusing. The
+    // Change button is now the only REPLACE target.
     cell.addEventListener("drop", async (e) => {
       const onChangeBtn = e.target.closest(".ref-change");
-      const wasHold = _holdActive;
-      _clearHold();
-      if (!onChangeBtn && !wasHold) {
+      if (!onChangeBtn) {
         // No preventDefault / no stopPropagation -> bubbles to refArea's
         // ondrop="onRefDrop(event)" which runs the ADD path.
         return;

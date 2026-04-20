@@ -143,6 +143,11 @@ class AppState:
         self.active_job_count = 0
         # Persisted across restarts (loaded below from .nanobanana/prefs.json)
         self.skip_delete_confirm = False
+        # Always-on-top window state. Actual enforcement is done via Win32
+        # SetWindowPos on the NanoBanana HWND by the toggle endpoint; this
+        # flag just remembers the user's choice so we can reapply after a
+        # page reload or a minimize/restore cycle.
+        self.always_on_top = False
         self.output_dir = os.path.join(os.path.expanduser("~"), "Desktop", "NanoBanana_Output")
         self.file_counter = 0
         self.file_counter_lock = threading.Lock()   # parallel-worker safe naming
@@ -2696,6 +2701,90 @@ def close_save():
         return jsonify({"ok": True, "filepath": fp})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)[:120]})
+
+
+# --- Always on top toggle ---
+def _find_nanobanana_hwnd():
+    """Find NanoBanana's top-level window by title prefix. Returns 0 if
+    not found. Same EnumWindows strategy as launcher._focus_existing_ —
+    title changes as projects load ("NanoBanana - foo.json *") but still
+    starts with "NanoBanana"."""
+    if sys.platform != "win32":
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        found = [0]
+
+        def _cb(hwnd, _lp):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length <= 0:
+                    return True
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                if buf.value.startswith("NanoBanana"):
+                    found[0] = hwnd
+                    return False
+            except Exception:
+                pass
+            return True
+
+        user32.EnumWindows(EnumWindowsProc(_cb), 0)
+        return found[0]
+    except Exception:
+        return 0
+
+
+def _apply_always_on_top(enabled):
+    """Push the HWND to topmost / not-topmost via SetWindowPos. Returns
+    True on success, False on any failure (wrong platform, window not
+    found, API error)."""
+    if sys.platform != "win32":
+        return False
+    hwnd = _find_nanobanana_hwnd()
+    if not hwnd:
+        return False
+    try:
+        import ctypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        # HWND_TOPMOST = -1, HWND_NOTOPMOST = -2 (signed values expected by
+        # SetWindowPos). Python's ctypes int->HWND conversion handles the
+        # sign-extension on 64-bit.
+        hwnd_insert_after = -1 if enabled else -2
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_NOACTIVATE = 0x0010
+        user32.SetWindowPos(
+            hwnd, hwnd_insert_after, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+        return True
+    except Exception:
+        return False
+
+
+@app.route("/api/always-on-top", methods=["GET"])
+def get_always_on_top():
+    return jsonify({"enabled": bool(state.always_on_top)})
+
+
+@app.route("/api/always-on-top", methods=["POST"])
+def set_always_on_top():
+    d = request.json or {}
+    enabled = bool(d.get("enabled"))
+    if sys.platform != "win32":
+        return jsonify({"ok": False, "error": "Windows only"})
+    ok = _apply_always_on_top(enabled)
+    if not ok:
+        return jsonify({"ok": False, "error": "Window not found"})
+    state.always_on_top = enabled
+    state.log(f"Always-on-top: {'ON' if enabled else 'OFF'}")
+    return jsonify({"ok": True, "enabled": enabled})
 
 
 # --- UI-driven log line (for Prompt clipboard copy etc.) ---

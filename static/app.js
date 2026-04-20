@@ -32,11 +32,35 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupFixedPromptMention();
   await checkReleaseNotes();   // show "What's new" popup if first launch after update
   checkRecentProjects();
+  initAlwaysOnTopButton();
   try {
     const d = await api("/api/delete-confirm-state");
     _skipDeleteConfirm = !!d.skip;
   } catch (e) { /* ignore */ }
 });
+
+// Pin-to-top button. Queries server state on load so reloads keep the
+// button's visual in sync with what SetWindowPos actually did to the HWND.
+async function initAlwaysOnTopButton() {
+  try {
+    const d = await api("/api/always-on-top");
+    const btn = document.getElementById("alwaysOnTopBtn");
+    if (btn) btn.classList.toggle("active", !!d.enabled);
+  } catch (_) { /* ignore */ }
+}
+
+async function toggleAlwaysOnTop() {
+  const btn = document.getElementById("alwaysOnTopBtn");
+  if (!btn) return;
+  const nextEnabled = !btn.classList.contains("active");
+  const d = await api("/api/always-on-top", { method: "POST", body: { enabled: nextEnabled } });
+  if (d.ok) {
+    btn.classList.toggle("active", !!d.enabled);
+    showToast(d.enabled ? "Pinned on top" : "No longer on top", "success");
+  } else {
+    showToast(d.error || "Toggle failed", "error");
+  }
+}
 
 // ==========================================
 // Release notes "what's new" popup (first launch after update)
@@ -776,14 +800,49 @@ async function refreshRefs() {
     const cell = document.createElement("div");
     cell.className = "ref-cell" + (ref.pinned ? " pinned" : "");
 
-    // Drop policy:
-    //   - Drop lands on the Change button of this cell -> REPLACE this slot
-    //   - Drop lands anywhere else on the cell          -> let it bubble to
-    //     refArea, which handles ADD. This gives the user a generous "drop
-    //     here to add" target even when the grid is fully populated.
+    // Drop policy (v2005+):
+    //   - Drop on Change button          -> REPLACE this slot (explicit)
+    //   - Drop on cell after ~700ms hover-hold -> REPLACE this slot (implicit)
+    //   - Drop on cell before hold fires -> fall through to refArea (ADD)
+    //
+    // Hover-hold gives users a way to replace a slot without aiming at
+    // the small Change button, while the default (quick drop) still
+    // favors ADD so a cramped grid doesn't accidentally overwrite refs.
+    let _holdTimer = null;
+    let _holdActive = false;
+    let _cellDragDepth = 0;
+
+    const _clearHold = () => {
+      if (_holdTimer) { clearTimeout(_holdTimer); _holdTimer = null; }
+      _holdActive = false;
+      cell.classList.remove("drag-hover-hold", "drag-hold-replace");
+    };
+
+    cell.addEventListener("dragenter", (e) => {
+      // Change button has its own dragenter listener + visual.
+      if (e.target.closest(".ref-change")) return;
+      e.preventDefault();
+      _cellDragDepth++;
+      if (_cellDragDepth === 1) {
+        cell.classList.add("drag-hover-hold");
+        if (_holdTimer) clearTimeout(_holdTimer);
+        _holdTimer = setTimeout(() => {
+          _holdActive = true;
+          cell.classList.add("drag-hold-replace");
+        }, 700);
+      }
+    });
+    cell.addEventListener("dragleave", () => {
+      _cellDragDepth = Math.max(0, _cellDragDepth - 1);
+      if (_cellDragDepth === 0) _clearHold();
+    });
+
     cell.addEventListener("drop", async (e) => {
       const onChangeBtn = e.target.closest(".ref-change");
-      if (!onChangeBtn) {
+      const wasHold = _holdActive;
+      _cellDragDepth = 0;
+      _clearHold();
+      if (!onChangeBtn && !wasHold) {
         // No preventDefault / no stopPropagation -> bubbles to refArea's
         // ondrop="onRefDrop(event)" which runs the ADD path.
         return;

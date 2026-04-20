@@ -587,6 +587,59 @@ textarea.prompt-box { min-height: 82px; }
   box-shadow: 0 0 0 3px rgba(212, 165, 116, 0.25);
 }
 
+/* Hover-hold to REPLACE: initial faint hint on dragenter, escalates after
+   the hold timer fires (see static/app.js). Gives the user a way to replace
+   a slot without aiming at the small Change button — just pause over it. */
+.ref-cell.drag-hover-hold {
+  background: rgba(212, 165, 116, 0.08);
+  transition: background .35s ease, border-color .35s ease, box-shadow .35s ease;
+}
+.ref-cell.drag-hold-replace {
+  background: rgba(212, 165, 116, 0.22);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent), 0 0 14px rgba(212, 165, 116, 0.35);
+}
+.ref-cell.drag-hold-replace::after {
+  content: "Release to replace";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 11px;
+  font-weight: bold;
+  padding: 4px 10px;
+  border-radius: 4px;
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 3;
+}
+.ref-cell { position: relative; }
+
+/* Always-on-top pin button in the header */
+.pin-btn {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  height: 32px;
+  width: 32px;
+  font-size: 15px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.pin-btn:hover { background: var(--border); }
+.pin-btn.active {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+
 /* ═══════════════════════════════════════════
    GALLERY
    ═══════════════════════════════════════════ */

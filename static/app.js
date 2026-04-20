@@ -1024,6 +1024,11 @@ async function refreshGallery() {
     }
     const img = document.createElement("img");
     img.className = "card-img";
+    // Without this the <img>'s native drag hijacks the gesture: the browser
+    // fires an image/uri-list drag with no custom data, so the card-level
+    // dragstart (which stamps application/x-nb-gallery-path) effectively
+    // never runs, and drops onto the ref area see nothing useful.
+    img.draggable = false;
     img.src = `/api/gallery/thumb?path=${encodeURIComponent(item.filepath)}&size=${thumbSize}`;
     img.loading = "lazy";
     img.alt = item.filename || "";

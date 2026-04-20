@@ -391,7 +391,7 @@ function addPromptSection(initialText = "") {
   ta.value = initialText;
   ta.addEventListener("input", (e) => {
     onPromptInput(e, ta);
-    syncPromptHighlight(ta);
+    syncPromptHighlight(ta, { immediate: _shouldSyncImmediate(e) });
     scheduleSettingsSave();
   });
   ta.addEventListener("keyup", () => _tryShowMention(ta));
@@ -422,21 +422,57 @@ function _buildHighlightedHTML(text) {
     + "\n";  // keep trailing line so final newline is rendered
 }
 
-// rAF-coalesced highlight update — at most one DOM rewrite per frame,
-// even if user types very fast (Korean IME emits many events per second).
+// Highlight overlay update.
+//
+// Korean IME emits many input events per second during composition, so to
+// avoid rebuilding the whole overlay on every keystroke we normally batch
+// via rAF. But for paste (especially held Ctrl+V) the coalesce leaves the
+// overlay's innerHTML one frame behind the textarea's value — the caret
+// sits where the new text should be, but the visible (overlay) text is
+// still the previous frame's content, so the cursor visibly drifts ahead
+// of the rendered characters. Callers pass {immediate:true} from paste
+// handlers to bypass the rAF and sync synchronously.
+//
+// Scroll position sync is ALWAYS immediate (cheap; avoids a second
+// frame of lag where the overlay is scrolled one line behind).
 const _pendingHighlights = new WeakSet();
-function syncPromptHighlight(textarea) {
+function syncPromptHighlight(textarea, opts) {
+  const wrap = textarea.closest(".prompt-wrap");
+  if (!wrap) return;
+  const hl = wrap.querySelector(".prompt-highlight");
+  if (!hl) return;
+  // Always sync scroll immediately.
+  hl.scrollTop = textarea.scrollTop;
+  const immediate = opts && opts.immediate;
+  if (immediate) {
+    // Cancel any pending rAF — we're about to do the work synchronously.
+    _pendingHighlights.delete(textarea);
+    hl.innerHTML = _buildHighlightedHTML(textarea.value);
+    hl.scrollTop = textarea.scrollTop;
+    return;
+  }
   if (_pendingHighlights.has(textarea)) return;
   _pendingHighlights.add(textarea);
   requestAnimationFrame(() => {
     _pendingHighlights.delete(textarea);
-    const wrap = textarea.closest(".prompt-wrap");
-    if (!wrap) return;
-    const hl = wrap.querySelector(".prompt-highlight");
-    if (!hl) return;
     hl.innerHTML = _buildHighlightedHTML(textarea.value);
     hl.scrollTop = textarea.scrollTop;
   });
+}
+
+// Decide whether this input event should bypass rAF coalescing. Paste
+// (including repeated Ctrl+V) inserts large chunks at once, so we want
+// the overlay content to update the same frame the textarea does.
+// IME composition ("insertCompositionText" / "insertFromComposition") stays
+// on the rAF path to keep per-keystroke rebuilds cheap.
+function _shouldSyncImmediate(e) {
+  if (!e) return false;
+  const t = e.inputType || "";
+  return t === "insertFromPaste"
+      || t === "insertReplacementText"
+      || t === "insertFromDrop"
+      || t === "insertFromYank"
+      || t.startsWith("deleteByCut");
 }
 
 function setupFixedPromptMention() {
@@ -444,7 +480,7 @@ function setupFixedPromptMention() {
   if (fp) {
     fp.addEventListener("input", (e) => {
       onPromptInput(e, fp);
-      syncPromptHighlight(fp);
+      syncPromptHighlight(fp, { immediate: _shouldSyncImmediate(e) });
       scheduleSettingsSave();
     });
     fp.addEventListener("keyup", () => _tryShowMention(fp));

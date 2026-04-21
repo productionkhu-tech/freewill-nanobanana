@@ -1277,21 +1277,38 @@ class AppState:
         except Exception as e:
             self.log(f"Worker crashed: {str(e)[:120]}")
         finally:
-            # Reset state so the user can try again. Doing this under the
-            # same lock /api/generate uses to read+flip is_generating prevents
-            # a subtle teardown race: pre-v2101, the worker could exit its
-            # loop, set is_generating=False outside any lock, and then another
-            # /api/generate request (arriving in the brief window before the
-            # clear()) would see is_generating=True, queue jobs into the
-            # "existing" batch, and then watch this finally block wipe those
-            # jobs with pending_jobs.clear() — the "queue has items but no
-            # worker" stall.
+            # Three-way teardown:
+            #   - cancel_flag set  -> user Stopped; drop pending (including any
+            #                          that raced in while we were shutting down)
+            #   - pending non-empty -> /api/generate queued jobs in the window
+            #                          between our body exiting and this finally
+            #                          taking the lock. Respawn a worker to drain
+            #                          them; keep is_generating=True so follow-up
+            #                          requests still see a live batch.
+            #   - otherwise         -> clean exit.
+            #
+            # v2101 unconditionally cleared pending_jobs here, which on a normal
+            # end-of-batch exit would delete race-added jobs and leave the user
+            # with "outstanding N, no worker" — the exact stall bug we set out
+            # to kill. v2102 splits the three cases.
+            respawn = False
             with self.pending_jobs_lock:
-                self.is_generating = False
-                self.cancel_flag = False
-                self.pending_jobs.clear()
-                self.active_job_count = 0
-            self.push_event({"type": "done", "done": self.done_count, "failed": self.fail_count})
+                if self.cancel_flag:
+                    self.pending_jobs.clear()
+                    self.is_generating = False
+                    self.cancel_flag = False
+                    self.active_job_count = 0
+                elif self.pending_jobs:
+                    self.active_job_count = 0
+                    respawn = True
+                else:
+                    self.is_generating = False
+                    self.cancel_flag = False
+                    self.active_job_count = 0
+            if respawn:
+                threading.Thread(target=self.gen_worker, daemon=True).start()
+            else:
+                self.push_event({"type": "done", "done": self.done_count, "failed": self.fail_count})
 
     def _gen_worker_body(self):
         max_workers = self.max_parallel_requests
@@ -2329,6 +2346,17 @@ def start_generate():
     # no worker" stall). Everything that reads or writes the shared
     # generator state now happens under pending_jobs_lock.
     with state.pending_jobs_lock:
+        # If a Stop is in flight, the previous worker is either still
+        # draining active futures or already in its teardown finally. Piling
+        # new jobs onto pending_jobs right now would race: the worker's
+        # cancel-branch teardown would discard those jobs along with the
+        # cancelled ones. Refuse cleanly; the user can retry in a moment.
+        if state.cancel_flag:
+            return jsonify({
+                "ok": False,
+                "error": "Stopping previous batch — try again in a moment",
+            })
+
         was_generating = state.is_generating
         # Re-check capacity with the real pending_jobs snapshot.
         current_outstanding = len(state.pending_jobs) + state.active_job_count

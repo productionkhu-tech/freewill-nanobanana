@@ -1277,10 +1277,18 @@ class AppState:
         except Exception as e:
             self.log(f"Worker crashed: {str(e)[:120]}")
         finally:
-            # Always reset state so the user can try again
-            self.is_generating = False
-            self.cancel_flag = False
+            # Reset state so the user can try again. Doing this under the
+            # same lock /api/generate uses to read+flip is_generating prevents
+            # a subtle teardown race: pre-v2101, the worker could exit its
+            # loop, set is_generating=False outside any lock, and then another
+            # /api/generate request (arriving in the brief window before the
+            # clear()) would see is_generating=True, queue jobs into the
+            # "existing" batch, and then watch this finally block wipe those
+            # jobs with pending_jobs.clear() — the "queue has items but no
+            # worker" stall.
             with self.pending_jobs_lock:
+                self.is_generating = False
+                self.cancel_flag = False
                 self.pending_jobs.clear()
                 self.active_job_count = 0
             self.push_event({"type": "done", "done": self.done_count, "failed": self.fail_count})
@@ -1304,8 +1312,15 @@ class AppState:
                     try:
                         fut = executor.submit(
                             self.generate_one_image,
-                            {"index": job["index"], "total": 0,
-                             "seed": job["seed"], "preferred_provider": job["preferred_provider"]},
+                            {"index": job["index"],
+                             # queue_count is the authoritative batch total
+                             # (updated under pending_jobs_lock whenever new
+                             # jobs are extended). Pre-v2101 this was a
+                             # hardcoded 0 placeholder, causing [1/0], [2/0]
+                             # log lines that looked like div-by-zero.
+                             "total": self.queue_count,
+                             "seed": job["seed"],
+                             "preferred_provider": job["preferred_provider"]},
                             job["prompt"], job["ref_payloads"], job["model"],
                             job["img_cfg"], ["IMAGE"]
                         )
@@ -2272,19 +2287,21 @@ def start_generate():
     os.makedirs(state.output_dir, exist_ok=True)
     naming = state.get_naming_settings()
 
-    was_generating = state.is_generating
     count = state.count
 
-    # Check queue capacity
-    outstanding = state.get_queue_outstanding()
-    if outstanding + count > state.max_queued_images:
+    # Check queue capacity (approximate — re-checked atomically in the
+    # critical section below; this early-out just avoids the expensive
+    # ref snapshot work when the queue is already obviously full).
+    outstanding_hint = state.get_queue_outstanding()
+    if outstanding_hint + count > state.max_queued_images:
         return jsonify({
             "ok": False,
-            "error": f"Queue full ({outstanding}/{state.max_queued_images})",
+            "error": f"Queue full ({outstanding_hint}/{state.max_queued_images})",
             "queue_full": True,
         })
 
-    # Snapshot settings for this batch
+    # Snapshot settings for this batch — done outside the lock because
+    # ref_image_to_bytes re-encodes images and shouldn't block other callers.
     model = state.model
     aspect = state.aspect
     resolution = state.resolution
@@ -2298,61 +2315,90 @@ def start_generate():
         p for i, p in enumerate(state.ref_path_list)
         if i < len(state.ref_pinned) and state.ref_pinned[i]
     ]
+    fixed_prompt_snapshot = state.fixed_prompt
+    prompt_sections_snapshot = list(state.prompt_sections)
 
-    base_idx = state.queue_count if was_generating else 0
-    if not was_generating:
-        state.prepare_file_counter(naming)
-        state.queue_count = 0
-        state.done_count = 0
-        state.fail_count = 0
-        state.discarded_count = 0
-
-    new_jobs = []
-    for i in range(count):
-        new_jobs.append({
-            "index": base_idx + i,
-            "seed": random.randint(0, 2147483646),
-            "preferred_provider": providers[i % len(providers)],
-            "prompt": prompt,
-            "model": model,
-            "aspect": aspect,
-            "resolution": resolution,
-            "img_cfg": dict(img_cfg),
-            "naming": dict(naming),
-            "ref_payloads": ref_payloads,
-            "ref_paths": ref_paths,
-            "pinned_ref_paths": pinned_ref_paths,
-            "output_dir": state.output_dir,
-            "fixed_prompt": state.fixed_prompt,
-            "prompt_sections": list(state.prompt_sections),
-            # Remembered so Load can restore the count the user picked for
-            # this batch (per-item gen_settings used to hardcode 1).
-            "batch_count": count,
-        })
-
+    # --- Atomic critical section -----------------------------------------
+    # Pre-v2101 the read of is_generating, the reset of counters, and the
+    # set of is_generating=True all lived outside any lock. Two rapid
+    # Generate clicks could both see is_generating=False, both reset the
+    # counters, and both start a worker thread — double workers racing on
+    # pending_jobs caused bogus total/done/outstanding numbers, and the
+    # losing worker's finally {pending_jobs.clear()} could delete queued
+    # jobs the other worker hadn't picked up yet (the "queue has items but
+    # no worker" stall). Everything that reads or writes the shared
+    # generator state now happens under pending_jobs_lock.
     with state.pending_jobs_lock:
+        was_generating = state.is_generating
+        # Re-check capacity with the real pending_jobs snapshot.
+        current_outstanding = len(state.pending_jobs) + state.active_job_count
+        if current_outstanding + count > state.max_queued_images:
+            return jsonify({
+                "ok": False,
+                "error": f"Queue full ({current_outstanding}/{state.max_queued_images})",
+                "queue_full": True,
+            })
+
+        if not was_generating:
+            # Starting a new batch — reset run-scoped counters and claim
+            # the generator slot BEFORE releasing the lock so any other
+            # request arriving mid-setup sees is_generating=True and takes
+            # the "queue into existing batch" branch instead.
+            state.queue_count = 0
+            state.done_count = 0
+            state.fail_count = 0
+            state.discarded_count = 0
+            state.is_generating = True
+            state.cancel_flag = False
+            base_idx = 0
+        else:
+            base_idx = state.queue_count
+
+        new_jobs = []
+        for i in range(count):
+            new_jobs.append({
+                "index": base_idx + i,
+                "seed": random.randint(0, 2147483646),
+                "preferred_provider": providers[i % len(providers)],
+                "prompt": prompt,
+                "model": model,
+                "aspect": aspect,
+                "resolution": resolution,
+                "img_cfg": dict(img_cfg),
+                "naming": dict(naming),
+                "ref_payloads": ref_payloads,
+                "ref_paths": ref_paths,
+                "pinned_ref_paths": pinned_ref_paths,
+                "output_dir": state.output_dir,
+                "fixed_prompt": fixed_prompt_snapshot,
+                "prompt_sections": prompt_sections_snapshot,
+                # Remembered so Load can restore the count the user picked for
+                # this batch (per-item gen_settings used to hardcode 1).
+                "batch_count": count,
+            })
+
         state.pending_jobs.extend(new_jobs)
-        # Keep queue_count paired with pending_jobs mutations so a second
-        # /api/generate hitting before the first one returns doesn't lose an
-        # increment (int += is not atomic under the GIL for multi-threaded
-        # Flask).
         state.queue_count += count
+        outstanding_after = len(state.pending_jobs) + state.active_job_count
+    # --- End of critical section -----------------------------------------
 
     if not was_generating:
-        state.is_generating = True
-        state.cancel_flag = False
+        # File counter prep scans the output dir; do it outside the lock.
+        # The worker thread is spawned after this returns, so there's no
+        # race on file_counter.
+        state.prepare_file_counter(naming)
         state.log(f"Starting {count} image(s) across {', '.join(state.get_provider_label(p) for p in providers)}")
         threading.Thread(target=state.gen_worker, daemon=True).start()
     else:
         preview = prompt.replace("\n", " ").strip()
         preview = preview[:56] + ("..." if len(preview) > 56 else "")
-        state.log(f"Queued {count} image(s) (outstanding {state.get_queue_outstanding()}/{state.max_queued_images}) | {preview}")
+        state.log(f"Queued {count} image(s) (outstanding {outstanding_after}/{state.max_queued_images}) | {preview}")
 
     return jsonify({
         "ok": True,
         "count": count,
         "queued": was_generating,
-        "outstanding": state.get_queue_outstanding(),
+        "outstanding": outstanding_after,
     })
 
 

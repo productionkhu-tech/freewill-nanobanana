@@ -639,14 +639,21 @@ class AppState:
             self.cleanup_temp_ref_path(fp)
 
     def cleanup_temp_ref_path(self, filepath):
-        if filepath not in self.temp_ref_paths:
-            return
+        # Only drop the session-level tracking entry. DO NOT delete the file.
+        #
+        # Pre-v2203 this also os.remove()'d the cached file from
+        # ~/Pictures/Screenshots/NanoBanana Clipboard/. That broke Load for
+        # any past gallery item that still referenced this path in its saved
+        # generation_settings.ref_paths — most visibly, a clipboard-pasted
+        # ref would be silently missing on Load after the user later clicked
+        # × on it, used Change to replace it, Clear-All'd, or loaded another
+        # gallery item (all of which funnel into clear_refs →
+        # cleanup_temp_ref_path).
+        #
+        # Files are SHA1-digest-named so identical content never produces a
+        # duplicate file, and the folder is in the user's Pictures tree where
+        # they can clean it manually if it ever grows too large.
         self.temp_ref_paths.discard(filepath)
-        try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-        except Exception:
-            pass
 
     def paste_clipboard_ref(self):
         if sys.platform != "win32":

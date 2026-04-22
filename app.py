@@ -1903,6 +1903,124 @@ def upload_refs():
     return jsonify({"ok": True, "added": added})
 
 
+@app.route("/api/refs/download-url", methods=["POST"])
+def download_ref_url():
+    """Download a remote image URL and add as reference.
+
+    Why this exists: when the user drags an <img> from another browser
+    window / webpage, Chromium often leaves DataTransfer.files empty and
+    only populates text/uri-list or text/html with the image URL. Fetch()
+    from the renderer is blocked by CORS for most image hosts, so we
+    can't get the bytes client-side. The Flask server has no CORS
+    constraint, so it does the download and saves the file just like
+    /api/refs/upload would for a dragged local file.
+
+    Body: {url: "https://..."}
+    """
+    import hashlib
+    import urllib.parse
+    import urllib.request
+    import urllib.error
+
+    d = request.json or {}
+    url = (d.get("url") or "").strip()
+    if not url:
+        return jsonify({"ok": False, "error": "No URL"})
+
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return jsonify({"ok": False, "error": "Only http/https URLs supported"})
+
+    MAX_BYTES = 40 * 1024 * 1024
+    TIMEOUT = 30
+
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "NanoBanana-RefDownloader/1.0",
+            "Accept": "image/*,*/*;q=0.8",
+        })
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            content_type = (resp.headers.get("Content-Type") or "").lower().split(";")[0].strip()
+            if not content_type.startswith("image/"):
+                return jsonify({
+                    "ok": False,
+                    "error": f"Not an image (type: {content_type or 'unknown'})",
+                })
+            content_length = resp.headers.get("Content-Length")
+            if content_length:
+                try:
+                    if int(content_length) > MAX_BYTES:
+                        return jsonify({"ok": False, "error": "Image too large (>40MB)"})
+                except ValueError:
+                    pass
+            chunks = []
+            total = 0
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_BYTES:
+                    return jsonify({"ok": False, "error": "Image too large (>40MB)"})
+                chunks.append(chunk)
+            data = b"".join(chunks)
+    except urllib.error.HTTPError as e:
+        return jsonify({"ok": False, "error": f"HTTP {e.code}"})
+    except urllib.error.URLError as e:
+        return jsonify({"ok": False, "error": f"Network error: {str(e.reason)[:80]}"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Download failed: {str(e)[:80]}"})
+
+    if not data:
+        return jsonify({"ok": False, "error": "Empty response"})
+
+    # Pick extension. Prefer content-type; fall back to URL path suffix.
+    ext_from_type = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/webp": ".webp",
+        "image/bmp": ".bmp",
+        "image/x-ms-bmp": ".bmp",
+    }.get(content_type)
+    if ext_from_type is None:
+        url_ext = os.path.splitext(parsed.path)[1].lower()
+        if url_ext in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+            ext_from_type = url_ext
+    if ext_from_type not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+        return jsonify({"ok": False, "error": f"Unsupported format ({content_type})"})
+
+    # Verify the bytes really are an image PIL can read.
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img.verify()
+    except Exception:
+        return jsonify({"ok": False, "error": "File is not a valid image"})
+
+    os.makedirs(state.temp_ref_dir, exist_ok=True)
+    digest = hashlib.sha1(data).hexdigest()[:16]
+    fp = os.path.join(state.temp_ref_dir, f"ref_{digest}{ext_from_type}")
+    if not os.path.exists(fp):
+        with open(fp, "wb") as out:
+            out.write(data)
+    state.temp_ref_paths.add(fp)
+
+    # Report limit / duplicate specifically so the client can show a useful toast.
+    with state.ref_lock:
+        if fp in state.ref_path_list:
+            return jsonify({"ok": False, "error": "Already a reference"})
+        limit = state.get_ref_limit()
+        if len(state.ref_images) >= limit:
+            return jsonify({
+                "ok": False,
+                "error": f"Max {limit} reference images (drop on a slot to replace)",
+                "limit_reached": True,
+            })
+    if state.add_ref_image(fp):
+        return jsonify({"ok": True, "added": 1})
+    return jsonify({"ok": False, "error": "Could not add"})
+
+
 @app.route("/api/browse-replace-ref", methods=["POST"])
 def browse_replace_ref():
     d = request.json or {}

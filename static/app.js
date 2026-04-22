@@ -1061,8 +1061,7 @@ async function onRefDrop(e) {
   _refAreaDragDepth = 0;
   document.getElementById("refArea").classList.remove("dragover");
 
-  // Internal drag from a gallery card: dataTransfer has our custom type but
-  // no files. Route to use-as-ref instead of upload.
+  // 1) Internal drag from a gallery card
   const internalPath = e.dataTransfer?.getData("application/x-nb-gallery-path");
   if (internalPath) {
     const d = await api("/api/gallery/use-as-ref", { method: "POST", body: { filepath: internalPath } });
@@ -1071,17 +1070,63 @@ async function onRefDrop(e) {
     return;
   }
 
+  // 2) Actual file blob(s) in dataTransfer.files — external file drag,
+  //    clipboard-paste, or web image drag when Chromium pre-downloaded it.
   const files = e.dataTransfer?.files;
-  if (!files?.length) return;
-  const form = new FormData();
-  for (const f of files) {
-    const ext = f.name.split(".").pop().toLowerCase();
-    if (["png", "jpg", "jpeg", "webp", "bmp"].includes(ext)) form.append("files", f);
+  if (files?.length) {
+    const form = new FormData();
+    for (const f of files) {
+      const ext = f.name.split(".").pop().toLowerCase();
+      if (["png", "jpg", "jpeg", "webp", "bmp"].includes(ext)) form.append("files", f);
+    }
+    if ([...form.entries()].length) {
+      const d = await api("/api/refs/upload", { method: "POST", body: form });
+      if (d.added > 0) { refreshRefs(); showToast(`Added ${d.added} image(s)`, "success"); }
+      else { showToast("Slots are full — drop onto a slot to replace it", "warn"); }
+      return;
+    }
   }
-  if (![...form.entries()].length) { showToast("No supported images", "warn"); return; }
-  const d = await api("/api/refs/upload", { method: "POST", body: form });
-  if (d.added > 0) { refreshRefs(); showToast(`Added ${d.added} image(s)`, "success"); }
-  else { showToast("Slots are full — drop onto a slot to replace it", "warn"); }
+
+  // 3) URL fallback — web image drag without a pre-downloaded blob.
+  //    Chromium keeps the image URL in text/uri-list / text/html / text/plain.
+  //    Fetch() from the renderer is blocked by CORS for most image hosts,
+  //    so the server downloads it for us.
+  const url = _extractImageUrlFromDrag(e.dataTransfer);
+  if (url) {
+    showToast("Downloading image...", "info");
+    const d = await api("/api/refs/download-url", { method: "POST", body: { url } });
+    if (d.ok) { refreshRefs(); showToast("Added from web", "success"); }
+    else { showToast(d.error || "Download failed", "error"); }
+    return;
+  }
+
+  showToast("No supported image in drop", "warn");
+}
+
+// Pull the first usable http(s) image URL out of a DataTransfer. Tries
+// text/uri-list first (standard), then <img src="..."> from text/html,
+// then text/plain as a last resort.
+function _extractImageUrlFromDrag(dt) {
+  if (!dt) return null;
+
+  const uriList = dt.getData("text/uri-list");
+  if (uriList) {
+    for (const line of uriList.split(/\r?\n/)) {
+      const s = line.trim();
+      if (s && !s.startsWith("#") && /^https?:\/\//i.test(s)) return s;
+    }
+  }
+
+  const html = dt.getData("text/html");
+  if (html) {
+    const m = html.match(/<img[^>]+src\s*=\s*["']([^"']+)["']/i);
+    if (m && /^https?:\/\//i.test(m[1])) return m[1];
+  }
+
+  const plain = (dt.getData("text/plain") || "").trim();
+  if (/^https?:\/\//i.test(plain)) return plain;
+
+  return null;
 }
 
 // ==========================================

@@ -1390,10 +1390,24 @@ class AppState:
                             saved_count = 1
                         if saved_count > 10:
                             saved_count = 10
+                        # Read every prompt-related value from the JOB
+                        # snapshot, NOT from live state. Pre-v2103 this read
+                        # self.fixed_prompt / self.prompt_sections, which
+                        # meant any prompt edit between submit and completion
+                        # (e.g. user starts typing a new prompt while the
+                        # batch is still rendering, or clears the prompt to
+                        # set up the next idea) would overwrite the saved
+                        # setup for images that had already been generated
+                        # with the ORIGINAL prompt. Clicking Load on those
+                        # images then restored the edited/blank prompt —
+                        # the "Load doesn't bring the prompt back" bug.
+                        # refs/model/aspect/etc were already being read from
+                        # the job snapshot; fixed_prompt and prompt_sections
+                        # were the only two values still leaking live state.
                         gen_settings = {
                             "prompt": prompt,
-                            "fixed_prompt": self.fixed_prompt,
-                            "prompt_sections": list(self.prompt_sections),
+                            "fixed_prompt": job.get("fixed_prompt", ""),
+                            "prompt_sections": list(job.get("prompt_sections") or []),
                             "model": model, "aspect": aspect, "resolution": resolution,
                             "count": saved_count, "output_dir": job["output_dir"],
                             "naming": naming,

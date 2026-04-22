@@ -33,11 +33,42 @@ document.addEventListener("DOMContentLoaded", async () => {
   await checkReleaseNotes();   // show "What's new" popup if first launch after update
   checkRecentProjects();
   initAlwaysOnTopButton();
+  wireProjectNameInputs();
   try {
     const d = await api("/api/delete-confirm-state");
     _skipDeleteConfirm = !!d.skip;
   } catch (e) { /* ignore */ }
 });
+
+// Enter = primary action, Escape = cancel. The save / close-save modals
+// focus their name input on open; without keyboard bindings the user had
+// to mouse over to the Save button every time.
+function wireProjectNameInputs() {
+  const save = document.getElementById("saveProjectName");
+  if (save) {
+    save.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.isComposing) {
+        e.preventDefault();
+        confirmSaveProject();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        closeSaveModal();
+      }
+    });
+  }
+  const close = document.getElementById("closeProjectName");
+  if (close) {
+    close.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.isComposing) {
+        e.preventDefault();
+        closeDialogSave();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        closeDialogCancel();
+      }
+    });
+  }
+}
 
 // Pin-to-top button. Queries server state on load so reloads keep the
 // button's visual in sync with what SetWindowPos actually did to the HWND.
@@ -1903,7 +1934,20 @@ async function loadProjectByPath(fp) {
   }
 }
 
-async function loadProjectFromBrowser() { closeProjectsModal(); await loadProject(); }
+async function loadProjectFromBrowser() {
+  // Open the OS file dialog directly. Pre-v2201 this delegated to
+  // loadProject(), which re-runs the recent-projects check and — if
+  // recents exist (which they always do when this button is visible) —
+  // just pops the same modal back up. Button looked completely dead.
+  closeProjectsModal();
+  const d = await api("/api/browse-project", { method: "POST" });
+  if (d.ok) {
+    await loadSettings();
+    refreshGallery();
+    refreshRefs();
+    showToast("Project loaded", "success");
+  }
+}
 
 function formatRelativeTime(ts) {
   if (!ts) return "Unknown";

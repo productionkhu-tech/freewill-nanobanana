@@ -204,6 +204,22 @@ class AppState:
         )
         self.temp_ref_paths = set()
 
+        # Gemini Files API cache. Pre-v2204 we sent ref images as inline
+        # base64 inside the generate_content payload. For a 20MB+ reference
+        # (common with 4K / 6K source art) the payload itself was >20MB,
+        # and Google's server-side deadline fired before the model finished
+        # ingesting it — the infamous 503 "Deadline expired before
+        # operation". Other SaaS tools avoid this by uploading large refs
+        # to the Files API first and passing only the URI in the actual
+        # generate_content call. We do the same.
+        #
+        # Key:   (provider, sha1_of_bytes)
+        # Value: {"file": FileObj, "uploaded_at": epoch_seconds}
+        # TTL handled lazily on read — Google auto-expires after 48h, we
+        # drop entries after 40h to stay safely within that window.
+        self._files_cache = {}
+        self._files_cache_lock = threading.Lock()
+
         # API status
         self.vertex_status = "disconnected"
         self.studio_status = "disconnected"
@@ -400,6 +416,15 @@ class AppState:
         return False
 
     def call_api(self, model, contents, config, preferred_provider=None):
+        """Backward-compat: fixed contents. For Files-API-aware calls, use
+        call_api_builder instead."""
+        return self.call_api_builder(model, lambda _p: contents, config, preferred_provider)
+
+    def call_api_builder(self, model, contents_builder, config, preferred_provider=None):
+        """Try preferred provider, fall back if it fails. `contents_builder`
+        is a callable (provider) -> contents; we rebuild per provider so
+        each attempt can use that provider's Files-API URIs (which aren't
+        cross-compatible between Studio and Vertex)."""
         errors = []
         providers = self.build_provider_order(preferred_provider)
         for i, provider in enumerate(providers):
@@ -410,6 +435,13 @@ class AppState:
             if limiter and not limiter.acquire(should_cancel=lambda: self.cancel_flag):
                 raise RuntimeError("Cancelled")
             label = self.get_provider_label(provider)
+            try:
+                contents = contents_builder(provider)
+            except Exception as e:
+                err_text = str(e)
+                self.log(f"{label} contents build failed: {err_text[:80]}")
+                errors.append(f"{provider}: contents build: {err_text[:120]}")
+                continue
             try:
                 self.log(f"{label} requesting...")
                 t = time.time()
@@ -511,14 +543,110 @@ class AppState:
     def ref_bytes_to_part(self, ref_data):
         return types.Part.from_bytes(data=ref_data, mime_type="image/png")
 
-    def build_user_parts(self, prompt, ref_payloads):
+    # --- Gemini Files API path (v2204+) ---------------------------------
+    # Upload a ref once per (provider, content-hash), cache the returned
+    # File object, and use its URI in subsequent generate_content calls
+    # instead of the raw bytes. Keeps the original image at full resolution
+    # (no downscale) while shrinking the actual API request body to a few
+    # hundred bytes, which avoids the server-side deadline timeout that
+    # large inline payloads were hitting.
+
+    _FILES_CACHE_TTL_SECONDS = 40 * 3600  # Google auto-expires at 48h; buffer
+
+    def _files_upload_ref(self, provider, bytes_data):
+        """Upload bytes to the provider's Files API. Returns the File
+        object on success, or None if the provider / SDK doesn't support
+        Files uploads. Never raises — we always have an inline fallback."""
+        client = self.get_provider_client(provider)
+        if client is None:
+            return None
+        files_api = getattr(client, "files", None)
+        if files_api is None or not hasattr(files_api, "upload"):
+            return None
+
+        # SDK's upload accepts either a path or a file-like with .name.
+        # Feed it a BytesIO with an explicit .name so MIME is detected.
+        import hashlib as _hashlib
+        sha = _hashlib.sha1(bytes_data).hexdigest()[:16]
+        buf = io.BytesIO(bytes_data)
+        buf.name = f"nb_ref_{sha}.png"
+        try:
+            # Different SDK versions accept different kwargs; try the
+            # modern form first, fall back to positional.
+            try:
+                uploaded = files_api.upload(file=buf)
+            except TypeError:
+                buf.seek(0)
+                uploaded = files_api.upload(buf)
+        except Exception as e:
+            self.log(f"[{provider}] Files upload failed: {str(e)[:80]}")
+            return None
+
+        # Large uploads start in PROCESSING; wait briefly for ACTIVE.
+        try:
+            state_val = getattr(uploaded, "state", None)
+            state_str = str(state_val) if state_val is not None else ""
+            t0 = time.time()
+            while "PROCESSING" in state_str.upper() and time.time() - t0 < 20:
+                if self.cancel_flag:
+                    return None
+                time.sleep(0.5)
+                try:
+                    uploaded = files_api.get(name=uploaded.name)
+                except Exception:
+                    break
+                state_val = getattr(uploaded, "state", None)
+                state_str = str(state_val) if state_val is not None else ""
+            if "FAILED" in state_str.upper():
+                self.log(f"[{provider}] Files upload state=FAILED")
+                return None
+        except Exception:
+            pass
+        return uploaded
+
+    def _files_get_cached_ref(self, provider, bytes_data):
+        """Cached version of _files_upload_ref. Keyed by (provider, sha1)
+        so identical ref bytes re-use the same Files entry across batches
+        within the cache TTL."""
+        import hashlib as _hashlib
+        sha = _hashlib.sha1(bytes_data).hexdigest()
+        key = (provider, sha)
+        now = time.time()
+        with self._files_cache_lock:
+            entry = self._files_cache.get(key)
+            if entry and (now - entry.get("uploaded_at", 0)) < self._FILES_CACHE_TTL_SECONDS:
+                return entry.get("file")
+            # Drop stale entry
+            if entry:
+                self._files_cache.pop(key, None)
+
+        uploaded = self._files_upload_ref(provider, bytes_data)
+        if uploaded is None:
+            return None
+        with self._files_cache_lock:
+            self._files_cache[key] = {"file": uploaded, "uploaded_at": now}
+        return uploaded
+
+    def _ref_part_for_provider(self, provider, bytes_data):
+        """Return a Part/File object representing this ref for a specific
+        provider. Tries Files API first (URI-based, no size penalty), falls
+        back to inline bytes on any failure. The google.genai SDK accepts
+        a File object directly in contents, so we return it as-is."""
+        if provider:
+            f = self._files_get_cached_ref(provider, bytes_data)
+            if f is not None:
+                return f
+        # Inline fallback — matches pre-v2204 behavior.
+        return self.ref_bytes_to_part(bytes_data)
+
+    def build_user_parts(self, prompt, ref_payloads, provider=None):
         if not ref_payloads:
             return [types.Part.from_text(text=prompt)]
         matches = list(re.finditer(r"\[Image (\d+)\]", prompt))
         if not matches:
             parts = [types.Part.from_text(text=prompt)]
             for rd in ref_payloads:
-                parts.append(self.ref_bytes_to_part(rd))
+                parts.append(self._ref_part_for_provider(provider, rd))
             return parts
         parts = []
         last_end = 0
@@ -531,7 +659,7 @@ class AppState:
                     parts.append(types.Part.from_text(text=t))
             idx = int(m.group(1)) - 1
             if 0 <= idx < len(ref_payloads):
-                parts.append(self.ref_bytes_to_part(ref_payloads[idx]))
+                parts.append(self._ref_part_for_provider(provider, ref_payloads[idx]))
                 used.add(idx)
             else:
                 parts.append(types.Part.from_text(text=m.group(0)))
@@ -542,7 +670,7 @@ class AppState:
                 parts.append(types.Part.from_text(text=tail))
         for i, rd in enumerate(ref_payloads):
             if i not in used:
-                parts.append(self.ref_bytes_to_part(rd))
+                parts.append(self._ref_part_for_provider(provider, rd))
         return parts or [types.Part.from_text(text=prompt)]
 
     def add_ref_image(self, filepath, pinned=False):
@@ -1165,7 +1293,14 @@ class AppState:
 
         self.log(f"[{idx+1}/{total}] Queued on {self.get_provider_label(preferred)} (seed {seed})")
 
-        contents = [types.Content(role="user", parts=self.build_user_parts(prompt, ref_payloads))]
+        # v2204+: build contents lazily per provider so each attempt uses
+        # that provider's Files API URIs (if available). Avoids re-sending
+        # 20MB+ inline payloads that trigger the "Deadline expired" 503
+        # on large reference images.
+        def _build_contents_for(provider):
+            parts = self.build_user_parts(prompt, ref_payloads, provider=provider)
+            return [types.Content(role="user", parts=parts)]
+
         cfg_kw = dict(
             temperature=1.0,
             seed=seed,
@@ -1185,7 +1320,7 @@ class AppState:
             if self.cancel_flag:
                 return {"status": "cancelled", "index": idx, "seed": seed}
             try:
-                resp, api_used = self.call_api(model, contents, config, preferred_provider=preferred)
+                resp, api_used = self.call_api_builder(model, _build_contents_for, config, preferred_provider=preferred)
                 elapsed = time.time() - start
                 pil = self.extract_image_from_response(resp)
                 if pil is not None:
@@ -1204,7 +1339,7 @@ class AppState:
                     fl = self.get_provider_label(fp)
                     self.log(f"[{idx+1}] No image -> {fl} fallback")
                     try:
-                        resp2, fu = self.call_api(model, contents, config, preferred_provider=fp)
+                        resp2, fu = self.call_api_builder(model, _build_contents_for, config, preferred_provider=fp)
                     except Exception:
                         continue
                     pil2 = self.extract_image_from_response(resp2)

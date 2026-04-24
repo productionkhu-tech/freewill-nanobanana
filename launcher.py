@@ -221,12 +221,22 @@ _instance_mutex_handle = None
 def _focus_existing_nanobanana_window():
     """Bring any already-running NanoBanana window to the front.
 
-    Previously we used FindWindowW(None, "NanoBanana") which requires an
-    EXACT title match. The app's JS mutates the title as the project
-    loads ("NanoBanana - project.json *" with a dirty marker), so the
-    exact match missed the window and the user saw nothing happen on a
-    second launch. We now EnumWindows and match any visible top-level
-    window whose title starts with "NanoBanana".
+    History:
+      - FindWindowW(None, "NanoBanana") required an EXACT title match; the
+        JS side mutates the title on project load ("NanoBanana - foo.json *"),
+        so the exact match missed the window. Switched to EnumWindows +
+        startswith("NanoBanana") title check.
+      - SetForegroundWindow + AllowSetForegroundWindow(ASFW_ANY) alone
+        still fails silently when the running instance is minimized /
+        covered / on another virtual desktop. Windows' foreground-stealing
+        rules require the calling process to either own the current
+        foreground or share an input queue with whoever does. v2206 uses
+        the classic AttachThreadInput trick: attach our thread's input
+        queue to the foreground window's thread, then the focus calls
+        succeed; detach afterward. Also runs a multi-step focus sequence
+        (ShowWindow / SetWindowPos / BringWindowToTop / SetForegroundWindow /
+        SetActiveWindow / SetFocus) because different Windows builds
+        respect different members of that list.
     """
     if sys.platform != "win32":
         return False
@@ -234,12 +244,19 @@ def _focus_existing_nanobanana_window():
         import ctypes
         from ctypes import wintypes
         user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
         found_hwnd = [0]
 
         def _cb(hwnd, _lparam):
             try:
+                # IsWindowVisible is False for windows explicitly hidden via
+                # ShowWindow(SW_HIDE). Minimized windows still return True,
+                # which is what we want. But guard with IsWindow too in case
+                # the handle is stale.
+                if not user32.IsWindow(hwnd):
+                    return True
                 if not user32.IsWindowVisible(hwnd):
                     return True
                 length = user32.GetWindowTextLengthW(hwnd)
@@ -259,17 +276,96 @@ def _focus_existing_nanobanana_window():
         if not hwnd:
             return False
 
-        # SetForegroundWindow has input-rules restrictions when called from
-        # a non-foreground process. AllowSetForegroundWindow(ASFW_ANY)
-        # lifts the restriction for this call; combined with a restore-
-        # then-foreground sequence this reliably pops the existing window.
         SW_RESTORE = 9
-        user32.ShowWindow(hwnd, SW_RESTORE)
+        SW_SHOW = 5
+        HWND_TOP = 0
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_SHOWWINDOW = 0x0040
+
+        # If minimized or hidden, unminimize / show first.
         try:
-            ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, SW_RESTORE)
+            else:
+                user32.ShowWindow(hwnd, SW_SHOW)
         except Exception:
             pass
-        user32.SetForegroundWindow(hwnd)
+
+        # Belt-and-suspenders: permit any caller to steal foreground.
+        try:
+            user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
+        except Exception:
+            pass
+
+        # AttachThreadInput bypass for foreground-stealing rules. We attach
+        # our input queue to the current foreground window's owning thread,
+        # which lets SetForegroundWindow actually succeed. Without this
+        # step, on a cold-click from Explorer the focus calls silently
+        # fail when the target is buried / minimized / on another desktop.
+        fg_hwnd = user32.GetForegroundWindow()
+        fg_pid = wintypes.DWORD(0)
+        fg_tid = user32.GetWindowThreadProcessId(fg_hwnd, ctypes.byref(fg_pid)) if fg_hwnd else 0
+        cur_tid = kernel32.GetCurrentThreadId()
+        attached = False
+        try:
+            if fg_tid and fg_tid != cur_tid:
+                attached = bool(user32.AttachThreadInput(fg_tid, cur_tid, True))
+            # Multi-step focus. Each Win32 release picks a different subset
+            # of these to honor; running all of them is the empirically
+            # reliable approach pywebview / Qt / Electron use.
+            try:
+                user32.SetWindowPos(
+                    hwnd, HWND_TOP, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                )
+            except Exception:
+                pass
+            try:
+                user32.BringWindowToTop(hwnd)
+            except Exception:
+                pass
+            try:
+                user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+            try:
+                user32.SetActiveWindow(hwnd)
+            except Exception:
+                pass
+            try:
+                user32.SetFocus(hwnd)
+            except Exception:
+                pass
+        finally:
+            if attached:
+                try:
+                    user32.AttachThreadInput(fg_tid, cur_tid, False)
+                except Exception:
+                    pass
+
+        # Final fallback: if the target is still not foreground (e.g. the
+        # user switched desktops mid-call), flash the taskbar button so
+        # they at least SEE that we tried to open it.
+        try:
+            if user32.GetForegroundWindow() != hwnd:
+                FLASHW_ALL = 0x00000003
+                FLASHW_TIMERNOFG = 0x0000000C
+                class FLASHWINFO(ctypes.Structure):
+                    _fields_ = [
+                        ("cbSize", wintypes.UINT),
+                        ("hwnd", wintypes.HWND),
+                        ("dwFlags", wintypes.DWORD),
+                        ("uCount", wintypes.UINT),
+                        ("dwTimeout", wintypes.DWORD),
+                    ]
+                info = FLASHWINFO(
+                    ctypes.sizeof(FLASHWINFO), hwnd,
+                    FLASHW_ALL | FLASHW_TIMERNOFG, 5, 0,
+                )
+                user32.FlashWindowEx(ctypes.byref(info))
+        except Exception:
+            pass
         return True
     except Exception as e:
         print(f"  focus existing window failed: {e}")

@@ -62,7 +62,19 @@
         <div id="refEmpty" class="ref-empty">No reference images</div>
       </div>
       <div class="btn-row" style="margin-bottom:6px">
-        <button class="btn-sm" onclick="browseRefImages()">+ Add Image</button>
+        <!-- v2026-05-1101: replaced tkinter askopenfilenames with the browser's
+             native multi-file picker. <label for=…> ties the visible button to
+             the hidden <input type="file" multiple> so the click counts as a
+             user gesture (WebView2 blocks programmatic .click() on file inputs).
+             The old tkinter route was unreliable in PyInstaller+WebView2 — it
+             would often return only the first selected file. -->
+        <label class="btn-sm" for="refFileInput"
+               style="display:inline-flex;align-items:center;justify-content:center;cursor:pointer">+ Add Image</label>
+        <input type="file" id="refFileInput"
+               accept="image/png,image/jpeg,image/webp,image/bmp"
+               multiple
+               style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0"
+               onchange="onRefFilesChosen(this)">
         <button class="btn-sm" onclick="clearRefs()">Clear All</button>
       </div>
       <p class="hint" id="refLimitHint">3rd-gen models support up to 14 reference images.</p>

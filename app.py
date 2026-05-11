@@ -1498,9 +1498,44 @@ app = Flask(
     template_folder=os.path.join(_flask_base, 'templates'),
     static_folder=os.path.join(_flask_base, 'static'),
 )
-# Cap upload size at 40 MB so a rogue drop can't OOM the process
-app.config["MAX_CONTENT_LENGTH"] = 40 * 1024 * 1024
+# Cap upload size at 300 MB. v2401 had this at 40 MB, which is fine for one
+# image but breaks multi-select: 5 phone photos at ~15 MB each blow past it,
+# Werkzeug aborts with 413, returns its default HTML error page, and the JS
+# client's r.json() fails with "Unexpected token '<'..." (the user's actual
+# multi-attach symptom — diagnosed in the prototype branch).
+app.config["MAX_CONTENT_LENGTH"] = 300 * 1024 * 1024
 state = AppState()
+
+
+# --- JSON error responses for /api/* ---
+# Flask defaults to HTML error pages, which break clients that call r.json()
+# on the response. Force any error on /api/ to come back as JSON so the
+# frontend's existing error toasts work uniformly. Non-/api/ paths are
+# unaffected (the viewer/popup HTML pages still get HTML error pages).
+@app.errorhandler(413)
+def _api_413(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "Upload too large (>300MB total)"}), 413
+    return e
+
+
+@app.errorhandler(500)
+def _api_500(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": f"Server error: {str(e)[:200]}"}), 500
+    return e
+
+
+@app.errorhandler(Exception)
+def _api_unhandled(e):
+    if request.path.startswith("/api/"):
+        import traceback
+        return jsonify({
+            "ok": False,
+            "error": f"{type(e).__name__}: {str(e)[:200]}",
+            "trace": traceback.format_exc()[-500:],
+        }), 500
+    raise e
 
 
 # --- CSRF protection ---
@@ -1881,33 +1916,51 @@ def get_refs():
 @app.route("/api/refs/upload", methods=["POST"])
 def upload_refs():
     import hashlib
-    files = request.files.getlist("files")
-    added = 0
-    os.makedirs(state.temp_ref_dir, exist_ok=True)
-    for f in files:
-        ext = os.path.splitext(f.filename)[1].lower()
-        if ext not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
-            continue
+    # Wrap the whole thing so any exception comes back as JSON instead of
+    # a Werkzeug HTML traceback page (the prototype branch found this is
+    # exactly what was breaking the frontend's r.json() with "Unexpected
+    # token '<'" on multi-file uploads — see 다중첨부_수정내역.md).
+    try:
+        files = request.files.getlist("files")
+        added = 0
+        received = len(files)
+        os.makedirs(state.temp_ref_dir, exist_ok=True)
+        for f in files:
+            fname = f.filename or ""
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+                state.log(f"upload: skipped non-image '{fname}'")
+                continue
 
-        # Read bytes once, hash them to dedupe identical content
-        data = f.read()
-        if not data:
-            continue
-        digest = hashlib.sha1(data).hexdigest()[:16]
-        fp = os.path.join(state.temp_ref_dir, f"ref_{digest}{ext}")
+            # Read bytes once, hash them to dedupe identical content
+            data = f.read()
+            if not data:
+                state.log(f"upload: empty stream '{fname}'")
+                continue
+            digest = hashlib.sha1(data).hexdigest()[:16]
+            fp = os.path.join(state.temp_ref_dir, f"ref_{digest}{ext}")
 
-        # If a file with this exact content already exists on disk, reuse it
-        if not os.path.exists(fp):
-            with open(fp, "wb") as out:
-                out.write(data)
+            # If a file with this exact content already exists on disk, reuse it
+            if not os.path.exists(fp):
+                with open(fp, "wb") as out:
+                    out.write(data)
 
-        # Track so we know it was cached by this app (used for accounting, not deletion)
-        state.temp_ref_paths.add(fp)
+            # Track so we know it was cached by this app (used for accounting, not deletion)
+            state.temp_ref_paths.add(fp)
 
-        # add_ref_image already skips if the same path is already in ref_path_list
-        if state.add_ref_image(fp):
-            added += 1
-    return jsonify({"ok": True, "added": added})
+            # add_ref_image already skips if the same path is already in ref_path_list
+            if state.add_ref_image(fp):
+                added += 1
+        state.log(f"upload: received {received}, added {added}")
+        return jsonify({"ok": True, "added": added, "received": received})
+    except Exception as e:
+        import traceback
+        state.log(f"upload_refs CRASH: {str(e)[:200]}")
+        return jsonify({
+            "ok": False,
+            "error": f"{type(e).__name__}: {str(e)[:200]}",
+            "trace": traceback.format_exc()[-500:],
+        }), 200
 
 
 @app.route("/api/refs/download-url", methods=["POST"])

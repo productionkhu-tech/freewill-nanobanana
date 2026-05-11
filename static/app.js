@@ -982,9 +982,47 @@ async function refreshRefs() {
   });
 }
 
+// v2026-05-1101: Native browser file picker via the hidden <input type="file"
+// multiple> in index.html. Replaces the tkinter askopenfilenames route, which
+// was unreliable in PyInstaller+WebView2 (often returned only the first of
+// several Ctrl/Shift-selected files). Same /api/refs/upload endpoint as the
+// drag-and-drop path, so all the dedupe + slot-limit + PIL validation runs
+// once in `upload_refs` regardless of how the file got picked.
+async function onRefFilesChosen(inputEl) {
+  const files = inputEl.files;
+  showToast(`Picked ${files ? files.length : 0} file(s)...`, "info");
+  if (!files || !files.length) return;
+  const form = new FormData();
+  let appended = 0;
+  for (const f of files) { form.append("files", f); appended++; }
+  if (appended === 0) {
+    showToast("No valid files", "warn");
+    inputEl.value = "";
+    return;
+  }
+  try {
+    const d = await api("/api/refs/upload", { method: "POST", body: form });
+    if (d?.ok && d.added > 0) {
+      refreshRefs();
+      showToast(`Added ${d.added}/${appended} image(s)`, "success");
+    } else if (d?.ok && d.added === 0) {
+      showToast(`Sent ${appended}, 0 added (full or duplicates?)`, "warn");
+    } else {
+      showToast(d?.error || "Upload failed", "error");
+    }
+  } catch (e) {
+    showToast("Upload exception: " + (e.message || e), "error");
+  }
+  // Reset so picking the same file twice in a row still fires onchange.
+  inputEl.value = "";
+}
+
+// Compatibility stub: any old caller (or a stale event wired up elsewhere)
+// gets routed to the same hidden input. The native click is treated as a
+// user gesture because it inherits from the original handler frame.
 async function browseRefImages() {
-  const d = await api("/api/browse-files", { method: "POST" });
-  if (d.ok && d.added > 0) { refreshRefs(); showToast(`Added ${d.added} image(s)`, "success"); }
+  const inp = document.getElementById("refFileInput");
+  if (inp) inp.click();
 }
 async function replaceRef(idx) {
   const d = await api("/api/browse-replace-ref", { method: "POST", body: { index: idx } });

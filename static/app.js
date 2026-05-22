@@ -12,7 +12,9 @@ let logPollTimer = null;
 let promptSectionCount = 0;
 let mentionMenu = null;
 let mentionTarget = null;
-let refCount = 0;
+let refCount = 0;                 // number of FILLED ref slots
+let refSlotCount = 0;             // total slot count (highest [Image N])
+let refFilledSlots = new Set();   // 1-based slot numbers that hold an image
 let allGalleryPaths = [];
 let isGenerating = false;
 let searchDebounce = null;
@@ -421,12 +423,22 @@ function addPromptSection(initialText = "") {
   ta.placeholder = "Describe the image... Enter=Generate, Shift+Enter=newline, @ mentions refs";
   ta.value = initialText;
   ta.addEventListener("input", (e) => {
+    // Normalize "@imageN" -> "[Image N]" before anything else reads the value.
+    if (maybeAutoConvertMentions(e, ta)) closeMentionMenu();
     onPromptInput(e, ta);
     syncPromptHighlight(ta, { immediate: _shouldSyncImmediate(e) });
     scheduleSettingsSave();
   });
   ta.addEventListener("keyup", () => _tryShowMention(ta));
   ta.addEventListener("scroll", () => syncPromptHighlight(ta));
+  // Catch a "@image1" left unsealed at the caret (user typed it then clicked
+  // away without a trailing space) — full-mode convert on blur.
+  ta.addEventListener("blur", () => {
+    if (_autoConvertImageMentions(ta, true)) {
+      syncPromptHighlight(ta, { immediate: true });
+      scheduleSettingsSave();
+    }
+  });
   ta.addEventListener("keydown", (e) => {
     _onAtKeydown(e, ta);     // detect @ directly from the keystroke
     onPromptKeydown(e, ta);
@@ -510,12 +522,19 @@ function setupFixedPromptMention() {
   const fp = document.getElementById("fixedPrompt");
   if (fp) {
     fp.addEventListener("input", (e) => {
+      if (maybeAutoConvertMentions(e, fp)) closeMentionMenu();
       onPromptInput(e, fp);
       syncPromptHighlight(fp, { immediate: _shouldSyncImmediate(e) });
       scheduleSettingsSave();
     });
     fp.addEventListener("keyup", () => _tryShowMention(fp));
     fp.addEventListener("scroll", () => syncPromptHighlight(fp));
+    fp.addEventListener("blur", () => {
+      if (_autoConvertImageMentions(fp, true)) {
+        syncPromptHighlight(fp, { immediate: true });
+        scheduleSettingsSave();
+      }
+    });
     fp.addEventListener("keydown", (e) => {
       _onAtKeydown(e, fp);
       onPromptKeydown(e, fp);
@@ -573,7 +592,7 @@ function resetSetup() {
 //     before selectionStart updated, so the lookup saw the wrong position.
 function _tryShowMention(textarea) {
   const pos = textarea.selectionStart;
-  if (pos > 0 && textarea.value[pos - 1] === "@" && refCount > 0) {
+  if (pos > 0 && textarea.value[pos - 1] === "@" && refFilledSlots.size > 0) {
     showMentionMenu(textarea, pos);
   } else if (mentionMenu) {
     if (textarea.value.substring(0, pos).lastIndexOf("@") === -1) {
@@ -746,22 +765,26 @@ function showMentionMenu(textarea, cursorPos) {
     return;
   }
   closeMentionMenu();
-  if (refCount <= 0) return;
+  if (refFilledSlots.size <= 0) return;
   mentionTarget = { textarea, cursorPos };
   mentionMenu = document.createElement("div");
   mentionMenu.className = "mention-menu";
   mentionMenu.dataset.selected = "0";
-  for (let i = 0; i < refCount; i++) {
+  // Offer only FILLED slots — e.g. with slot 2 empty the menu lists
+  // "Image 1" and "Image 3". Each button carries its real slot number.
+  const slots = [...refFilledSlots].sort((a, b) => a - b);
+  slots.forEach((slotNum, i) => {
     const btn = document.createElement("button");
     btn.className = "mention-item" + (i === 0 ? " active" : "");
-    btn.textContent = `Image ${i + 1}`;
+    btn.textContent = `Image ${slotNum}`;
+    btn.dataset.slot = String(slotNum);
     btn.addEventListener("mousedown", (e) => {
       e.preventDefault();
       mentionMenu.dataset.selected = String(i);
       insertMention();
     });
     mentionMenu.appendChild(btn);
-  }
+  });
   document.body.appendChild(mentionMenu);
 
   // Reposition now AND after a short delay (in case layout wasn't settled
@@ -777,7 +800,7 @@ function positionMentionMenu(textarea) {
   // If rect is still 0×0 (textarea not yet laid out / hidden), defer
   if (rect.width === 0 && rect.height === 0) return;
 
-  const menuH = mentionMenu.offsetHeight || (refCount * 30 + 10);
+  const menuH = mentionMenu.offsetHeight || (refFilledSlots.size * 30 + 10);
   const menuW = mentionMenu.offsetWidth || 160;
   const vh = window.innerHeight;
   const vw = window.innerWidth;
@@ -809,7 +832,11 @@ function navigateMention(dir) {
 
 function insertMention() {
   if (!mentionMenu || !mentionTarget) return;
-  const tag = `[Image ${parseInt(mentionMenu.dataset.selected || "0") + 1}]`;
+  // The selected button carries the real slot number in data-slot.
+  const items = mentionMenu.querySelectorAll(".mention-item");
+  const sel = parseInt(mentionMenu.dataset.selected || "0", 10);
+  const slotNum = parseInt((items[sel] && items[sel].dataset.slot) || "1", 10);
+  const tag = `[Image ${slotNum}]`;
   const ta = mentionTarget.textarea;
   // Re-read position at insert time; the stored cursorPos can be stale if
   // the IME committed more characters between "@" press and this call.
@@ -839,6 +866,103 @@ document.addEventListener("mousedown", (e) => {
 });
 
 // ==========================================
+// Ref-slot mentions  ([Image N]  <->  @imageN)
+// ==========================================
+// MODEL: the prompt is the anchor. A [Image N] / @imageN mention's NUMBER is
+// whatever the user wrote — the app never renumbers it. Only the FORM toggles
+// with the ref-slot state:
+//   - [Image N]  (blue chip)  = slot N currently holds an image
+//   - @imageN    (grey text)  = slot N is empty / doesn't exist
+// Delete a ref -> its slot empties -> [Image N] becomes @imageN. Add a ref
+// into that slot -> @imageN becomes [Image N] again. Reorder swaps slot
+// contents but the prompt text is left untouched.
+//
+// `@` must not be preceded by an alphanumeric (so "email@image1" is left
+// alone). In typed mode the digits must be sealed by a following non-digit
+// (so typing "@image1" then "2" becomes "@image12", not "[Image 1]2").
+// In paste/blur/pre-generate mode end-of-string also counts as sealed.
+const _MENTION_TOKEN_SEALED = /(?<![A-Za-z0-9])@[ \t]*image[ \t]*(\d+)(?=\D)/gi;
+const _MENTION_TOKEN_FULL   = /(?<![A-Za-z0-9])@[ \t]*image[ \t]*(\d+)/gi;
+
+// Convert typed/pasted "@imageN" -> "[Image N]" for slots that currently hold
+// an image. Pure textarea text; the queue snapshots prompt text at
+// /api/generate time so this never interacts with queue ordering.
+function _autoConvertImageMentions(ta, pasteMode) {
+  if (!ta || refFilledSlots.size === 0) return false;
+  const value = ta.value;
+  const caret = ta.selectionStart;
+  const re = pasteMode ? _MENTION_TOKEN_FULL : _MENTION_TOKEN_SEALED;
+  re.lastIndex = 0;
+  let out = "";
+  let lastIdx = 0;
+  let delta = 0;          // length change applied to text strictly before caret
+  let caretInMatch = -1;  // if caret lands inside a converted match, snap here
+  let changed = false;
+  let m;
+  while ((m = re.exec(value)) !== null) {
+    const n = parseInt(m[1], 10);
+    if (!refFilledSlots.has(n)) continue;   // slot N not filled — leave verbatim
+    const replacement = `[Image ${n}]`;
+    const s = m.index;
+    const end = m.index + m[0].length;
+    out += value.slice(lastIdx, s) + replacement;
+    lastIdx = end;
+    changed = true;
+    if (caret >= end) {
+      delta += replacement.length - m[0].length;
+    } else if (caret > s) {
+      caretInMatch = out.length;
+    }
+  }
+  if (!changed) return false;
+  out += value.slice(lastIdx);
+  ta.value = out;
+  const newCaret = caretInMatch >= 0 ? caretInMatch : caret + delta;
+  ta.selectionStart = ta.selectionEnd = Math.max(0, Math.min(newCaret, out.length));
+  return true;
+}
+
+// Called from a prompt box's `input` listener. Paste/drop convert eagerly
+// (the inserted chunk is complete); plain typing only converts sealed tokens.
+function maybeAutoConvertMentions(e, ta) {
+  if (e && e.isComposing) return false;          // mid-IME — defer
+  const paste = !!e && (e.inputType === "insertFromPaste" ||
+                        e.inputType === "insertFromDrop");
+  return _autoConvertImageMentions(ta, paste);
+}
+
+// Two-way re-sync of every prompt mention to the current ref-slot state.
+// The mention number is fixed; only the form changes:
+//   [Image N] -> @imageN   when slot N is empty / out of range
+//   @imageN   -> [Image N] when slot N is filled
+// Called from refreshRefs() after any add/delete/reorder, and from generate()
+// so the server snapshots canonical [Image N] for every filled slot.
+// Returns true if any box changed.
+function syncMentionsToRefSlots() {
+  const boxes = [document.getElementById("fixedPrompt"),
+                 ...document.querySelectorAll(".prompt-section-box")];
+  let any = false;
+  boxes.forEach(ta => {
+    if (!ta) return;
+    let v = ta.value;
+    // de-activate: [Image N] -> @imageN when slot N no longer holds an image
+    v = v.replace(/\[Image (\d+)\]/g, (m, n) =>
+      refFilledSlots.has(parseInt(n, 10)) ? m : `@image${n}`);
+    // activate: @imageN -> [Image N] when slot N is filled
+    v = v.replace(_MENTION_TOKEN_FULL, (m, n) =>
+      refFilledSlots.has(parseInt(n, 10)) ? `[Image ${parseInt(n, 10)}]` : m);
+    if (v !== ta.value) {
+      ta.value = v;
+      any = true;
+      if (typeof syncPromptHighlight === "function") {
+        syncPromptHighlight(ta, { immediate: true });
+      }
+    }
+  });
+  return any;
+}
+
+// ==========================================
 // Naming Controls
 // ==========================================
 function toggleNaming() {
@@ -858,19 +982,157 @@ function updateNamingControls() {
 // ==========================================
 // Reference Images
 // ==========================================
+// Render an empty ref slot — a placeholder that holds slot number i so the
+// [Image i+1] mention keeps its meaning. The whole cell is a drop target
+// (fill it) and a reorder drop target; clicking opens the file picker.
+function _renderEmptyRefSlot(cell, i) {
+  // Structurally mirror a filled cell — media box + label + button — so an
+  // empty slot is exactly the same height and the grid columns line up.
+  cell.className = "ref-cell ref-cell-empty";
+  cell.title = `Image ${i + 1} — empty slot. Drop or click to fill.`;
+  const IDLE_HINT = "비어 있음";
+  const DROP_HINT = "여기에 놓기";
+
+  const media = document.createElement("div");
+  media.className = "ref-media ref-empty-media";
+  const hint = document.createElement("div");
+  hint.className = "ref-empty-hint";
+  hint.textContent = IDLE_HINT;
+  media.appendChild(hint);
+  cell.appendChild(media);
+
+  const lbl = document.createElement("div");
+  lbl.className = "ref-label";
+  lbl.textContent = `[Image ${i + 1}]`;
+  cell.appendChild(lbl);
+
+  // Sits in the same row as a filled cell's Change button -> equal height.
+  const fillBtn = document.createElement("button");
+  fillBtn.className = "ref-change";
+  fillBtn.textContent = "채우기";
+  fillBtn.addEventListener("click", (e) => { e.stopPropagation(); replaceRef(i); });
+  cell.appendChild(fillBtn);
+
+  cell.addEventListener("click", () => replaceRef(i));
+  const clearHover = () => {
+    cell.classList.remove("reorder-over");
+    cell.classList.remove("drop-target");
+    hint.textContent = IDLE_HINT;
+  };
+  cell.addEventListener("dragover", (e) => {
+    if (!e.dataTransfer) return;
+    e.preventDefault();
+    if (e.dataTransfer.types.includes("application/x-nb-ref-reorder")) {
+      e.dataTransfer.dropEffect = "move";
+      cell.classList.add("reorder-over");
+    } else {
+      cell.classList.add("drop-target");
+    }
+    // Make it unmistakable that this drop goes INTO this slot (vs adding a
+    // brand-new image when dropped on empty ref-area space).
+    hint.textContent = DROP_HINT;
+  });
+  cell.addEventListener("dragleave", (e) => {
+    if (!cell.contains(e.relatedTarget)) clearHover();
+  });
+  cell.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    clearHover();
+    const reorderRaw = e.dataTransfer ? e.dataTransfer.getData("application/x-nb-ref-reorder") : "";
+    if (reorderRaw !== "" && reorderRaw != null) {
+      const from = parseInt(reorderRaw, 10);
+      if (!Number.isNaN(from) && from !== i) reorderRefs(from, i);
+      return;
+    }
+    await _fillSlotFromDrop(e, i);
+  });
+}
+
+// Fill slot i from a drop event (gallery-card internal drag or external file).
+async function _fillSlotFromDrop(e, i) {
+  const internalPath = e.dataTransfer?.getData("application/x-nb-gallery-path");
+  if (internalPath) {
+    const r = await api(`/api/refs/replace-from-path/${i}`, {
+      method: "POST", body: { filepath: internalPath },
+    });
+    if (r.ok) {
+      if (!r.unchanged) await refreshRefs();
+      showToast(r.unchanged ? "Same image — no change" : "Reference set", "success");
+    } else {
+      showToast(r.error || "Failed", "error");
+    }
+    return true;
+  }
+  const files = e.dataTransfer?.files;
+  if (files && files.length) {
+    const f = files[0];
+    const ext = (f.name || "").split(".").pop().toLowerCase();
+    if (!["png", "jpg", "jpeg", "webp", "bmp"].includes(ext)) {
+      showToast("Unsupported format", "warn");
+      return true;
+    }
+    const form = new FormData();
+    form.append("file", f);
+    const r = await api(`/api/refs/replace/${i}`, { method: "POST", body: form });
+    if (r.ok) { await refreshRefs(); showToast("Reference set", "success"); }
+    else { showToast(r.error || "Failed", "error"); }
+    return true;
+  }
+  return false;
+}
+
 async function refreshRefs() {
   const d = await api("/api/refs");
   refCount = d.count || 0;
+  refSlotCount = d.slot_count || (d.refs ? d.refs.length : 0);
+  refFilledSlots = new Set();
+  (d.refs || []).forEach((ref, i) => { if (!ref.empty) refFilledSlots.add(i + 1); });
+  // A ref slot just changed (add/delete/reorder). Re-sync every prompt
+  // mention to slot state: [Image N] de-activates to @imageN text when slot N
+  // is empty, @imageN re-activates to [Image N] when slot N is filled. The
+  // mention NUMBER never changes — the prompt is the anchor.
+  if (syncMentionsToRefSlots()) {
+    closeMentionMenu();
+    scheduleSettingsSave();
+  }
   const grid = document.getElementById("refGrid");
   const empty = document.getElementById("refEmpty");
   grid.innerHTML = "";
-  if (d.refs.length === 0) { empty.style.display = "block"; return; }
+  if (!d.refs || d.refs.length === 0) { empty.style.display = "block"; return; }
   empty.style.display = "none";
   d.refs.forEach((ref, i) => {
     const cell = document.createElement("div");
+    if (ref.empty) { _renderEmptyRefSlot(cell, i); grid.appendChild(cell); return; }
     cell.className = "ref-cell" + (ref.pinned ? " pinned" : "");
 
+    // Drag-to-reorder: the whole cell is a drag source. The payload is the
+    // cell's index under a private MIME type so drop handlers can tell a
+    // reorder apart from an external file drop or a gallery-card drag.
+    cell.draggable = true;
+    cell.addEventListener("dragstart", (e) => {
+      e.dataTransfer.setData("application/x-nb-ref-reorder", String(i));
+      e.dataTransfer.effectAllowed = "move";
+      cell.classList.add("reorder-dragging");
+    });
+    cell.addEventListener("dragend", () => {
+      cell.classList.remove("reorder-dragging");
+      cell.classList.remove("reorder-over");
+    });
+    cell.addEventListener("dragover", (e) => {
+      if (e.dataTransfer && e.dataTransfer.types.includes("application/x-nb-ref-reorder")) {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        cell.classList.add("reorder-over");
+      }
+    });
+    cell.addEventListener("dragleave", (e) => {
+      // relatedTarget is where the pointer went; only clear when it left the cell.
+      if (!cell.contains(e.relatedTarget)) cell.classList.remove("reorder-over");
+    });
+
     // Drop policy (v2008):
+    //   - Reorder drag (another ref cell)        -> move this slot
     //   - Drop on the Change button of this slot -> REPLACE this slot
     //   - Drop anywhere else on the cell         -> fall through to refArea (ADD)
     //
@@ -878,6 +1140,16 @@ async function refreshRefs() {
     // cell image to replace, but the UX was unreliable and confusing. The
     // Change button is now the only REPLACE target.
     cell.addEventListener("drop", async (e) => {
+      // Reorder drag from another ref cell — handled before everything else.
+      const reorderRaw = e.dataTransfer ? e.dataTransfer.getData("application/x-nb-ref-reorder") : "";
+      if (reorderRaw !== "" && reorderRaw != null) {
+        e.preventDefault();
+        e.stopPropagation();
+        cell.classList.remove("reorder-over");
+        const from = parseInt(reorderRaw, 10);
+        if (!Number.isNaN(from) && from !== i) reorderRefs(from, i);
+        return;
+      }
       const onChangeBtn = e.target.closest(".ref-change");
       if (!onChangeBtn) {
         // No preventDefault / no stopPropagation -> bubbles to refArea's
@@ -933,6 +1205,9 @@ async function refreshRefs() {
     const img = document.createElement("img");
     img.src = `/api/refs/thumb/${i}?t=${Date.now()}`;
     img.alt = `ref ${i + 1}`;
+    // Kill the native image drag so dragging the thumbnail moves the whole
+    // cell (reorder) instead of starting an image drag with no payload.
+    img.draggable = false;
     media.appendChild(img);
 
     const pinBtn = document.createElement("button");
@@ -967,11 +1242,16 @@ async function refreshRefs() {
     // matches the refArea dragDepth style.
     let _chgDragDepth = 0;
     chgBtn.addEventListener("dragenter", (e) => {
+      // A reorder drag isn't a replace — don't show the replace highlight.
+      if (e.dataTransfer && e.dataTransfer.types.includes("application/x-nb-ref-reorder")) return;
       e.preventDefault();
       _chgDragDepth++;
       chgBtn.classList.add("drop-target");
     });
-    chgBtn.addEventListener("dragover", (e) => { e.preventDefault(); });
+    chgBtn.addEventListener("dragover", (e) => {
+      if (e.dataTransfer && e.dataTransfer.types.includes("application/x-nb-ref-reorder")) return;
+      e.preventDefault();
+    });
     chgBtn.addEventListener("dragleave", () => {
       _chgDragDepth = Math.max(0, _chgDragDepth - 1);
       if (_chgDragDepth === 0) chgBtn.classList.remove("drop-target");
@@ -1029,63 +1309,52 @@ async function replaceRef(idx) {
   if (d.ok) { refreshRefs(); showToast("Reference replaced", "success"); }
 }
 async function removeRef(idx) {
-  // Capture count BEFORE delete so we know how to reindex
-  const beforeCount = refCount;
+  // Delete = empty slot `idx` on the server. refreshRefs() then re-syncs the
+  // prompt: [Image idx+1] de-activates to @imageN text; every other slot
+  // (and its mention) keeps its number. No shifting.
   await api(`/api/refs/${idx}`, { method: "DELETE" });
-  reindexPromptMentions(idx, beforeCount);
   await refreshRefs();
   scheduleSettingsSave();
 }
 async function togglePin(idx) { await api(`/api/refs/pin/${idx}`, { method: "POST" }); refreshRefs(); }
 async function clearRefs(pp = true) {
+  // Server empties non-pinned slots; refreshRefs() re-syncs the prompt
+  // (cleared slots' [Image N] become @imageN text).
   await api("/api/refs/clear", { method: "POST", body: { preserve_pinned: pp } });
-  // Strip all [Image N] tags (or keep only those matching pinned refs that remain)
-  stripAllPromptMentions();
   await refreshRefs();
   scheduleSettingsSave();
 }
 
-// Reindex [Image N] tags across fixed_prompt + all prompt sections after
-// ref at position `removedIdx` (0-based) was removed.
-//   [Image removedIdx+1]      -> "" (stripped, matching original behavior)
-//   [Image M] where M > removedIdx+1 -> [Image M-1]
-//   [Image M] where M > previousMax  -> left alone (out of range anyway)
-function reindexPromptMentions(removedIdx, previousCount) {
-  const removedNum = removedIdx + 1;
-  const boxes = [document.getElementById("fixedPrompt"),
-                 ...document.querySelectorAll(".prompt-section-box")];
-  boxes.forEach(ta => {
-    if (!ta) return;
-    const updated = ta.value.replace(/\[Image (\d+)\]/g, (m, n) => {
-      const num = parseInt(n, 10);
-      if (num < 1 || num > previousCount) return m;
-      if (num === removedNum) return "";
-      if (num > removedNum) return `[Image ${num - 1}]`;
-      return m;
-    });
-    if (updated !== ta.value) {
-      ta.value = updated;
-      if (typeof syncPromptHighlight === "function") syncPromptHighlight(ta);
-    }
-  });
-}
-
-function stripAllPromptMentions() {
-  const boxes = [document.getElementById("fixedPrompt"),
-                 ...document.querySelectorAll(".prompt-section-box")];
-  boxes.forEach(ta => {
-    if (!ta) return;
-    const updated = ta.value.replace(/\[Image \d+\]/g, "");
-    if (updated !== ta.value) {
-      ta.value = updated;
-      if (typeof syncPromptHighlight === "function") syncPromptHighlight(ta);
-    }
-  });
+// SWAP the contents of slot `from` and slot `to`. Dragging a ref cell onto
+// another cell swaps exactly those two slots — the dragged image lands in the
+// target slot, the target's old content moves to the dragged slot, and
+// NOTHING ELSE MOVES. Dropping onto an empty slot is therefore a clean "move
+// there" (the dragged slot becomes empty). This is NOT an insertion shift:
+// dragging slot 4 onto slot 2 leaves slot 3 exactly where it was.
+//
+// The prompt text is not touched — refreshRefs -> syncMentionsToRefSlots
+// re-resolves [Image N] <-> @imageN against the new slot-filled state.
+async function reorderRefs(from, to) {
+  const n = refSlotCount;
+  if (from === to || from < 0 || from >= n || to < 0 || to >= n) return;
+  // order[newPos] = oldSlotIndex — identity with `from` and `to` swapped.
+  const order = [...Array(n).keys()];
+  const tmp = order[from];
+  order[from] = order[to];
+  order[to] = tmp;
+  const r = await api("/api/refs/reorder", { method: "POST", body: { order } });
+  if (!r || !r.ok) { showToast((r && r.error) || "Move failed", "error"); return; }
+  await refreshRefs();
+  scheduleSettingsSave();
+  showToast("Reference moved", "success");
 }
 
 // Counter avoids flashing the border when the cursor crosses a child element
 let _refAreaDragDepth = 0;
 function onRefDragEnter(e) {
+  // A ref-cell reorder drag stays inside the grid — don't light up the whole
+  // ref area as an "add here" drop zone for it.
+  if (e.dataTransfer?.types.includes("application/x-nb-ref-reorder")) return;
   e.preventDefault();
   _refAreaDragDepth++;
   document.getElementById("refArea").classList.add("dragover");
@@ -1098,6 +1367,16 @@ async function onRefDrop(e) {
   e.preventDefault();
   _refAreaDragDepth = 0;
   document.getElementById("refArea").classList.remove("dragover");
+
+  // 0) Reorder drag dropped on empty ref-area space (not on a cell) — treat
+  //    it as "move to the end". Drops onto a cell are handled by that cell's
+  //    own drop listener, which stops propagation before reaching here.
+  const reorderRaw = e.dataTransfer?.getData("application/x-nb-ref-reorder");
+  if (reorderRaw !== "" && reorderRaw != null) {
+    const from = parseInt(reorderRaw, 10);
+    if (!Number.isNaN(from) && refSlotCount > 0) reorderRefs(from, refSlotCount - 1);
+    return;
+  }
 
   // 1) Internal drag from a gallery card
   const internalPath = e.dataTransfer?.getData("application/x-nb-gallery-path");
@@ -1417,16 +1696,12 @@ function updateSelectionUI() {
 // Gallery Actions
 // ==========================================
 function applyRefRemovalsToPrompts(removals) {
+  // A gallery image that was in use as a ref got deleted — the server already
+  // emptied that ref slot. Just refresh: refreshRefs() -> syncMentionsToRefSlots
+  // de-activates the now-empty slot's [Image N] mention to @imageN text. No
+  // shifting; every other slot keeps its number.
   if (!removals || !removals.length) return;
-  // Apply in reverse order so indices stay valid
-  removals
-    .slice()
-    .sort((a, b) => (b.removed_ref_idx || 0) - (a.removed_ref_idx || 0))
-    .forEach(r => {
-      if (typeof r.removed_ref_idx === "number") {
-        reindexPromptMentions(r.removed_ref_idx, r.ref_count_before || refCount);
-      }
-    });
+  refreshRefs();
   scheduleSettingsSave();
 }
 
@@ -1577,6 +1852,11 @@ async function showPromptPopup(prompt, filename) {
 // Generation
 // ==========================================
 async function generate() {
+  // Last-chance sync: a user can type "@image1" and hit Enter without ever
+  // blurring the box. Re-sync mentions to slot state now — before
+  // saveSettings() reads the values — so the server snapshots "[Image N]"
+  // for every filled slot.
+  syncMentionsToRefSlots();
   await saveSettings();
   const d = await api("/api/generate", { method: "POST" });
   if (!d.ok) {

@@ -489,19 +489,58 @@ class AppState:
             self.log(f"diagnose error: {str(e)[:80]}")
 
     # --- Reference Images ---
+    #
+    # SLOT MODEL (v2026-05-2201+): ref_images / ref_path_list / ref_pinned are
+    # parallel lists where the INDEX is a stable slot number (index 0 = "Image
+    # 1"). A deleted ref leaves a HOLE — its entry becomes None — instead of
+    # the list compacting. This is what lets "[Image 2]" in a prompt keep
+    # meaning the image in slot 2 even after slot 1 is deleted. The prompt is
+    # the source of truth; the app never renumbers a [Image N] mention.
+    #   - delete  -> set slot to None (then trim trailing Nones)
+    #   - add     -> fill the lowest None hole, else append
+    #   - reorder -> permute the lists (holes move too)
+    # build_user_parts maps [Image N] -> ref_payloads[N-1]; a None payload
+    # renders as literal text.
     def get_ref_limit(self, model=None):
         m = model or self.model
         return 3 if m == "gemini-2.5-flash-image" else 14
 
+    def _filled_ref_count(self):
+        """Number of non-empty ref slots. Caller must hold ref_lock."""
+        return sum(1 for x in self.ref_images if x is not None)
+
+    def _trim_trailing_empty_refs(self):
+        """Drop trailing None slots so the grid doesn't show perpetual empty
+        cells at the end. Holes in the MIDDLE are kept. Caller holds ref_lock."""
+        while self.ref_images and self.ref_images[-1] is None:
+            self.ref_images.pop()
+            if self.ref_path_list:
+                self.ref_path_list.pop()
+            if self.ref_pinned:
+                self.ref_pinned.pop()
+
     def get_effective_ref_images(self, model=None):
+        # Slot list with None holes preserved — position is the slot number,
+        # which build_user_parts indexes by. Truncated so at most `limit`
+        # FILLED slots are included (matters only after switching to a
+        # lower-limit model with many refs already loaded — a plain slice
+        # would be wrong because holes don't count toward the limit).
         limit = self.get_ref_limit(model)
         with self.ref_lock:
-            return list(self.ref_images[:limit])
+            out, filled = [], 0
+            for x in self.ref_images:
+                if x is not None:
+                    if filled >= limit:
+                        break
+                    filled += 1
+                out.append(x)
+            return out
 
     def get_effective_ref_paths(self, model=None):
-        limit = self.get_ref_limit(model)
+        # Full slot list (no limit cap) — used for project save, which must
+        # persist every slot including holes and any excess refs.
         with self.ref_lock:
-            return list(self.ref_path_list[:limit])
+            return list(self.ref_path_list)
 
     def ref_image_to_bytes(self, ref_pil):
         buf = io.BytesIO()
@@ -512,13 +551,16 @@ class AppState:
         return types.Part.from_bytes(data=ref_data, mime_type="image/png")
 
     def build_user_parts(self, prompt, ref_payloads):
-        if not ref_payloads:
+        # ref_payloads is a slot-indexed list — entry may be None (empty slot).
+        has_any = any(rd is not None for rd in (ref_payloads or []))
+        if not has_any:
             return [types.Part.from_text(text=prompt)]
         matches = list(re.finditer(r"\[Image (\d+)\]", prompt))
         if not matches:
             parts = [types.Part.from_text(text=prompt)]
             for rd in ref_payloads:
-                parts.append(self.ref_bytes_to_part(rd))
+                if rd is not None:
+                    parts.append(self.ref_bytes_to_part(rd))
             return parts
         parts = []
         last_end = 0
@@ -530,7 +572,9 @@ class AppState:
                 if t:
                     parts.append(types.Part.from_text(text=t))
             idx = int(m.group(1)) - 1
-            if 0 <= idx < len(ref_payloads):
+            # Resolve [Image N] -> the image in slot N. An empty slot (None)
+            # or out-of-range index falls back to literal "[Image N]" text.
+            if 0 <= idx < len(ref_payloads) and ref_payloads[idx] is not None:
                 parts.append(self.ref_bytes_to_part(ref_payloads[idx]))
                 used.add(idx)
             else:
@@ -541,17 +585,22 @@ class AppState:
             if tail:
                 parts.append(types.Part.from_text(text=tail))
         for i, rd in enumerate(ref_payloads):
-            if i not in used:
+            if i not in used and rd is not None:
                 parts.append(self.ref_bytes_to_part(rd))
         return parts or [types.Part.from_text(text=prompt)]
 
-    def add_ref_image(self, filepath, pinned=False):
+    def add_ref_image(self, filepath, pinned=False, slot=None):
+        """Add a ref image as a NEW slot at the end. A generic add never fills
+        an existing hole — empty slots left by a delete are only filled by an
+        explicit drop/click on that slot's placeholder (which goes through
+        replace_ref, not here). Pass `slot` to place at a specific index —
+        used by project load to restore exact slot positions, holes included."""
         with self.ref_lock:
             if filepath in self.ref_path_list:
                 self.log(f"Ref already added: {os.path.basename(filepath)}")
                 return False
             limit = self.get_ref_limit()
-            if len(self.ref_images) >= limit:
+            if slot is None and self._filled_ref_count() >= limit:
                 self.log(f"Max {limit} reference images")
                 return False
             try:
@@ -559,34 +608,52 @@ class AppState:
                     # Preserve alpha — PNG logos/icons should stay as
                     # cutouts, not get a white halo.
                     pil = _to_display_image(img)
-                self.ref_images.append(pil)
-                self.ref_path_list.append(filepath)
-                self.ref_pinned.append(bool(pinned))
-                self.project_dirty = True
-                return True
             except Exception as e:
                 self.log(f"Ref load failed: {str(e)[:80]}")
                 return False
+            if slot is not None:
+                # Explicit slot placement (load): grow the lists with holes.
+                while len(self.ref_images) <= slot:
+                    self.ref_images.append(None)
+                    self.ref_path_list.append(None)
+                    self.ref_pinned.append(False)
+                self.ref_images[slot] = pil
+                self.ref_path_list[slot] = filepath
+                self.ref_pinned[slot] = bool(pinned)
+            else:
+                # Generic add -> always a brand-new slot at the end. Holes
+                # from earlier deletions stay empty until explicitly filled.
+                self.ref_images.append(pil)
+                self.ref_path_list.append(filepath)
+                self.ref_pinned.append(bool(pinned))
+            self.project_dirty = True
+            return True
 
     def remove_ref(self, idx):
+        # Delete = empty the slot (set to None), do NOT compact. Other slots
+        # keep their numbers so prompt [Image N] mentions stay matched.
+        # Trailing empty slots are trimmed so the grid stays tidy.
         with self.ref_lock:
-            if 0 <= idx < len(self.ref_images):
-                img = self.ref_images.pop(idx)
-                fp = self.ref_path_list.pop(idx)
+            if 0 <= idx < len(self.ref_images) and self.ref_images[idx] is not None:
+                img = self.ref_images[idx]
+                fp = self.ref_path_list[idx]
+                self.ref_images[idx] = None
+                self.ref_path_list[idx] = None
                 if idx < len(self.ref_pinned):
-                    self.ref_pinned.pop(idx)
+                    self.ref_pinned[idx] = False
                 try:
                     img.close()
                 except Exception:
                     pass
+                self._trim_trailing_empty_refs()
                 self.cleanup_temp_ref_path(fp)
                 self.project_dirty = True
                 return True
             return False
 
     def replace_ref(self, idx, filepath):
-        """Replace the ref at `idx` with the image at `filepath`, preserving
-        position and pin state. Used by drag-drop onto an existing ref cell."""
+        """Replace the ref at slot `idx` with the image at `filepath`,
+        preserving position and pin state. Also fills an empty slot."""
         with self.ref_lock:
             if not (0 <= idx < len(self.ref_images)):
                 return False
@@ -596,19 +663,21 @@ class AppState:
             except Exception as e:
                 self.log(f"Replace failed: {str(e)[:80]}")
                 return False
-            old = self.ref_images[idx]
+            old = self.ref_images[idx]          # may be None (empty slot)
             old_fp = self.ref_path_list[idx]
             self.ref_images[idx] = pil
             self.ref_path_list[idx] = filepath
-            try: old.close()
-            except Exception: pass
+            if old is not None:
+                try: old.close()
+                except Exception: pass
             self.cleanup_temp_ref_path(old_fp)
             self.project_dirty = True
             return True
 
     def toggle_ref_pin(self, idx):
         with self.ref_lock:
-            if not (0 <= idx < len(self.ref_path_list)):
+            # Can't pin an empty slot.
+            if not (0 <= idx < len(self.ref_images)) or self.ref_images[idx] is None:
                 return
             while len(self.ref_pinned) < len(self.ref_path_list):
                 self.ref_pinned.append(False)
@@ -616,27 +685,54 @@ class AppState:
             self.project_dirty = True
 
     def clear_refs(self, preserve_pinned=False):
-        kept_imgs, kept_paths, kept_pinned = [], [], []
+        # Empty slots IN PLACE (no compaction) so surviving pinned refs keep
+        # their slot numbers. Non-pinned slots become None; trailing holes
+        # are trimmed.
         removed = []
         with self.ref_lock:
-            for i, (img, fp) in enumerate(zip(self.ref_images, self.ref_path_list)):
+            for i in range(len(self.ref_images)):
+                img = self.ref_images[i]
+                if img is None:
+                    continue
                 pin = i < len(self.ref_pinned) and bool(self.ref_pinned[i])
                 if preserve_pinned and pin:
-                    kept_imgs.append(img)
-                    kept_paths.append(fp)
-                    kept_pinned.append(pin)
-                else:
-                    removed.append(fp)
-                    try:
-                        img.close()
-                    except Exception:
-                        pass
-            self.ref_images = kept_imgs
-            self.ref_path_list = kept_paths
-            self.ref_pinned = kept_pinned
+                    continue
+                removed.append(self.ref_path_list[i])
+                try:
+                    img.close()
+                except Exception:
+                    pass
+                self.ref_images[i] = None
+                self.ref_path_list[i] = None
+                if i < len(self.ref_pinned):
+                    self.ref_pinned[i] = False
+            self._trim_trailing_empty_refs()
             self.project_dirty = True
         for fp in removed:
             self.cleanup_temp_ref_path(fp)
+
+    def reorder_refs(self, order):
+        """Reorder all three ref lists by `order` — a permutation of
+        range(len(refs)) where new[pos] = old[order[pos]]. Returns True on
+        success, False if `order` isn't a valid permutation."""
+        with self.ref_lock:
+            n = len(self.ref_path_list)
+            try:
+                order = [int(x) for x in order]
+            except (TypeError, ValueError):
+                return False
+            if sorted(order) != list(range(n)):
+                return False
+            # ref_pinned is lazily extended elsewhere — normalize length first
+            # so the permutation lines up across all three lists.
+            while len(self.ref_pinned) < n:
+                self.ref_pinned.append(False)
+            self.ref_images = [self.ref_images[i] for i in order]
+            self.ref_path_list = [self.ref_path_list[i] for i in order]
+            self.ref_pinned = [self.ref_pinned[i] for i in order]
+            self._trim_trailing_empty_refs()
+            self.project_dirty = True
+            return True
 
     def cleanup_temp_ref_path(self, filepath):
         # Only drop the session-level tracking entry. DO NOT delete the file.
@@ -911,7 +1007,12 @@ class AppState:
         return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_image_session.json"
 
     def collect_project_state(self):
-        current_ref_paths = [p for p in self.get_effective_ref_paths() if p and os.path.exists(p)]
+        # Slot-indexed: keep None for empty slots (and for refs whose file
+        # vanished) so reload restores the exact slot layout, holes included.
+        current_ref_paths = [
+            (p if (p and os.path.exists(p)) else None)
+            for p in self.get_effective_ref_paths()
+        ]
         with self.ref_lock:
             pinned_ref_paths = [
                 p for i, p in enumerate(self.ref_path_list)
@@ -1028,13 +1129,15 @@ class AppState:
         except (TypeError, ValueError):
             self.gallery_columns = 2
 
-        # Clear and restore refs
+        # Clear and restore refs. ref_paths is slot-indexed and may contain
+        # null entries (empty slots) — place each ref at its exact slot so the
+        # hole layout survives a save/reload round-trip.
         self.clear_refs()
-        ref_paths = [p for p in (ui.get("ref_paths") or []) if p]
+        ref_paths = ui.get("ref_paths") or []
         pinned = set(p for p in (ui.get("pinned_ref_paths") or []) if p)
-        for rp in ref_paths:
-            if os.path.exists(rp):
-                self.add_ref_image(rp, pinned=rp in pinned)
+        for slot, rp in enumerate(ref_paths):
+            if rp and os.path.exists(rp):
+                self.add_ref_image(rp, pinned=rp in pinned, slot=slot)
 
         # Clear and restore gallery (under the lock so /api/gallery polls
         # don't see half-cleared state)
@@ -1896,20 +1999,35 @@ def get_events():
 # --- References ---
 @app.route("/api/refs", methods=["GET"])
 def get_refs():
+    # refs is a slot list — one entry per slot. An empty slot (deleted ref)
+    # is reported as {index, empty: true} so the grid can render a hole
+    # placeholder there. `count` is the number of FILLED slots; `slot_count`
+    # is the total number of slots (highest [Image N] number in play).
+    with state.ref_lock:
+        images = list(state.ref_images)
+        paths = list(state.ref_path_list)
+        pinned = list(state.ref_pinned)
     refs = []
-    for i, fp in enumerate(state.ref_path_list):
-        pinned = i < len(state.ref_pinned) and state.ref_pinned[i]
+    filled = 0
+    for i, img in enumerate(images):
+        if img is None:
+            refs.append({"index": i, "empty": True})
+            continue
+        filled += 1
+        fp = paths[i] or ""
         refs.append({
             "index": i,
+            "empty": False,
             "path": fp,
             "filename": os.path.basename(fp),
-            "pinned": pinned,
-            "exists": os.path.exists(fp),
+            "pinned": i < len(pinned) and bool(pinned[i]),
+            "exists": bool(fp) and os.path.exists(fp),
         })
     return jsonify({
         "refs": refs,
         "limit": state.get_ref_limit(),
-        "count": len(state.ref_images),
+        "count": filled,
+        "slot_count": len(images),
     })
 
 
@@ -2070,7 +2188,7 @@ def download_ref_url():
         if fp in state.ref_path_list:
             return jsonify({"ok": False, "error": "Already a reference"})
         limit = state.get_ref_limit()
-        if len(state.ref_images) >= limit:
+        if state._filled_ref_count() >= limit:
             return jsonify({
                 "ok": False,
                 "error": f"Max {limit} reference images (drop on a slot to replace)",
@@ -2136,6 +2254,18 @@ def clear_refs():
     return jsonify({"ok": True})
 
 
+@app.route("/api/refs/reorder", methods=["POST"])
+def reorder_refs():
+    d = request.json or {}
+    order = d.get("order")
+    if not isinstance(order, list):
+        return jsonify({"ok": False, "error": "order must be a list"})
+    ok = state.reorder_refs(order)
+    if not ok:
+        return jsonify({"ok": False, "error": "invalid order (not a permutation)"})
+    return jsonify({"ok": True})
+
+
 @app.route("/api/refs/pin/<int:idx>", methods=["POST"])
 def pin_ref(idx):
     state.toggle_ref_pin(idx)
@@ -2183,7 +2313,7 @@ def ref_thumb(idx):
     # replace can't shrink the list between the bounds check and the index
     # access, and can't close the image object out from under us.
     with state.ref_lock:
-        if idx < 0 or idx >= len(state.ref_images):
+        if idx < 0 or idx >= len(state.ref_images) or state.ref_images[idx] is None:
             return "", 404
         pil = state.ref_images[idx].copy()
     pil.thumbnail((100, 100), Image.LANCZOS)
@@ -2372,7 +2502,7 @@ def use_as_ref():
         if fp in state.ref_path_list:
             return jsonify({"ok": False, "error": "Already a reference"})
         limit = state.get_ref_limit()
-        if len(state.ref_images) >= limit:
+        if state._filled_ref_count() >= limit:
             return jsonify({
                 "ok": False,
                 "error": f"Max {limit} reference images (drop on a slot to replace)",
@@ -2436,11 +2566,12 @@ def load_setup():
     # those same paths, the subsequent add_ref_image(rp) would then fail the
     # os.path.exists check. To keep drag-dropped refs loadable, snapshot their
     # bytes before clearing and rewrite the files if clear removed them.
-    ref_paths = [p for p in (saved.get("ref_paths") or []) if p]
+    # ref_paths is slot-indexed and may contain null entries (empty slots).
+    ref_paths = saved.get("ref_paths") or []
     pinned = set(p for p in (saved.get("pinned_ref_paths") or []) if p)
     buffered = {}
     for rp in ref_paths:
-        if rp in buffered:
+        if not rp or rp in buffered:
             continue
         try:
             if os.path.isfile(rp):
@@ -2465,9 +2596,9 @@ def load_setup():
         except Exception:
             pass
 
-    for rp in ref_paths:
-        if os.path.exists(rp):
-            state.add_ref_image(rp, pinned=rp in pinned)
+    for slot, rp in enumerate(ref_paths):
+        if rp and os.path.exists(rp):
+            state.add_ref_image(rp, pinned=rp in pinned, slot=slot)
 
     state.fixed_prompt = saved.get("fixed_prompt", "")
     ps = saved.get("prompt_sections")
@@ -2517,12 +2648,17 @@ def start_generate():
     img_cfg = {"aspect_ratio": aspect}
     if "gemini-3" in model:
         img_cfg["image_size"] = resolution
+    # ref_payloads is slot-indexed: position N-1 holds the bytes for [Image N],
+    # or None for an empty slot. build_user_parts resolves [Image N] against it.
     ref_snapshots = state.get_effective_ref_images(model)
-    ref_payloads = [state.ref_image_to_bytes(r) for r in ref_snapshots]
+    ref_payloads = [
+        state.ref_image_to_bytes(r) if r is not None else None
+        for r in ref_snapshots
+    ]
     ref_paths = list(state.ref_path_list)
     pinned_ref_paths = [
         p for i, p in enumerate(state.ref_path_list)
-        if i < len(state.ref_pinned) and state.ref_pinned[i]
+        if p and i < len(state.ref_pinned) and state.ref_pinned[i]
     ]
     fixed_prompt_snapshot = state.fixed_prompt
     prompt_sections_snapshot = list(state.prompt_sections)
@@ -2673,6 +2809,8 @@ def new_project():
     # Clear refs + close PIL handles (under ref_lock)
     with state.ref_lock:
         for img in state.ref_images:
+            if img is None:
+                continue
             try: img.close()
             except Exception: pass
         state.ref_images.clear()

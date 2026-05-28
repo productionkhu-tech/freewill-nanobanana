@@ -561,7 +561,7 @@ function updateRemovePromptBtn() {
 }
 
 function resetSetup() {
-  document.getElementById("modelSelect").value = "gemini-3-pro-image-preview";
+  document.getElementById("modelSelect").value = "gemini-3-pro-image";
   // Close the mention menu if it was open over a box we're about to wipe —
   // otherwise the menu keeps referencing a detached textarea and the next
   // keystroke throws because mentionTarget.textarea is no longer in the DOM.

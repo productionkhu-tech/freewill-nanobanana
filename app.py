@@ -26,6 +26,22 @@ from google import genai
 from google.genai import types
 
 
+# Google renamed the preview Gemini image-generation models to GA names
+# (dropped the "-preview" suffix). Map the old names to the current ones so
+# saved projects, gallery items, and stored settings from earlier builds keep
+# working — without this, loading an old project would set state.model to a
+# name Gemini now 404s on. Applied wherever we set `state.model` from any
+# externally-sourced string.
+_MODEL_RENAMES = {
+    "gemini-3-pro-image-preview": "gemini-3-pro-image",
+    "gemini-3.1-flash-image-preview": "gemini-3.1-flash-image",
+}
+def _normalize_model_name(m):
+    if not isinstance(m, str):
+        return m
+    return _MODEL_RENAMES.get(m, m)
+
+
 def _to_display_image(img):
     """Normalize a PIL image for in-app display / storage while PRESERVING
     the alpha channel if present. Used for reference images and generated
@@ -172,7 +188,7 @@ class AppState:
         self.gallery_columns = 2
 
         # Settings
-        self.model = "gemini-3-pro-image-preview"
+        self.model = "gemini-3-pro-image"
         self.aspect = "16:9"
         self.resolution = "4K"
         self.count = 1
@@ -1099,7 +1115,7 @@ class AppState:
             return False, "Invalid project file"
 
         ui = data.get("ui_state", {})
-        self.model = ui.get("model", self.model)
+        self.model = _normalize_model_name(ui.get("model", self.model))
         self.aspect = ui.get("aspect", self.aspect)
         self.resolution = ui.get("resolution", self.resolution)
         # Tolerant parse — older projects sometimes have count="" which would
@@ -1243,7 +1259,11 @@ class AppState:
 
     # --- Generation ---
     def get_default_thinking_config(self, model):
-        if model != "gemini-3.1-flash-image-preview":
+        # Tolerate both the GA name and any leftover -preview string flowing
+        # in from a stale snapshot — _normalize_model_name handles new sets,
+        # but in-flight jobs queued before this build's restart might carry
+        # the old name.
+        if _normalize_model_name(model) != "gemini-3.1-flash-image":
             return None
         try:
             return types.ThinkingConfig(thinking_level="high")
@@ -1965,7 +1985,10 @@ def update_settings():
     for k in ("model", "aspect", "resolution", "fixed_prompt",
               "naming_prefix", "naming_delimiter", "naming_index_prefix"):
         if k in d and d[k] is not None:
-            setattr(state, k, str(d[k]))
+            v = str(d[k])
+            if k == "model":
+                v = _normalize_model_name(v)
+            setattr(state, k, v)
     if "count" in d:
         # Clamp to the valid UI range so a rogue client can't brick the dropdown
         state.count = _safe_int(d.get("count"), state.count, lo=1, hi=10)
@@ -2545,7 +2568,7 @@ def load_setup():
     if not saved:
         return jsonify({"ok": False, "error": "No saved setup"})
 
-    state.model = saved.get("model", state.model)
+    state.model = _normalize_model_name(saved.get("model", state.model))
     state.aspect = saved.get("aspect", state.aspect)
     state.resolution = saved.get("resolution", state.resolution)
     state.count = int(saved.get("count", 1))
@@ -2833,7 +2856,7 @@ def new_project():
     # Reset prompts + settings to defaults
     state.fixed_prompt = ""
     state.prompt_sections = [""]
-    state.model = "gemini-3-pro-image-preview"
+    state.model = "gemini-3-pro-image"
     state.aspect = "16:9"
     state.resolution = "4K"
     state.count = 1

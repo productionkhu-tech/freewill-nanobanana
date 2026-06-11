@@ -436,7 +436,7 @@ const MODEL_SPECS = {
   },
   "gemini-3.1-flash-image": {
     aspects: ["auto","1:1","2:3","3:2","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1"],
-    resolutions: ["0.5K","1K","2K","4K"],
+    resolutions: ["512px","1K","2K","4K"],
     counts: ["1","2","3","4","5","6","7","8","9","10"],
     showQuality: false,
     defaultAspect: "16:9", defaultResolution: "2K",
@@ -454,8 +454,9 @@ const MODEL_SPECS = {
   },
 };
 
-// Old saved resolution tokens -> current. "512px" was renamed to "0.5K".
-const _RES_MIGRATIONS = { "512px": "0.5K" };
+// The Gemini API token is "512px" (NOT "0.5K" — verified: 0.5K returns 400).
+// v2026-06-12 01/02 shipped the wrong "0.5K" token; migrate it back here.
+const _RES_MIGRATIONS = { "0.5K": "512px" };
 function migrateResolution(r) { return _RES_MIGRATIONS[r] || r; }
 
 // 옛 -preview 이름이 들어오면 자동 치환.
@@ -491,7 +492,7 @@ function repopulateSelect(id, values, preferred, fallback) {
 
 function applyModelSpec(model, preserved) {
   const spec = getModelSpec(model);
-  // H8: migrate legacy resolution tokens (512px -> 0.5K) before matching.
+  // H8: migrate the wrong "0.5K" token (shipped v1201/02) back to "512px".
   const prefRes = preserved ? migrateResolution(preserved.resolution) : undefined;
   repopulateSelect("aspectSelect",     spec.aspects,     preserved?.aspect, spec.defaultAspect);
   repopulateSelect("resolutionSelect", spec.resolutions, prefRes,           spec.defaultResolution);
@@ -528,6 +529,7 @@ function onModelChange() {
 let _customLockOn = true;
 let _customDebounce = null;
 let _customRatio = null;   // proportion held while ratio-lock is on
+let _lastRefDims;          // last seen slot-1 "WxH" (undefined=startup, null=none)
 
 function _cCeil16(n){ return Math.max(16, Math.ceil(n/16)*16); }
 function _cFloor16(n){ return Math.max(16, Math.floor(n/16)*16); }
@@ -605,6 +607,24 @@ function _customDebouncedSave() {
   _customDebounce = setTimeout(() => { updateCustomPreview(); saveSettings(); }, 200);
 }
 
+// Auto-follow reference slot 1: when it's added/changed/removed while Custom is
+// active, sync W/H to its REAL dimensions (no manual "ref" chip click needed).
+// The first call after startup only RECORDS the dims, so a restored/typed
+// custom value isn't clobbered on load — only genuine ref changes re-fill.
+function _applyCustomRefFill(refs) {
+  const first = (refs || []).find(r => !r.empty && r.w > 0 && r.h > 0);
+  const key = first ? (first.w + "x" + first.h) : null;
+  if (_lastRefDims === undefined) { _lastRefDims = key; return; }  // startup: record only
+  if (key === _lastRefDims) return;                                // unchanged: don't clobber
+  _lastRefDims = key;
+  if (!first || !customSizeActive()) return;                       // removed / not in Custom
+  const wEl = document.getElementById("customW"), hEl = document.getElementById("customH");
+  if (!wEl || !hEl) return;
+  wEl.value = first.w; hEl.value = first.h;
+  _customRatio = first.w / first.h;
+  updateCustomPreview(); saveSettings();
+}
+
 function initCustomSize() {
   const wEl = document.getElementById("customW"), hEl = document.getElementById("customH");
   const lock = document.getElementById("customLock");
@@ -644,6 +664,7 @@ function initCustomSize() {
       if (first) {
         wEl.value = first.w; hEl.value = first.h;
         _customRatio = first.w / first.h;
+        _lastRefDims = first.w + "x" + first.h;   // keep auto-follow tracker in sync
         updateCustomPreview(); saveSettings();
         return;
       }
@@ -1348,6 +1369,8 @@ async function refreshRefs() {
   refSlotCount = d.slot_count || (d.refs ? d.refs.length : 0);
   refFilledSlots = new Set();
   (d.refs || []).forEach((ref, i) => { if (!ref.empty) refFilledSlots.add(i + 1); });
+  // Auto-follow slot-1 dimensions into the Custom inputs (no chip click needed).
+  if (typeof _applyCustomRefFill === "function") _applyCustomRefFill(d.refs);
   // A ref slot just changed (add/delete/reorder). Re-sync every prompt
   // mention to slot state: [Image N] de-activates to @imageN text when slot N
   // is empty, @imageN re-activates to [Image N] when slot N is filled. The

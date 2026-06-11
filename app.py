@@ -3073,7 +3073,10 @@ def start_generate():
         if aspect and aspect != "auto" and _gemini_aspect_ok(model, aspect):
             img_cfg["aspect_ratio"] = aspect
         if "gemini-3" in model:
-            img_cfg["image_size"] = resolution
+            # The Gemini API token is "512px", not "0.5K". v1201/02 shipped the
+            # wrong token; translate it here so even a project saved with "0.5K"
+            # (loaded straight into state) can't send the 400-causing value.
+            img_cfg["image_size"] = "512px" if resolution == "0.5K" else resolution
     ref_paths = list(state.ref_path_list)
     pinned_ref_paths = [
         p for i, p in enumerate(state.ref_path_list)

@@ -616,12 +616,20 @@ function _applyCustomRefFill(refs) {
   const key = first ? (first.w + "x" + first.h) : null;
   if (_lastRefDims === undefined) { _lastRefDims = key; return; }  // startup: record only
   if (key === _lastRefDims) return;                                // unchanged: don't clobber
+  const hadRef = (_lastRefDims !== null);
   _lastRefDims = key;
-  if (!first || !customSizeActive()) return;                       // removed / not in Custom
+  if (!customSizeActive()) return;
   const wEl = document.getElementById("customW"), hEl = document.getElementById("customH");
   if (!wEl || !hEl) return;
-  wEl.value = first.w; hEl.value = first.h;
-  _customRatio = first.w / first.h;
+  if (first) {                       // ref added/changed -> follow its dimensions
+    wEl.value = first.w; hEl.value = first.h;
+    _customRatio = first.w / first.h;
+  } else if (hadRef) {               // last ref just removed -> reset to default 1024x1024
+    wEl.value = 1024; hEl.value = 1024;
+    _customRatio = 1;
+  } else {
+    return;
+  }
   updateCustomPreview(); saveSettings();
 }
 

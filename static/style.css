@@ -357,7 +357,7 @@ textarea.prompt-box { min-height: 82px; }
   background: rgba(100, 210, 255, 0.04);
 }
 .custom-row { display: flex; align-items: flex-end; gap: 8px; }
-.custom-field { flex: 1; }
+.custom-field { flex: 1; min-width: 0; }
 .custom-field input {
   width: 100%; height: 32px; font-size: 12px; border-radius: 6px;
   border: 1px solid var(--border, #2a2a32);
@@ -377,14 +377,36 @@ textarea.prompt-box { min-height: 82px; }
 .custom-send.adjusted { color: #FFC857; }
 .custom-status { margin-top: 3px; font-size: 10px; color: var(--text3); min-height: 13px; transition: color 0.15s; }
 .custom-status.adjusted { color: #FF7B72; }
-.custom-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
-.custom-chip {
-  font-size: 10px; padding: 3px 8px; border-radius: 11px;
-  border: 1px solid var(--border, #2a2a32); background: transparent;
-  color: var(--text2); cursor: pointer; transition: background 0.12s, border-color 0.12s;
+/* Two action buttons (fetch reference size / max resolution) side by side */
+.custom-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 10px; }
+.custom-ref-btn {
+  display: block; width: 100%;
+  padding: 7px 6px; font-size: 11px; font-weight: bold; text-align: center;
+  border-radius: 7px; cursor: pointer; white-space: nowrap; overflow: hidden;
+  border: 1px solid #64D2FF66; background: rgba(100,210,255,0.08); color: #64D2FF;
+  transition: background 0.12s, border-color 0.12s, opacity 0.12s;
 }
-.custom-chip:hover { background: rgba(100,210,255,0.1); border-color: #64D2FF55; }
-#customRefChip { color: #64D2FF; border-color: #64D2FF44; }
+.custom-ref-btn:hover:not(:disabled) { background: rgba(100,210,255,0.16); border-color: #64D2FF; }
+.custom-ref-btn:disabled { opacity: 0.35; cursor: default; color: var(--text3); border-color: var(--border, #2a2a32); background: transparent; }
+.custom-chips-label { font-size: 9px; color: var(--text3); margin: 11px 0 5px; }
+/* 3-column grid that lines up with the Aspect/Resolution/Count grid above —
+   9 presets fall into a clean 3x3 and never overflow at any window width. */
+.custom-chips {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+}
+.custom-chip {
+  height: 27px; min-width: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10.5px; font-weight: 600; white-space: nowrap; overflow: hidden;
+  border-radius: 6px;
+  border: 1px solid var(--border, #2a2a32);
+  background: var(--bg2, rgba(255,255,255,0.025));
+  color: var(--text2); cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.custom-chip:hover { background: rgba(100,210,255,0.12); border-color: #64D2FF66; color: #64D2FF; }
 
 /* Folder row */
 .folder-row {

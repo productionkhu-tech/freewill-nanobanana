@@ -91,9 +91,9 @@ def _gpt2_compute_size(ar, resolution):
         h = _up16(w / 3.0)
     elif h > w and h / float(w) > 3.0:
         w = _up16(h / 3.0)
-    while w * h > _GPT2_MAX_PX:                          # shrink to pixel cap
-        if w >= h: w = _dn16(w - 1)
-        else:      h = _dn16(h - 1)
+    if w * h > _GPT2_MAX_PX:                             # scale down proportionally
+        s = math.sqrt(_GPT2_MAX_PX / float(w * h))
+        w, h = _dn16(w * s), _dn16(h * s)
     while w * h < _GPT2_MIN_PX:                          # grow (ceil) to pixel floor
         if w <= h: w = _up16(w + 1)
         else:      h = _up16(h + 1)
@@ -169,11 +169,13 @@ def _gpt2_custom_size(w, h):
         w = max(16, int(w * s)); h = max(16, int(h * s)); notes.append("edge")
     # 3) 16-align (nearest)
     w, h = _r16(w), _r16(h)
-    # 4) max pixels — shrink the LONG edge (floor) until within cap
-    while w * h > _GPT2_MAX_PX:
-        if w >= h: w = _dn16(w - 1)
-        else:      h = _dn16(h - 1)
-        if "maxpx" not in notes: notes.append("maxpx")
+    # 4) max pixels — scale BOTH edges down proportionally (preserve ratio),
+    #    then floor to 16. (Shrinking only the long edge would drift the ratio,
+    #    e.g. 3840x2880 4:3 -> 2880x2880 1:1.)
+    if w * h > _GPT2_MAX_PX:
+        s = math.sqrt(_GPT2_MAX_PX / float(w * h))
+        w, h = _dn16(w * s), _dn16(h * s)
+        notes.append("maxpx")
     # 5) min pixels — grow the SHORT edge (ceil) until within floor
     while w * h < _GPT2_MIN_PX:
         if w <= h: w = _up16(w + 1)

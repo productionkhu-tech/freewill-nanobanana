@@ -128,17 +128,17 @@
         </div>
         <div id="customSend" class="custom-send empty">W·H를 입력하세요</div>
         <div id="customStatus" class="custom-status"></div>
+        <div class="custom-actions">
+          <button type="button" id="customRefBtn" class="custom-ref-btn">🖼 레퍼런스 크기</button>
+          <button type="button" id="customMaxBtn" class="custom-ref-btn" title="현재 비율 유지하고 최대 화질로">⬆ 최대 화질</button>
+        </div>
+        <div class="custom-chips-label">시네마 비율 (드롭다운에 없는 특수비율)</div>
         <div class="custom-chips">
-          <button type="button" class="custom-chip" data-ar="2.39" title="시네마스코프(현대)">2.39:1</button>
-          <button type="button" class="custom-chip" data-ar="2.35" title="시네마스코프(클래식)">2.35:1</button>
-          <button type="button" class="custom-chip" data-ar="2.31">2.31:1</button>
-          <button type="button" class="custom-chip" data-ar="1.85" title="극장 와이드">1.85:1</button>
-          <button type="button" class="custom-chip" data-ar="1.7778">16:9</button>
-          <button type="button" class="custom-chip" data-ar="1.43" title="IMAX">1.43:1</button>
-          <button type="button" class="custom-chip" data-ar="1.3333">1.33:1</button>
-          <button type="button" class="custom-chip" data-ar="1">1:1</button>
-          <button type="button" class="custom-chip" data-ar="0.8">4:5</button>
-          <button type="button" class="custom-chip" id="customRefChip" data-ref="1">ref 1번</button>
+          <button type="button" class="custom-chip" data-ar="2.39" data-frac="239:100" title="시네마스코프(현대)">2.39:1</button>
+          <button type="button" class="custom-chip" data-ar="2.35" data-frac="47:20" title="시네마스코프(클래식)">2.35:1</button>
+          <button type="button" class="custom-chip" data-ar="2.31" data-frac="231:100" title="70mm 근접">2.31:1</button>
+          <button type="button" class="custom-chip" data-ar="1.85" data-frac="37:20" title="극장 와이드(플랫)">1.85:1</button>
+          <button type="button" class="custom-chip" data-ar="1.43" data-frac="10:7" title="IMAX(근사 10:7)">1.43:1</button>
         </div>
       </div>
 

@@ -530,10 +530,34 @@ let _customLockOn = true;
 let _customDebounce = null;
 let _customRatio = null;   // proportion held while ratio-lock is on
 let _lastRefDims;          // last seen slot-1 "WxH" (undefined=startup, null=none)
+let _customUserEdited = false;  // user typed/preset a deliberate size -> stop auto-following refs
+let _customFrac = null;    // exact ratio "p:q" from the last preset click (null = free input)
 
 function _cCeil16(n){ return Math.max(16, Math.ceil(n/16)*16); }
 function _cFloor16(n){ return Math.max(16, Math.floor(n/16)*16); }
 function _cRound16(n){ return Math.max(16, Math.round(n/16)*16); }
+function _cGcd(a,b){ a=Math.abs(Math.round(a)); b=Math.abs(Math.round(b)); while(b){ const t=a%b; a=b; b=t; } return a||1; }
+function _cLcm(a,b){ return a/_cGcd(a,b)*b; }
+// Largest WxH at EXACTLY ratio p:q (both 16-multiples) within every gpt-image-2
+// cap (edge<=3840, pixels<=8.29M, ratio<=3:1). Returns [W,H] or null.
+function _customMaxAtRatio(p, q) {
+  const g=_cGcd(p,q); p=p/g; q=q/g;
+  if (p > 3*q) { p=3; q=1; } else if (q > 3*p) { p=1; q=3; }   // clamp to <=3:1
+  const t0=_cLcm(16/_cGcd(16,p), 16/_cGcd(16,q));
+  let best=null;
+  for (let m=1; m<100000; m++) {
+    const t=t0*m, W=p*t, H=q*t;
+    if (Math.max(W,H) > 3840 || W*H > 8294400) break;
+    best=[W,H];
+  }
+  return best;
+}
+// Clean ratio label: "16:9"/"4:3" for named ratios, else "2.353:1" decimal.
+function _ratioLabel(w, h) {
+  const g = _cGcd(w, h), p = w / g, q = h / g;
+  if (p <= 21 && q <= 21) return `${p}:${q}`;
+  return `${(Math.max(w, h) / Math.min(w, h)).toFixed(3)}:1`;
+}
 
 // Live-preview mirror of app.py `_gpt2_custom_size`. The server re-corrects on
 // send (double-correction), so this is advisory only — but matches the backend.
@@ -551,8 +575,11 @@ function gpt2CustomSize(w, h) {
   const aw = _cRound16(w), ah = _cRound16(h);
   if ((aw !== w || ah !== h) && !notes.length) notes.push("16배수 정렬");
   w = aw; h = ah;
-  while (w*h > 8294400) { if (w>=h) w=_cFloor16(w-1); else h=_cFloor16(h-1);
-    if (!notes.includes("최대픽셀 축소")) notes.push("최대픽셀 축소"); }
+  if (w*h > 8294400) {            // scale BOTH down proportionally (keep ratio)
+    const s = Math.sqrt(8294400 / (w*h));
+    w = _cFloor16(w*s); h = _cFloor16(h*s);
+    notes.push("최대픽셀 축소");
+  }
   while (w*h < 655360) { if (w<=h) w=_cCeil16(w+1); else h=_cCeil16(h+1);
     if (!notes.includes("최소픽셀 확대")) notes.push("최소픽셀 확대"); }
   if (w > 3*h) h = _cCeil16(w/3);
@@ -573,11 +600,10 @@ function updateCustomPreview() {
     return;
   }
   const { w, h, notes } = gpt2CustomSize(rw, rh);
-  const ratio = (Math.max(w,h)/Math.min(w,h)).toFixed(3);
   send.textContent = `→ 전송: ${w} × ${h}`;
   send.className = "custom-send" + (notes.length ? " adjusted" : " ok");
   if (status) {
-    status.textContent = `${ratio}:1 · ${_fmtPx(w*h)} · ` + (notes.length ? "⚠ " + notes.join(", ") : "✓ valid");
+    status.textContent = `${_ratioLabel(w, h)} · ${_fmtPx(w*h)} · ` + (notes.length ? "⚠ " + notes.join(", ") : "✓ valid");
     status.className = "custom-status" + (notes.length ? " adjusted" : " ok");
   }
 }
@@ -613,11 +639,16 @@ function _customDebouncedSave() {
 // custom value isn't clobbered on load — only genuine ref changes re-fill.
 function _applyCustomRefFill(refs) {
   const first = (refs || []).find(r => !r.empty && r.w > 0 && r.h > 0);
+  const refBtn = document.getElementById("customRefBtn");   // grey out when no ref present
+  if (refBtn) refBtn.disabled = !first;
   const key = first ? (first.w + "x" + first.h) : null;
   if (_lastRefDims === undefined) { _lastRefDims = key; return; }  // startup: record only
   if (key === _lastRefDims) return;                                // unchanged: don't clobber
   const hadRef = (_lastRefDims !== null);
   _lastRefDims = key;
+  // A deliberate user value (typed or preset) is NEVER clobbered by a ref change.
+  // Use the "ref" chip to opt back into following the reference.
+  if (_customUserEdited) return;
   if (!customSizeActive()) return;
   const wEl = document.getElementById("customW"), hEl = document.getElementById("customH");
   if (!wEl || !hEl) return;
@@ -641,10 +672,12 @@ function initCustomSize() {
   wEl.addEventListener("focus", capRatio);
   hEl.addEventListener("focus", capRatio);
   wEl.addEventListener("input", () => {
+    _customUserEdited = true; _customFrac = null;   // free typing -> not a preset ratio
     if (_customLockOn && _customRatio) hEl.value = _cRound16(Number(wEl.value) / _customRatio);
     _customDebouncedSave();
   });
   hEl.addEventListener("input", () => {
+    _customUserEdited = true; _customFrac = null;
     if (_customLockOn && _customRatio) wEl.value = _cRound16(Number(hEl.value) * _customRatio);
     _customDebouncedSave();
   });
@@ -655,21 +688,26 @@ function initCustomSize() {
   });
   document.querySelectorAll(".custom-chip[data-ar]").forEach(chip => {
     chip.addEventListener("click", () => {
-      const ar = Number(chip.dataset.ar);
-      const w = Number(wEl.value) || 2048;
-      hEl.value = _cRound16(w / ar);
-      _customRatio = ar;
+      _customUserEdited = true;
+      _customFrac = chip.dataset.frac || null;
+      // Preset click = the MAX valid size at that EXACT ratio (one click, never
+      // over-cap, no second "최대 화질" press needed).
+      const fr = (_customFrac || "1:1").split(":").map(Number);
+      const best = _customMaxAtRatio(fr[0], fr[1]);
+      if (best) { wEl.value = best[0]; hEl.value = best[1]; _customRatio = best[0] / best[1]; }
       updateCustomPreview(); saveSettings();
     });
   });
-  const refChip = document.getElementById("customRefChip");
-  if (refChip) refChip.addEventListener("click", async () => {
+  const refBtn = document.getElementById("customRefBtn");
+  if (refBtn) refBtn.addEventListener("click", async () => {
     // Pull the FIRST filled slot's ORIGINAL dimensions from the backend
     // (the thumbnail's naturalWidth would be the resized preview, not the ref).
     try {
       const d = await api("/api/refs");
       const first = (d.refs || []).find(r => !r.empty && r.w > 0 && r.h > 0);
       if (first) {
+        _customUserEdited = false;   // "match reference" -> opt back into auto-follow
+        _customFrac = null;          // ref dims aren't a preset ratio -> let "최대 화질" derive the ratio from these real dims
         wEl.value = first.w; hEl.value = first.h;
         _customRatio = first.w / first.h;
         _lastRefDims = first.w + "x" + first.h;   // keep auto-follow tracker in sync
@@ -678,6 +716,24 @@ function initCustomSize() {
       }
     } catch (e) {}
     showToast("레퍼런스 슬롯 1이 비어있어요", "info");
+  });
+  // "⬆ 최대 화질": fill W/H with the largest valid size at the CURRENT exact ratio.
+  const maxBtn = document.getElementById("customMaxBtn");
+  if (maxBtn) maxBtn.addEventListener("click", () => {
+    let p, q;
+    if (_customFrac) {
+      [p, q] = _customFrac.split(":").map(Number);   // exact ratio from a preset
+    } else {
+      const w = Number(wEl.value), h = Number(hEl.value);
+      if (!(w > 0 && h > 0)) { showToast("W·H를 먼저 입력하세요", "info"); return; }
+      p = w; q = h;                                   // exact ratio from the typed values
+    }
+    const best = _customMaxAtRatio(p, q);
+    if (!best) { showToast("계산할 수 없는 비율이에요", "error"); return; }
+    _customUserEdited = true;
+    wEl.value = best[0]; hEl.value = best[1];
+    _customRatio = best[0] / best[1];
+    updateCustomPreview(); saveSettings();
   });
   // Toggle the wrap when the user switches to/from the Custom aspect.
   const asp = document.getElementById("aspectSelect");
@@ -1866,8 +1922,21 @@ async function refreshGallery() {
     const meta = document.createElement("div");
     meta.className = "card-meta";
     const parts = [];
-    if (item.resolution) parts.push(item.resolution);
-    if (item.aspect) parts.push(item.aspect);
+    if (item.aspect === "custom") {
+      // Custom: show the real output pixels + ratio (the "4K"/"custom" labels are vague).
+      const gs = item.generation_settings || {};
+      const cw = Number(gs.custom_w), ch = Number(gs.custom_h);
+      if (cw > 0 && ch > 0) {
+        const c = gpt2CustomSize(cw, ch);   // mirrors the server correction = actual output size
+        parts.push(`${c.w}×${c.h}`);
+        parts.push(`${(Math.max(c.w, c.h) / Math.min(c.w, c.h)).toFixed(2)}:1`);
+      } else {
+        parts.push("custom");
+      }
+    } else {
+      if (item.resolution) parts.push(item.resolution);
+      if (item.aspect) parts.push(item.aspect);
+    }
     if (item.timestamp) {
       const dt = new Date(item.timestamp * 1000);
       parts.push(dt.toLocaleString("ko-KR", {

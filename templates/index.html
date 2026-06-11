@@ -19,6 +19,7 @@
     <div class="api-status">
       <span id="vertexDot" class="dot"></span><span class="status-label">Vertex</span>
       <span id="studioDot" class="dot"></span><span class="status-label">Studio</span>
+      <span id="openaiDot" class="dot"></span><span class="status-label">OpenAI</span>
     </div>
     <button id="topGenBtn" class="btn-accent" onclick="generate()">Generate</button>
     <button id="alwaysOnTopBtn" class="pin-btn" onclick="toggleAlwaysOnTop()" title="Always on top">&#128204;</button>
@@ -36,8 +37,9 @@
         <option value="gemini-2.5-flash-image">gemini-2.5-flash-image</option>
         <option value="gemini-3-pro-image" selected>gemini-3-pro-image</option>
         <option value="gemini-3.1-flash-image">gemini-3.1-flash-image</option>
+        <option value="gpt-image-2">gpt-image-2 (OpenAI)</option>
       </select>
-      <p class="hint">10 RPM limit &mdash; auto-throttled to ~8 RPM</p>
+      <p class="hint" id="modelHint">10 RPM limit &mdash; auto-throttled to ~8 RPM</p>
 
       <!-- Prompt -->
       <div class="section-title">Prompt</div>
@@ -102,6 +104,36 @@
             <option>1</option><option>2</option><option>3</option><option>4</option><option>5</option>
             <option>6</option><option>7</option><option>8</option><option>9</option><option>10</option>
           </select>
+        </div>
+        <div id="qualityWrap" style="display:none">
+          <label class="field-label">Quality</label>
+          <select id="qualitySelect">
+            <option>low</option><option>medium</option><option selected>high</option><option>auto</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- GPT-2 Custom pixel input (shown only when Aspect = Custom) -->
+      <div id="customSizeWrap" style="display:none">
+        <div class="custom-row">
+          <div class="custom-field">
+            <label class="field-label">Width</label>
+            <input type="number" id="customW" min="16" max="99999" step="16" placeholder="예: 2400">
+          </div>
+          <button type="button" id="customLock" class="custom-lock on" title="비율 잠금 (W·H 같이 움직임)">🔗</button>
+          <div class="custom-field">
+            <label class="field-label">Height</label>
+            <input type="number" id="customH" min="16" max="99999" step="16" placeholder="예: 1080">
+          </div>
+        </div>
+        <div id="customSend" class="custom-send empty">W·H를 입력하세요</div>
+        <div id="customStatus" class="custom-status"></div>
+        <div class="custom-chips">
+          <button type="button" class="custom-chip" data-ar="2.35" title="시네마스코프">2.35:1</button>
+          <button type="button" class="custom-chip" data-ar="1.7778">16:9</button>
+          <button type="button" class="custom-chip" data-ar="0.8">4:5</button>
+          <button type="button" class="custom-chip" data-ar="1">1:1</button>
+          <button type="button" class="custom-chip" id="customRefChip" data-ref="1">ref 1번</button>
         </div>
       </div>
 

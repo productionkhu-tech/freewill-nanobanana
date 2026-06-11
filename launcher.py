@@ -856,7 +856,9 @@ def main():
         except Exception as e:
             print(f"  Update check: {e}")
 
-    threading.Thread(target=_bg_update_check, daemon=True).start()
+    # NanoGPT 프로토타입 (오프라인 전용) — GitHub 릴리스 채널 없음. 자동
+    # 업데이트 체크 비활성. _bg_update_check 함수는 정의만 남기고 쓰레드는 안 띄움.
+    # threading.Thread(target=_bg_update_check, daemon=True).start()
 
     # Start Flask server
     print(f"  Starting server on {APP_URL}")

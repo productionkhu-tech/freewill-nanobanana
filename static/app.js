@@ -337,9 +337,23 @@ async function loadSettings() {
   const d = await api("/api/settings");
   if (!d.model) return;
   document.getElementById("modelSelect").value = d.model;
-  document.getElementById("aspectSelect").value = d.aspect;
-  document.getElementById("resolutionSelect").value = d.resolution;
-  document.getElementById("countSelect").value = String(d.count);
+  // 저장된 값을 적용하기 전에 모델 스펙으로 드롭다운을 먼저 재구성 — 그래야
+  // 저장된 옵션(GPT-2 quality 등)이 <select>에 실제로 존재함.
+  applyModelSpec(d.model, {
+    aspect: d.aspect,
+    resolution: d.resolution,
+    count: String(d.count),
+    quality: d.quality || "high",
+  });
+  // H7: applyModelSpec() above already populated AND selected each dropdown
+  // (loaded value, else this model's default). Raw-setting .value here would
+  // bypass that fallback and blank out any value the model no longer offers
+  // (e.g. an old 2.5-flash project saved at 4K). So we intentionally don't.
+  // Restore Custom pixel inputs (raw user values) then re-toggle the wrap.
+  const cwEl = document.getElementById("customW"), chEl = document.getElementById("customH");
+  if (cwEl) cwEl.value = d.custom_w || 1024;
+  if (chEl) chEl.value = d.custom_h || 1024;
+  if (typeof toggleCustomWrap === "function") toggleCustomWrap();
   document.getElementById("folderInput").value = d.output_dir;
   document.getElementById("fixedPrompt").value = d.fixed_prompt || "";
   document.getElementById("namingSwitch").checked = d.naming_enabled;
@@ -369,10 +383,14 @@ function scheduleSettingsSave() {
 async function saveSettings() {
   const sections = [];
   document.querySelectorAll(".prompt-section-box").forEach(el => sections.push(el.value));
+  const qs = document.getElementById("qualitySelect");
   const r = await api("/api/settings", { method: "POST", body: {
     model: document.getElementById("modelSelect").value,
     aspect: document.getElementById("aspectSelect").value,
     resolution: document.getElementById("resolutionSelect").value,
+    quality: qs ? qs.value : "high",
+    custom_w: parseInt(document.getElementById("customW")?.value) || 1024,
+    custom_h: parseInt(document.getElementById("customH")?.value) || 1024,
     count: parseInt(document.getElementById("countSelect").value),
     output_dir: document.getElementById("folderInput").value,
     fixed_prompt: document.getElementById("fixedPrompt").value,
@@ -391,15 +409,252 @@ async function saveSettings() {
   }
 }
 
+// ==========================================
+// Per-model dropdown spec (GPT Image 2 support)
+// ==========================================
+// aspects[0] === "auto" is the UI sentinel (shown as "Auto"); its select value
+// is the lowercase "auto" the backend keys on. defaultAspect/Resolution are the
+// value SELECTED by default and the fallback when a loaded value isn't offered.
+const MODEL_SPECS = {
+  "gemini-2.5-flash-image": {
+    aspects: ["auto","1:1","2:3","3:2","3:4","4:3","4:5","5:4","9:16","16:9","21:9"],
+    resolutions: ["1K"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: false,
+    defaultAspect: "16:9", defaultResolution: "1K",
+    hint: "10 RPM limit — auto-throttled to ~8 RPM",
+    refHint: "Flash model supports up to 3 reference images.",
+  },
+  "gemini-3-pro-image": {
+    aspects: ["auto","1:1","2:3","3:2","3:4","4:3","4:5","5:4","9:16","16:9","21:9"],
+    resolutions: ["1K","2K","4K"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: false,
+    defaultAspect: "16:9", defaultResolution: "2K",
+    hint: "10 RPM limit — auto-throttled to ~8 RPM",
+    refHint: "3rd-gen models support up to 14 reference images.",
+  },
+  "gemini-3.1-flash-image": {
+    aspects: ["auto","1:1","2:3","3:2","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1"],
+    resolutions: ["0.5K","1K","2K","4K"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: false,
+    defaultAspect: "16:9", defaultResolution: "2K",
+    hint: "10 RPM limit — auto-throttled to ~8 RPM",
+    refHint: "3rd-gen models support up to 14 reference images.",
+  },
+  "gpt-image-2": {
+    aspects: ["auto","1:1","3:2","2:3","4:3","3:4","4:5","5:4","16:9","9:16","21:9","9:21","3:1","1:3","custom"],
+    resolutions: ["1K","2K","4K"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: true,
+    defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "high",
+    hint: "OpenAI Image API — generation may take up to ~2 min.",
+    refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
+  },
+};
+
+// Old saved resolution tokens -> current. "512px" was renamed to "0.5K".
+const _RES_MIGRATIONS = { "512px": "0.5K" };
+function migrateResolution(r) { return _RES_MIGRATIONS[r] || r; }
+
+// 옛 -preview 이름이 들어오면 자동 치환.
+const _MODEL_ID_MIGRATIONS = {
+  "gemini-3-pro-image-preview":     "gemini-3-pro-image",
+  "gemini-3.1-flash-image-preview": "gemini-3.1-flash-image",
+};
+function migrateModelId(m) {
+  return _MODEL_ID_MIGRATIONS[m] || m;
+}
+
+function getModelSpec(model) {
+  model = migrateModelId(model);
+  return MODEL_SPECS[model] || MODEL_SPECS["gemini-3-pro-image"];
+}
+
+function repopulateSelect(id, values, preferred, fallback) {
+  const sel = document.getElementById(id);
+  if (!sel) return;
+  const prev = preferred || sel.value;
+  sel.innerHTML = "";
+  values.forEach(v => {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = (v === "auto") ? "Auto" : (v === "custom") ? "Custom" : v;  // sentinels capitalised
+    sel.appendChild(opt);
+  });
+  // H7: prefer the loaded value, else the model's sane default, else last.
+  if (values.includes(prev)) sel.value = prev;
+  else if (fallback && values.includes(fallback)) sel.value = fallback;
+  else sel.value = values[values.length - 1];
+}
+
+function applyModelSpec(model, preserved) {
+  const spec = getModelSpec(model);
+  // H8: migrate legacy resolution tokens (512px -> 0.5K) before matching.
+  const prefRes = preserved ? migrateResolution(preserved.resolution) : undefined;
+  repopulateSelect("aspectSelect",     spec.aspects,     preserved?.aspect, spec.defaultAspect);
+  repopulateSelect("resolutionSelect", spec.resolutions, prefRes,           spec.defaultResolution);
+  repopulateSelect("countSelect",      spec.counts,      preserved?.count);
+  if (spec.showQuality) {
+    repopulateSelect("qualitySelect", ["low","medium","high","auto"], preserved?.quality, spec.defaultQuality || "high");
+    const qw = document.getElementById("qualityWrap");
+    if (qw) qw.style.display = "";
+  } else {
+    const qw = document.getElementById("qualityWrap");
+    if (qw) qw.style.display = "none";
+  }
+  const hintEl = document.getElementById("modelHint");
+  if (hintEl) hintEl.textContent = spec.hint;
+  const isGpt2 = (model === "gpt-image-2");
+  const refHintEl = document.getElementById("refLimitHint");
+  if (refHintEl) {
+    refHintEl.textContent = spec.refHint;
+    refHintEl.classList.toggle("hint-warn", isGpt2);
+  }
+  // Show/hide the Custom pixel inputs for the current model+aspect.
+  if (typeof toggleCustomWrap === "function") toggleCustomWrap();
+}
+
 function onModelChange() {
-  updateRefLimitHint(document.getElementById("modelSelect").value);
+  const model = document.getElementById("modelSelect").value;
+  applyModelSpec(model);
   saveSettings();
 }
 
+// ==========================================
+// GPT-2 Custom pixel input
+// ==========================================
+let _customLockOn = true;
+let _customDebounce = null;
+let _customRatio = null;   // proportion held while ratio-lock is on
+
+function _cCeil16(n){ return Math.max(16, Math.ceil(n/16)*16); }
+function _cFloor16(n){ return Math.max(16, Math.floor(n/16)*16); }
+function _cRound16(n){ return Math.max(16, Math.round(n/16)*16); }
+
+// Live-preview mirror of app.py `_gpt2_custom_size`. The server re-corrects on
+// send (double-correction), so this is advisory only — but matches the backend.
+function gpt2CustomSize(w, h) {
+  w = Math.max(16, Math.round(Number(w) || 0));
+  h = Math.max(16, Math.round(Number(h) || 0));
+  const notes = [];
+  if (w > 3*h) { h = _cCeil16(w/3); notes.push("3:1 클램프"); }
+  else if (h > 3*w) { w = _cCeil16(h/3); notes.push("3:1 클램프"); }
+  if (Math.max(w,h) > 3840) {
+    const s = 3840/Math.max(w,h);
+    w = Math.max(16, Math.floor(w*s)); h = Math.max(16, Math.floor(h*s));
+    notes.push("변 3840 제한");
+  }
+  const aw = _cRound16(w), ah = _cRound16(h);
+  if ((aw !== w || ah !== h) && !notes.length) notes.push("16배수 정렬");
+  w = aw; h = ah;
+  while (w*h > 8294400) { if (w>=h) w=_cFloor16(w-1); else h=_cFloor16(h-1);
+    if (!notes.includes("최대픽셀 축소")) notes.push("최대픽셀 축소"); }
+  while (w*h < 655360) { if (w<=h) w=_cCeil16(w+1); else h=_cCeil16(h+1);
+    if (!notes.includes("최소픽셀 확대")) notes.push("최소픽셀 확대"); }
+  if (w > 3*h) h = _cCeil16(w/3);
+  else if (h > 3*w) w = _cCeil16(h/3);
+  return { w, h, notes };
+}
+
+function _fmtPx(n){ return (n/1e6).toFixed(2) + "M px"; }
+
+function updateCustomPreview() {
+  const wEl = document.getElementById("customW"), hEl = document.getElementById("customH");
+  const send = document.getElementById("customSend"), status = document.getElementById("customStatus");
+  if (!wEl || !hEl || !send) return;
+  const rw = wEl.value.trim(), rh = hEl.value.trim();
+  if (!rw || !rh || Number(rw) <= 0 || Number(rh) <= 0) {
+    send.textContent = "W·H를 입력하세요"; send.className = "custom-send empty";
+    if (status) status.textContent = "";
+    return;
+  }
+  const { w, h, notes } = gpt2CustomSize(rw, rh);
+  const ratio = (Math.max(w,h)/Math.min(w,h)).toFixed(3);
+  send.textContent = `→ 전송: ${w} × ${h}`;
+  send.className = "custom-send" + (notes.length ? " adjusted" : " ok");
+  if (status) {
+    status.textContent = `${ratio}:1 · ${_fmtPx(w*h)} · ` + (notes.length ? "⚠ " + notes.join(", ") : "✓ valid");
+    status.className = "custom-status" + (notes.length ? " adjusted" : " ok");
+  }
+}
+
+function customSizeActive() {
+  const model = document.getElementById("modelSelect").value;
+  const asp = document.getElementById("aspectSelect").value;
+  return model === "gpt-image-2" && asp === "custom";
+}
+
+function toggleCustomWrap() {
+  const wrap = document.getElementById("customSizeWrap");
+  const active = customSizeActive();
+  if (wrap) wrap.style.display = active ? "" : "none";
+  // Resolution is meaningless in custom mode (pixels ARE the resolution).
+  const resSel = document.getElementById("resolutionSelect");
+  if (resSel) {
+    resSel.disabled = active;
+    const box = resSel.closest("div");
+    if (box) box.style.opacity = active ? "0.4" : "";
+  }
+  if (active) updateCustomPreview();
+}
+
+function _customDebouncedSave() {
+  if (_customDebounce) clearTimeout(_customDebounce);
+  _customDebounce = setTimeout(() => { updateCustomPreview(); saveSettings(); }, 200);
+}
+
+function initCustomSize() {
+  const wEl = document.getElementById("customW"), hEl = document.getElementById("customH");
+  const lock = document.getElementById("customLock");
+  if (!wEl || !hEl) return;
+  const capRatio = () => { const w = Number(wEl.value), h = Number(hEl.value); if (w>0 && h>0) _customRatio = w/h; };
+  wEl.addEventListener("focus", capRatio);
+  hEl.addEventListener("focus", capRatio);
+  wEl.addEventListener("input", () => {
+    if (_customLockOn && _customRatio) hEl.value = _cRound16(Number(wEl.value) / _customRatio);
+    _customDebouncedSave();
+  });
+  hEl.addEventListener("input", () => {
+    if (_customLockOn && _customRatio) wEl.value = _cRound16(Number(hEl.value) * _customRatio);
+    _customDebouncedSave();
+  });
+  if (lock) lock.addEventListener("click", () => {
+    _customLockOn = !_customLockOn;
+    lock.classList.toggle("on", _customLockOn);
+    if (_customLockOn) capRatio();
+  });
+  document.querySelectorAll(".custom-chip[data-ar]").forEach(chip => {
+    chip.addEventListener("click", () => {
+      const ar = Number(chip.dataset.ar);
+      const w = Number(wEl.value) || 2048;
+      hEl.value = _cRound16(w / ar);
+      _customRatio = ar;
+      updateCustomPreview(); saveSettings();
+    });
+  });
+  const refChip = document.getElementById("customRefChip");
+  if (refChip) refChip.addEventListener("click", () => {
+    // Best-effort: pull slot-1's natural dimensions from the first ref thumbnail.
+    const img = document.querySelector('#refList img, .ref-slot img, .ref-thumb img, [id^="refSlot"] img');
+    if (img && img.naturalWidth > 0 && img.naturalHeight > 0) {
+      wEl.value = img.naturalWidth; hEl.value = img.naturalHeight;
+      _customRatio = img.naturalWidth / img.naturalHeight;
+      updateCustomPreview(); saveSettings();
+    } else {
+      showToast("레퍼런스 슬롯 1이 비어있어요", "info");
+    }
+  });
+  // Toggle the wrap when the user switches to/from the Custom aspect.
+  const asp = document.getElementById("aspectSelect");
+  if (asp) asp.addEventListener("change", toggleCustomWrap);
+}
+
 function updateRefLimitHint(model) {
-  document.getElementById("refLimitHint").textContent = model === "gemini-2.5-flash-image"
-    ? "Flash model supports up to 3 reference images."
-    : "3rd-gen models support up to 14 reference images.";
+  // 원본 슬롯/멘션 코드가 호출하는 진입점 — spec 기반으로 위임해 일관성 유지.
+  const refHintEl = document.getElementById("refLimitHint");
+  if (refHintEl) refHintEl.textContent = getModelSpec(model).refHint;
 }
 
 // ==========================================
@@ -562,6 +817,7 @@ function updateRemovePromptBtn() {
 
 function resetSetup() {
   document.getElementById("modelSelect").value = "gemini-3-pro-image";
+  applyModelSpec("gemini-3-pro-image");
   // Close the mention menu if it was open over a box we're about to wipe —
   // otherwise the menu keeps referencing a detached textarea and the next
   // keystroke throws because mentionTarget.textarea is no longer in the DOM.
@@ -1523,7 +1779,10 @@ async function refreshGallery() {
     // Refine aspect from the actual image once loaded (handles legacy items
     // missing an `aspect` field).
     img.addEventListener("load", () => {
-      if (!item.aspect && img.naturalWidth > 0 && img.naturalHeight > 0) {
+      // Measure the real ratio when the item has no usable "W:H" aspect —
+      // legacy items (no aspect) AND new "auto" generations both land here.
+      const hasNumericAspect = item.aspect && /^\d+:\d+$/.test(item.aspect);
+      if (!hasNumericAspect && img.naturalWidth > 0 && img.naturalHeight > 0) {
         frame.style.setProperty(
           "--card-ar",
           (img.naturalWidth / img.naturalHeight).toFixed(4)
@@ -1555,8 +1814,15 @@ async function refreshGallery() {
     elapsed.textContent = `${(item.elapsed_sec || 0).toFixed(1)}s`;
     infoRight.appendChild(elapsed);
     const badge = document.createElement("span");
-    badge.className = "api-badge " + (item.api_used === "vertex" ? "vertex" : "studio");
-    badge.textContent = item.api_used === "vertex" ? " [V]" : " [S]";
+    // 3-way: vertex -> [V] green, studio -> [S] yellow, openai -> [G] cyan.
+    const badgeMap = {
+      vertex: { cls: "vertex", text: " [V]" },
+      studio: { cls: "studio", text: " [S]" },
+      openai: { cls: "openai", text: " [G]" },
+    };
+    const bm = badgeMap[item.api_used] || badgeMap.studio;
+    badge.className = "api-badge " + bm.cls;
+    badge.textContent = bm.text;
     infoRight.appendChild(badge);
     infoRow.appendChild(infoRight);
     body.appendChild(infoRow);
@@ -2045,6 +2311,8 @@ async function refreshApiStatus() {
   if (!d.vertex) return;
   document.getElementById("vertexDot").className = "dot " + d.vertex;
   document.getElementById("studioDot").className = "dot " + d.studio;
+  const openaiDot = document.getElementById("openaiDot");
+  if (openaiDot) openaiDot.className = "dot " + (d.openai || "disconnected");
   if (d.is_generating) updateGenUI(true, d.outstanding || 0);
   if (!d.is_generating && isGenerating) { updateGenUI(false, 0); refreshGallery(); }
   if (d.close_requested) showCloseDialog();
@@ -2557,11 +2825,14 @@ function showToast(msg, kind = "info") {
 // ==========================================
 // Auto-save settings on change
 // ==========================================
-["aspectSelect", "resolutionSelect", "countSelect", "namingSwitch",
+["aspectSelect", "resolutionSelect", "countSelect", "qualitySelect", "namingSwitch",
  "namingPrefix", "namingDelimiter", "namingIndexPrefix", "namingPadding"].forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener("change", () => saveSettings());
 });
+
+// Wire the Custom pixel inputs (ratio-lock, presets, ref-grab, live preview).
+initCustomSize();
 
 // ==========================================
 // Close Save Prompt (called from pywebview launcher.py on window close)

@@ -9,6 +9,7 @@ import os
 import io
 import sys
 import json
+import math
 import re
 import subprocess
 
@@ -24,6 +25,170 @@ from flask import Flask, render_template, request, jsonify, send_file, Response
 from PIL import Image, ImageGrab
 from google import genai
 from google.genai import types
+
+try:
+    from openai import OpenAI as _OpenAI
+except Exception:
+    _OpenAI = None
+
+# ==========================================
+# GPT Image 2 config
+# ==========================================
+GPT2_MODEL_ID = "gpt-image-2"
+# 13 explicit aspect ratios exposed for gpt-image-2 (all within the API's 3:1
+# cap). "auto" is a UI sentinel resolved before these are used.
+GPT2_ASPECTS = ["1:1", "3:2", "2:3", "4:3", "3:4", "4:5", "5:4",
+                "16:9", "9:16", "21:9", "9:21", "3:1", "1:3"]
+GPT2_RESOLUTIONS = ["1K", "2K", "4K"]
+GPT2_QUALITIES = ["low", "medium", "high", "auto"]
+
+# OpenAI gpt-image-2 hard constraints (official docs):
+#   16-multiple edges · max edge <= 3840 · long:short <= 3:1 · 655,360..8,294,400 px
+_GPT2_MIN_PX, _GPT2_MAX_PX, _GPT2_MAX_EDGE = 655_360, 8_294_400, 3840
+# Per-tier target pixel budget. 4K is pinned at the API ceiling.
+_GPT2_TARGET_PX = {"1K": 1024 * 1024, "2K": 2048 * 2048, "4K": 8_294_400}
+
+# Officially-listed "Popular sizes" — guaranteed valid, used verbatim on a hit.
+GPT2_OFFICIAL_SIZES = {
+    ("1:1",  "1K"): "1024x1024", ("1:1",  "2K"): "2048x2048",
+    ("3:2",  "1K"): "1536x1024", ("2:3",  "1K"): "1024x1536",
+    ("16:9", "2K"): "2048x1152", ("16:9", "4K"): "3840x2160",
+    ("9:16", "4K"): "2160x3840",
+}
+
+def _r16(n):  return max(16, int(round(n / 16.0)) * 16)
+def _up16(n): return max(16, int(math.ceil(n / 16.0)) * 16)
+def _dn16(n): return max(16, int(math.floor(n / 16.0)) * 16)
+
+def _parse_aspect(aspect):
+    """'W:H' -> float ratio. None for 'auto'/blank/unparseable."""
+    if not aspect or aspect == "auto":
+        return None
+    try:
+        w, h = aspect.split(":")
+        w, h = float(w), float(h)
+        return w / h if (w > 0 and h > 0) else None
+    except Exception:
+        return None
+
+def _nearest_standard_aspect(w, h):
+    """Closest gpt-image-2 standard aspect key for an arbitrary W,H (for labels)."""
+    if not w or not h:
+        return "1:1"
+    ratio = w / float(h)
+    return min(GPT2_ASPECTS, key=lambda a: abs(ratio - _parse_aspect(a)))
+
+def _gpt2_compute_size(ar, resolution):
+    """Arbitrary ratio -> a 'WxH' satisfying EVERY gpt-image-2 constraint."""
+    ar = min(3.0, max(1.0 / 3.0, float(ar)))           # clamp ratio to <= 3:1
+    target = _GPT2_TARGET_PX.get(resolution, _GPT2_TARGET_PX["1K"])
+    h = math.sqrt(target / ar); w = ar * h
+    w, h = _r16(w), _r16(h)
+    if max(w, h) > _GPT2_MAX_EDGE:                      # clamp longest edge
+        s = _GPT2_MAX_EDGE / float(max(w, h))
+        w, h = _r16(w * s), _r16(h * s)
+    if w > h and w / float(h) > 3.0:                    # ratio>3 -> grow SHORT edge up
+        h = _up16(w / 3.0)
+    elif h > w and h / float(w) > 3.0:
+        w = _up16(h / 3.0)
+    while w * h > _GPT2_MAX_PX:                          # shrink to pixel cap
+        if w >= h: w = _dn16(w - 1)
+        else:      h = _dn16(h - 1)
+    while w * h < _GPT2_MIN_PX:                          # grow (ceil) to pixel floor
+        if w <= h: w = _up16(w + 1)
+        else:      h = _up16(h + 1)
+    return "%dx%d" % (w, h)
+
+def _gpt2_size_is_valid(size_str):
+    """Server-side defence: confirm a 'WxH' meets all 4 constraints."""
+    try:
+        w, h = (int(x) for x in size_str.lower().split("x"))
+    except Exception:
+        return False
+    if w % 16 or h % 16: return False
+    if max(w, h) > _GPT2_MAX_EDGE: return False
+    if max(w, h) > 3 * min(w, h): return False
+    return _GPT2_MIN_PX <= w * h <= _GPT2_MAX_PX
+
+def gpt2_resolve_size(aspect, resolution, ref_size=None):
+    """Resolve the gpt-image-2 `size` parameter.
+    - 'auto' + usable reference -> match the reference's REAL ratio (freeform).
+    - 'auto' + no/invalid reference -> 'auto' (OpenAI decides).
+    - explicit aspect -> official Popular size if listed, else computed.
+    Never returns an invalid size."""
+    if aspect == "auto":
+        if not ref_size:
+            return "auto"
+        rw, rh = ref_size
+        if not rw or not rh:                # 0-dim / corrupt reference guard (H4)
+            return "auto"
+        ar = rw / float(rh)
+    else:
+        official = GPT2_OFFICIAL_SIZES.get((aspect, resolution))
+        if official:
+            return official
+        ar = _parse_aspect(aspect)
+        if ar is None:                      # stale/unknown aspect after model switch (H5)
+            return GPT2_OFFICIAL_SIZES.get(("1:1", resolution)) or "1024x1024"
+    size = _gpt2_compute_size(ar, resolution)
+    if not _gpt2_size_is_valid(size):       # belt-and-suspenders (H6)
+        size = "1024x1024"
+    return size
+
+
+# Valid Gemini aspect-ratio enums (the model rejects anything else). Used to
+# defend the Gemini path like H5 defends GPT: a stale GPT-only ratio
+# (9:21/3:1/1:3) left in state after a model switch must NOT be forwarded.
+_GEMINI_ASPECTS_BASE = {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4",
+                        "9:16", "16:9", "21:9"}
+_GEMINI_ASPECTS_31 = _GEMINI_ASPECTS_BASE | {"1:4", "4:1", "1:8", "8:1"}
+
+def _gemini_aspect_ok(model, aspect):
+    valid = _GEMINI_ASPECTS_31 if "3.1" in (model or "") else _GEMINI_ASPECTS_BASE
+    return aspect in valid
+
+def _gpt2_custom_size(w, h):
+    """Correct a user-entered W×H to the nearest VALID gpt-image-2 size, keeping
+    the user's pixels/aspect as much as possible (Custom always wins over refs).
+    Returns (w, h, notes) where notes lists which constraints were adjusted.
+    Verified by brute force over a W×H grid — 0 constraint violations."""
+    try:
+        w = max(16, int(round(float(w))))
+        h = max(16, int(round(float(h))))
+    except Exception:
+        return 1024, 1024, ["invalid"]
+    notes = []
+    # 1) ratio <= 3:1 — grow the SHORT edge up (preserve the long edge intent)
+    if w > 3 * h:
+        h = _up16(w / 3.0); notes.append("ratio")
+    elif h > 3 * w:
+        w = _up16(h / 3.0); notes.append("ratio")
+    # 2) max edge <= 3840 — scale both down, ratio preserved
+    if max(w, h) > _GPT2_MAX_EDGE:
+        s = _GPT2_MAX_EDGE / float(max(w, h))
+        w = max(16, int(w * s)); h = max(16, int(h * s)); notes.append("edge")
+    # 3) 16-align (nearest)
+    w, h = _r16(w), _r16(h)
+    # 4) max pixels — shrink the LONG edge (floor) until within cap
+    while w * h > _GPT2_MAX_PX:
+        if w >= h: w = _dn16(w - 1)
+        else:      h = _dn16(h - 1)
+        if "maxpx" not in notes: notes.append("maxpx")
+    # 5) min pixels — grow the SHORT edge (ceil) until within floor
+    while w * h < _GPT2_MIN_PX:
+        if w <= h: w = _up16(w + 1)
+        else:      h = _up16(h + 1)
+        if "minpx" not in notes: notes.append("minpx")
+    # 6) final ratio re-guard after all rounding (grow short edge)
+    if w > 3 * h:
+        h = _up16(w / 3.0)
+        if "ratio" not in notes: notes.append("ratio")
+    elif h > 3 * w:
+        w = _up16(h / 3.0)
+        if "ratio" not in notes: notes.append("ratio")
+    if not _gpt2_size_is_valid("%dx%d" % (w, h)):   # last-ditch (never expected)
+        return 1024, 1024, sorted(set(notes + ["fallback"]))
+    return w, h, sorted(set(notes))
 
 
 # Google renamed the preview Gemini image-generation models to GA names
@@ -141,11 +306,14 @@ class AppState:
     def __init__(self):
         self.client_vertex = None
         self.client_studio = None
+        self.client_openai = None
         # Rate limit: UI hint says "10 RPM auto-throttled to ~8 RPM". That's
         # 1 request every 7.5s per provider. Previously this was 0.5s (120
         # RPM) — we'd hit 429s constantly.
         self.vertex_rate_limiter = RateLimiter(interval=7.5)
         self.studio_rate_limiter = RateLimiter(interval=7.5)
+        # OpenAI Images API is less strict than Gemini preview; gentler cap.
+        self.openai_rate_limiter = RateLimiter(interval=1.5)
         self.is_generating = False
         self.cancel_flag = False
         self.done_count = 0
@@ -192,6 +360,11 @@ class AppState:
         self.aspect = "16:9"
         self.resolution = "4K"
         self.count = 1
+        # GPT Image 2 전용 — low/medium/high/auto. Gemini는 무시.
+        self.quality = "high"
+        # GPT Image 2 "Custom" aspect — raw user-entered pixels (pre-correction).
+        self.custom_w = 1024
+        self.custom_h = 1024
         self.fixed_prompt = ""
         self.prompt_sections = [""]
         self.naming_enabled = False
@@ -223,6 +396,7 @@ class AppState:
         # API status
         self.vertex_status = "disconnected"
         self.studio_status = "disconnected"
+        self.openai_status = "disconnected"
         self.vertex_credentials_path = None
         self.vertex_session_disabled = False
 
@@ -357,6 +531,49 @@ class AppState:
             self.log("AI Studio: key not configured (skipped)")
             self.studio_status = "disconnected"
 
+        # OpenAI — requires OPENAI_API_KEY. Only used when user picks gpt-image-2.
+        openai_key = os.environ.get("OPENAI_API_KEY", "")
+        if openai_key and _OpenAI is not None:
+            try:
+                self.client_openai = _OpenAI(api_key=openai_key)
+                self.log("OpenAI connected")
+                self.openai_status = "connected"
+                # 부팅 직후 백그라운드로 가벼운 연결 자가진단.
+                threading.Thread(target=self._openai_selftest, daemon=True).start()
+            except Exception as e:
+                self.log(f"OpenAI error: {e}")
+                self.openai_status = "error"
+        elif openai_key and _OpenAI is None:
+            self.log("OpenAI: openai package not installed (pip install openai)")
+            self.openai_status = "error"
+        else:
+            self.log("OpenAI: key not configured (skipped)")
+            self.openai_status = "disconnected"
+
+    def _openai_selftest(self):
+        """앱 부팅 직후 OpenAI 연결을 1회 점검. models.list()는 무과금.
+        실패 시 예외 체인을 끝까지 풀어 로그에 남겨서, 'Connection error'
+        한 줄 뒤에 숨은 진짜 원인(SSL/DNS/proxy/방화벽)을 식별 가능하게 한다."""
+        try:
+            time.sleep(1.5)
+            if not self.client_openai:
+                return
+            ms = self.client_openai.models.list()
+            n = len(getattr(ms, "data", []) or [])
+            self.log(f"OpenAI self-test OK ({n} models reachable)")
+        except Exception as e:
+            detail = f"{type(e).__name__}: {str(e)}"
+            cause = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
+            depth = 0
+            while cause is not None and depth < 6:
+                detail += f"  <- {type(cause).__name__}: {str(cause)[:200]}"
+                nxt = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
+                if nxt is cause:
+                    break
+                cause = nxt
+                depth += 1
+            self.log(f"OpenAI self-test FAILED: {detail[:600]}")
+
     # --- Provider helpers ---
     def get_available_providers(self):
         providers = []
@@ -381,6 +598,8 @@ class AppState:
         return None
 
     def get_provider_label(self, provider):
+        if provider == "openai":
+            return "OpenAI"
         return "Vertex" if provider == "vertex" else "Studio"
 
     def build_provider_order(self, preferred_provider=None):
@@ -519,6 +738,9 @@ class AppState:
     # renders as literal text.
     def get_ref_limit(self, model=None):
         m = model or self.model
+        if m == GPT2_MODEL_ID:
+            # gpt-image-2 edits endpoint: OpenAI 가이드 기준 최대 16장.
+            return 16
         return 3 if m == "gemini-2.5-flash-image" else 14
 
     def _filled_ref_count(self):
@@ -1058,6 +1280,8 @@ class AppState:
                 "model": self.model,
                 "aspect": self.aspect,
                 "resolution": self.resolution,
+                "custom_w": self.custom_w,
+                "custom_h": self.custom_h,
                 "count": str(self.count),
                 "output_dir": self.output_dir,
                 "naming": self.get_naming_settings(),
@@ -1280,7 +1504,109 @@ class AppState:
             remaining -= chunk
         return not self.cancel_flag
 
+    # --- GPT Image 2 (OpenAI) ---
+    def _openai_file_tuples(self, ref_payloads):
+        """Wrap raw PNG bytes in (filename, bytes, mime) tuples so the OpenAI
+        SDK's multipart encoder sets the right Content-Type."""
+        return [
+            (f"ref_{i}.png", data, "image/png")
+            for i, data in enumerate(ref_payloads)
+        ]
+
+    def _generate_one_image_openai(self, job, prompt, ref_payloads, img_cfg):
+        idx = job["index"]
+        total = job["total"]
+        seed = job["seed"]
+        label = "OpenAI"
+        # 슬롯 모델에서 ref_payloads는 빈 슬롯 자리에 None을 담을 수 있다.
+        # OpenAI edits 엔드포인트는 None을 못 받으므로 채워진 것만 추린다.
+        ref_payloads = [p for p in (ref_payloads or []) if p]
+        self.log(f"[{idx+1}/{total}] Queued on {label} (size {img_cfg.get('size')}, q={img_cfg.get('quality')})")
+        if not self.client_openai:
+            return {"status": "failed", "index": idx, "seed": seed,
+                    "error": "OpenAI client not configured", "elapsed": 0.0}
+        size = img_cfg.get("size", "1024x1024")
+        quality = img_cfg.get("quality", "high")
+        max_retries = 5
+        delay = 10
+        start = time.time()
+        for attempt in range(max_retries):
+            if self.cancel_flag:
+                return {"status": "cancelled", "index": idx, "seed": seed}
+            limiter = self.openai_rate_limiter
+            if limiter and not limiter.acquire(should_cancel=lambda: self.cancel_flag):
+                return {"status": "cancelled", "index": idx, "seed": seed}
+            try:
+                self.log(f"{label} requesting...")
+                t = time.time()
+                if ref_payloads:
+                    result = self.client_openai.images.edit(
+                        model=GPT2_MODEL_ID,
+                        image=self._openai_file_tuples(ref_payloads),
+                        prompt=prompt,
+                        size=size,
+                        quality=quality,
+                        n=1,
+                    )
+                else:
+                    result = self.client_openai.images.generate(
+                        model=GPT2_MODEL_ID,
+                        prompt=prompt,
+                        size=size,
+                        quality=quality,
+                        n=1,
+                    )
+                self.log(f"{label} OK ({time.time()-t:.1f}s)")
+                data_list = getattr(result, "data", None) or []
+                if not data_list:
+                    self.log(f"[{idx+1}] No image in OpenAI response (attempt {attempt+1})")
+                    if attempt < max_retries - 1:
+                        if not self.sleep_with_cancel(3):
+                            return {"status": "cancelled", "index": idx, "seed": seed}
+                        continue
+                    return {"status": "failed", "index": idx, "seed": seed,
+                            "error": "No image in response",
+                            "elapsed": time.time() - start}
+                b64 = getattr(data_list[0], "b64_json", None)
+                if not b64:
+                    return {"status": "failed", "index": idx, "seed": seed,
+                            "error": "OpenAI returned no b64_json (url mode unsupported)",
+                            "elapsed": time.time() - start}
+                pil = _to_display_image(Image.open(io.BytesIO(base64.b64decode(b64))))
+                return {"status": "success", "index": idx, "seed": seed,
+                        "image": pil, "elapsed": time.time() - start,
+                        "api_used": "openai"}
+            except Exception as e:
+                err = str(e)
+                if err == "Cancelled":
+                    return {"status": "cancelled", "index": idx, "seed": seed}
+                elapsed = time.time() - start
+                # OpenAI SDK는 "Connection error." 한 줄로 뭉개므로 예외 체인을 풀어 로그.
+                detail = f"{type(e).__name__}: {err}"
+                cause = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
+                depth = 0
+                while cause is not None and depth < 5:
+                    detail += f"  <- {type(cause).__name__}: {str(cause)[:160]}"
+                    nxt = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
+                    if nxt is cause:
+                        break
+                    cause = nxt
+                    depth += 1
+                self.log(f"{label} failed: {detail[:400]}")
+                if self.is_retryable_error(err) and attempt < max_retries - 1:
+                    wt = delay + random.uniform(2, 8)
+                    self.log(f"[{idx+1}] Retryable error. Wait {wt:.0f}s (retry {attempt+1}/{max_retries})")
+                    if not self.sleep_with_cancel(wt):
+                        return {"status": "cancelled", "index": idx, "seed": seed}
+                    delay = min(delay * 2, 120)
+                    continue
+                return {"status": "failed", "index": idx, "seed": seed,
+                        "error": detail[:300], "elapsed": elapsed}
+        return {"status": "cancelled", "index": idx, "seed": seed}
+
     def generate_one_image(self, job, prompt, ref_payloads, model, img_cfg, modalities):
+        if model == GPT2_MODEL_ID:
+            return self._generate_one_image_openai(job, prompt, ref_payloads, img_cfg)
         idx = job["index"]
         total = job["total"]
         seed = job["seed"]
@@ -1293,7 +1619,9 @@ class AppState:
             temperature=1.0,
             seed=seed,
             response_modalities=modalities,
-            image_config=types.ImageConfig(**img_cfg),
+            # H3: empty img_cfg (e.g. Gemini 2.5 on Auto) -> omit image_config
+            # entirely rather than sending an empty ImageConfig.
+            image_config=types.ImageConfig(**img_cfg) if img_cfg else None,
         )
         tc = self.get_default_thinking_config(model)
         if tc:
@@ -1937,6 +2265,7 @@ def api_status():
     return jsonify({
         "vertex": state.vertex_status,
         "studio": state.studio_status,
+        "openai": state.openai_status,
         "is_generating": state.is_generating,
         "done": state.done_count,
         "failed": state.fail_count,
@@ -1955,6 +2284,9 @@ def get_settings():
         "model": state.model,
         "aspect": state.aspect,
         "resolution": state.resolution,
+        "quality": state.quality,
+        "custom_w": state.custom_w,
+        "custom_h": state.custom_h,
         "count": state.count,
         "output_dir": state.output_dir,
         "fixed_prompt": state.fixed_prompt,
@@ -1982,7 +2314,7 @@ def _safe_int(value, default, lo=None, hi=None):
 @app.route("/api/settings", methods=["POST"])
 def update_settings():
     d = request.json or {}
-    for k in ("model", "aspect", "resolution", "fixed_prompt",
+    for k in ("model", "aspect", "resolution", "quality", "fixed_prompt",
               "naming_prefix", "naming_delimiter", "naming_index_prefix"):
         if k in d and d[k] is not None:
             v = str(d[k])
@@ -1992,6 +2324,11 @@ def update_settings():
     if "count" in d:
         # Clamp to the valid UI range so a rogue client can't brick the dropdown
         state.count = _safe_int(d.get("count"), state.count, lo=1, hi=10)
+    # Custom pixel input — sanitize to block garbage (clientside is advisory only)
+    if "custom_w" in d:
+        state.custom_w = _safe_int(d.get("custom_w"), state.custom_w, lo=16, hi=99999)
+    if "custom_h" in d:
+        state.custom_h = _safe_int(d.get("custom_h"), state.custom_h, lo=16, hi=99999)
     if "output_dir" in d and d["output_dir"]:
         state.output_dir = str(d["output_dir"])
     if "naming_enabled" in d:
@@ -2571,6 +2908,8 @@ def load_setup():
     state.model = _normalize_model_name(saved.get("model", state.model))
     state.aspect = saved.get("aspect", state.aspect)
     state.resolution = saved.get("resolution", state.resolution)
+    state.custom_w = _safe_int(saved.get("custom_w"), state.custom_w, lo=16, hi=99999)
+    state.custom_h = _safe_int(saved.get("custom_h"), state.custom_h, lo=16, hi=99999)
     state.count = int(saved.get("count", 1))
     state.output_dir = saved.get("output_dir", state.output_dir)
 
@@ -2636,16 +2975,26 @@ def load_setup():
 # --- Generation ---
 @app.route("/api/generate", methods=["POST"])
 def start_generate():
-    if not state.client_vertex and not state.client_studio:
-        return jsonify({"ok": False, "error": "No API connected"})
+    model = state.model
+    is_openai = (model == GPT2_MODEL_ID)
+
+    if is_openai:
+        if not state.client_openai:
+            return jsonify({"ok": False, "error": "OpenAI not connected — set OPENAI_API_KEY"})
+    else:
+        if not state.client_vertex and not state.client_studio:
+            return jsonify({"ok": False, "error": "No API connected"})
 
     prompt = state.compose_prompt()
     if not prompt:
         return jsonify({"ok": False, "error": "Empty prompt"})
 
-    providers = state.get_available_providers()
-    if not providers:
-        return jsonify({"ok": False, "error": "No provider available"})
+    if is_openai:
+        providers = ["openai"]
+    else:
+        providers = state.get_available_providers()
+        if not providers:
+            return jsonify({"ok": False, "error": "No provider available"})
 
     os.makedirs(state.output_dir, exist_ok=True)
     naming = state.get_naming_settings()
@@ -2665,12 +3014,11 @@ def start_generate():
 
     # Snapshot settings for this batch — done outside the lock because
     # ref_image_to_bytes re-encodes images and shouldn't block other callers.
-    model = state.model
+    # (model was already read at the top of this function.)
     aspect = state.aspect
     resolution = state.resolution
-    img_cfg = {"aspect_ratio": aspect}
-    if "gemini-3" in model:
-        img_cfg["image_size"] = resolution
+    # H1: snapshot refs BEFORE building img_cfg — Auto/freeform needs the
+    # anchor reference's real W×H to compute the gpt-image-2 size.
     # ref_payloads is slot-indexed: position N-1 holds the bytes for [Image N],
     # or None for an empty slot. build_user_parts resolves [Image N] against it.
     ref_snapshots = state.get_effective_ref_images(model)
@@ -2678,6 +3026,39 @@ def start_generate():
         state.ref_image_to_bytes(r) if r is not None else None
         for r in ref_snapshots
     ]
+    if is_openai:
+        # H4: measure the first FILLED slot's real dimensions for Auto. PIL
+        # .size is an O(1) header read (no pixel decode); guarded for 0-dim.
+        anchor = next((r for r in ref_snapshots if r is not None), None)
+        ref_size = None
+        if anchor is not None:
+            try:
+                rw, rh = anchor.size
+                if rw and rh:
+                    ref_size = (rw, rh)
+            except Exception:
+                ref_size = None
+        # OpenAI takes a concrete "WxH" size (or "auto") + quality.
+        if aspect == "custom":
+            # Custom always wins over the reference: send the user's pixels,
+            # server-side re-corrected to valid bounds (double-correction).
+            cw, ch, _cnotes = _gpt2_custom_size(state.custom_w, state.custom_h)
+            size = "%dx%d" % (cw, ch)
+        else:
+            size = gpt2_resolve_size(aspect, resolution, ref_size)
+        img_cfg = {"size": size, "quality": state.quality or "high"}
+    else:
+        # H2: Gemini "auto" = OMIT aspect_ratio so the model auto-matches the
+        # input image ratio. Passing the literal "auto" string crashes
+        # ImageConfig. H9: also omit any value that isn't a valid Gemini enum
+        # for this model (e.g. a GPT-only 9:21/3:1/1:3 left in state after a
+        # model switch) — forwarding it would crash; omitting falls back to the
+        # safe auto-match. Resolution (image_size) is kept independently on Auto.
+        img_cfg = {}
+        if aspect and aspect != "auto" and _gemini_aspect_ok(model, aspect):
+            img_cfg["aspect_ratio"] = aspect
+        if "gemini-3" in model:
+            img_cfg["image_size"] = resolution
     ref_paths = list(state.ref_path_list)
     pinned_ref_paths = [
         p for i, p in enumerate(state.ref_path_list)

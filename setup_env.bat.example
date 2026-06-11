@@ -23,6 +23,14 @@ set "VERTEX_PROJECT=YOUR_GCP_PROJECT_ID_HERE"
 set "VERTEX_LOCATION=global"
 REM -----------------------
 
+REM ---- OPTIONAL: OpenAI GPT Image 2 ----
+REM  Leave blank to run Gemini-only. The OpenAI key is managed SEPARATELY
+REM  from the Google/NanoBanana keys above — set it here OR via your own
+REM  `setx OPENAI_API_KEY "..."`. The app reads OPENAI_API_KEY from the
+REM  environment; gpt-image-2 also requires OpenAI Organization Verification.
+set "OPENAI_KEY=YOUR_OPENAI_API_KEY_HERE"
+REM --------------------------------------
+
 set "NB_HOME=%USERPROFILE%\.nanobanana"
 if not exist "!NB_HOME!" mkdir "!NB_HOME!"
 set "VERTEX_JSON=!NB_HOME!\vertex_credentials.json"
@@ -56,6 +64,12 @@ echo [3/4] Set GOOGLE_APPLICATION_CREDENTIALS
 setx NANOBANANA_PROJECT_ID "!VERTEX_PROJECT!" >nul
 setx NANOBANANA_LOCATION "!VERTEX_LOCATION!" >nul
 echo [4/4] Set NANOBANANA_PROJECT_ID and NANOBANANA_LOCATION
+
+REM Only register the OpenAI key if it was actually filled in above.
+if not "!OPENAI_KEY!"=="YOUR_OPENAI_API_KEY_HERE" if not "!OPENAI_KEY!"=="" (
+    setx OPENAI_API_KEY "!OPENAI_KEY!" >nul
+    echo [+]  Set OPENAI_API_KEY ^(GPT Image 2 enabled^)
+)
 
 echo.
 echo ============================================================

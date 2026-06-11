@@ -635,16 +635,20 @@ function initCustomSize() {
     });
   });
   const refChip = document.getElementById("customRefChip");
-  if (refChip) refChip.addEventListener("click", () => {
-    // Best-effort: pull slot-1's natural dimensions from the first ref thumbnail.
-    const img = document.querySelector('#refList img, .ref-slot img, .ref-thumb img, [id^="refSlot"] img');
-    if (img && img.naturalWidth > 0 && img.naturalHeight > 0) {
-      wEl.value = img.naturalWidth; hEl.value = img.naturalHeight;
-      _customRatio = img.naturalWidth / img.naturalHeight;
-      updateCustomPreview(); saveSettings();
-    } else {
-      showToast("레퍼런스 슬롯 1이 비어있어요", "info");
-    }
+  if (refChip) refChip.addEventListener("click", async () => {
+    // Pull the FIRST filled slot's ORIGINAL dimensions from the backend
+    // (the thumbnail's naturalWidth would be the resized preview, not the ref).
+    try {
+      const d = await api("/api/refs");
+      const first = (d.refs || []).find(r => !r.empty && r.w > 0 && r.h > 0);
+      if (first) {
+        wEl.value = first.w; hEl.value = first.h;
+        _customRatio = first.w / first.h;
+        updateCustomPreview(); saveSettings();
+        return;
+      }
+    } catch (e) {}
+    showToast("레퍼런스 슬롯 1이 비어있어요", "info");
   });
   // Toggle the wrap when the user switches to/from the Custom aspect.
   const asp = document.getElementById("aspectSelect");

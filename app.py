@@ -1280,6 +1280,7 @@ class AppState:
                 "model": self.model,
                 "aspect": self.aspect,
                 "resolution": self.resolution,
+                "quality": self.quality,
                 "custom_w": self.custom_w,
                 "custom_h": self.custom_h,
                 "count": str(self.count),
@@ -1342,6 +1343,9 @@ class AppState:
         self.model = _normalize_model_name(ui.get("model", self.model))
         self.aspect = ui.get("aspect", self.aspect)
         self.resolution = ui.get("resolution", self.resolution)
+        self.quality = ui.get("quality", self.quality)
+        self.custom_w = _safe_int(ui.get("custom_w"), self.custom_w, lo=16, hi=99999)
+        self.custom_h = _safe_int(ui.get("custom_h"), self.custom_h, lo=16, hi=99999)
         # Tolerant parse — older projects sometimes have count="" which would
         # raise ValueError and abort load mid-way, losing the whole session.
         try:
@@ -1867,6 +1871,8 @@ class AppState:
                             "fixed_prompt": job.get("fixed_prompt", ""),
                             "prompt_sections": list(job.get("prompt_sections") or []),
                             "model": model, "aspect": aspect, "resolution": resolution,
+                            "quality": job.get("quality", "high"),
+                            "custom_w": job.get("custom_w"), "custom_h": job.get("custom_h"),
                             "count": saved_count, "output_dir": job["output_dir"],
                             "naming": naming,
                             "ref_paths": list(job.get("ref_paths", [])),
@@ -2375,6 +2381,10 @@ def get_refs():
             continue
         filled += 1
         fp = paths[i] or ""
+        try:
+            rw, rh = img.size           # original dims (for the Custom "ref" chip)
+        except Exception:
+            rw, rh = 0, 0
         refs.append({
             "index": i,
             "empty": False,
@@ -2382,6 +2392,7 @@ def get_refs():
             "filename": os.path.basename(fp),
             "pinned": i < len(pinned) and bool(pinned[i]),
             "exists": bool(fp) and os.path.exists(fp),
+            "w": rw, "h": rh,
         })
     return jsonify({
         "refs": refs,
@@ -2908,6 +2919,7 @@ def load_setup():
     state.model = _normalize_model_name(saved.get("model", state.model))
     state.aspect = saved.get("aspect", state.aspect)
     state.resolution = saved.get("resolution", state.resolution)
+    state.quality = saved.get("quality", state.quality)
     state.custom_w = _safe_int(saved.get("custom_w"), state.custom_w, lo=16, hi=99999)
     state.custom_h = _safe_int(saved.get("custom_h"), state.custom_h, lo=16, hi=99999)
     state.count = int(saved.get("count", 1))
@@ -3017,6 +3029,9 @@ def start_generate():
     # (model was already read at the top of this function.)
     aspect = state.aspect
     resolution = state.resolution
+    quality = state.quality
+    custom_w = state.custom_w
+    custom_h = state.custom_h
     # H1: snapshot refs BEFORE building img_cfg — Auto/freeform needs the
     # anchor reference's real W×H to compute the gpt-image-2 size.
     # ref_payloads is slot-indexed: position N-1 holds the bytes for [Image N],
@@ -3124,6 +3139,9 @@ def start_generate():
                 "model": model,
                 "aspect": aspect,
                 "resolution": resolution,
+                "quality": quality,
+                "custom_w": custom_w,
+                "custom_h": custom_h,
                 "img_cfg": dict(img_cfg),
                 "naming": dict(naming),
                 "ref_payloads": ref_payloads,

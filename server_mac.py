@@ -23,16 +23,23 @@ URL = "http://%s:%d" % (HOST, PORT)
 def load_keys():
     """Load KEY=VALUE lines from keys.env (next to this script) into os.environ.
 
-    Lines beginning with '#' are comments; surrounding quotes on values are
-    stripped. A relative GOOGLE_APPLICATION_CREDENTIALS path is resolved against
-    this folder so users can drop the Vertex service-account JSON right next to
-    the app and just write its file name.
+    Looks for keys.env first next to this app, then in ~/.nanobanana/ (where the
+    key installer puts it). Lines beginning with '#' are comments; surrounding
+    quotes on values are stripped. A relative GOOGLE_APPLICATION_CREDENTIALS path
+    is resolved against the folder that holds keys.env, so the Vertex
+    service-account JSON can sit right next to it under either location.
     """
-    path = os.path.join(HERE, "keys.env")
-    if not os.path.isfile(path):
+    candidates = [
+        os.path.join(HERE, "keys.env"),
+        os.path.join(os.path.expanduser("~"), ".nanobanana", "keys.env"),
+    ]
+    path = next((p for p in candidates if os.path.isfile(p)), None)
+    if not path:
         print("[NanoBanana] keys.env not found.")
-        print("  -> Copy keys.env.example to keys.env and fill in your keys.")
+        print("  -> Put keys.env (and service_account.json) in this folder or in")
+        print("     ~/.nanobanana/, or copy keys.env.example to keys.env.")
         return
+    base = os.path.dirname(path)
     with open(path, "r", encoding="utf-8") as f:
         for raw in f:
             line = raw.strip()
@@ -45,7 +52,8 @@ def load_keys():
                 os.environ[key] = val
     cred = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
     if cred and not os.path.isabs(cred):
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(HERE, cred)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(base, cred)
+    print("[NanoBanana] Loaded keys from: " + path)
 
 
 def check_deps():

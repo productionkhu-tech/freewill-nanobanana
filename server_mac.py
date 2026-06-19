@@ -56,19 +56,42 @@ def load_keys():
     print("[NanoBanana] Loaded keys from: " + path)
 
 
-def check_deps():
-    missing = []
+def _missing_deps():
+    m = []
     for mod, pip_name in [("flask", "flask"),
                           ("google.genai", "google-genai"),
                           ("PIL", "Pillow")]:
         try:
             __import__(mod)
         except Exception:
-            missing.append(pip_name)
-    if missing:
-        print("[NanoBanana] Missing Python packages: " + ", ".join(missing))
-        print("  -> Run:  pip3 install -r requirements_mac.txt")
-        sys.exit(1)
+            m.append(pip_name)
+    return m
+
+
+def check_deps():
+    """On first run, auto-install the required packages (so the user does not
+    have to open Terminal and run pip themselves). Tries a normal install, then
+    a --user install for PEP 668 (Homebrew) Pythons."""
+    if not _missing_deps():
+        return
+    req = os.path.join(HERE, "requirements_mac.txt")
+    print("[NanoBanana] First run: installing required packages (needs internet)...")
+    import subprocess
+    attempts = [
+        [sys.executable, "-m", "pip", "install", "-r", req],
+        [sys.executable, "-m", "pip", "install", "--user", "-r", req],
+    ]
+    for args in attempts:
+        try:
+            subprocess.run(args, timeout=600)
+        except Exception:
+            pass
+        if not _missing_deps():
+            print("[NanoBanana] Packages installed.")
+            return
+    print("[NanoBanana] Could not install packages automatically.")
+    print("  -> Open Terminal in this folder and run:  pip3 install -r requirements_mac.txt")
+    sys.exit(1)
 
 
 def open_browser_when_ready():
@@ -121,6 +144,15 @@ def main():
     os.chdir(HERE)
     if HERE not in sys.path:
         sys.path.insert(0, HERE)
+    # Make the double-click launcher executable so that after this first
+    # (Terminal) run, the user can just double-click NanoBanana.command. USB/zip
+    # copies often drop the executable bit, so restore it here.
+    try:
+        cmd_path = os.path.join(HERE, "NanoBanana.command")
+        if os.path.isfile(cmd_path) and not os.access(cmd_path, os.X_OK):
+            os.chmod(cmd_path, 0o755)
+    except Exception:
+        pass
     load_keys()
     auto_update()
     check_deps()

@@ -1,0 +1,6 @@
+# Keep shell scripts and the macOS launcher as LF line endings so they run on
+# macOS even when committed from a Windows machine (autocrlf must not turn these
+# into CRLF -- a CRLF .command fails on macOS with "python3\r: not found").
+*.command text eol=lf
+*.sh text eol=lf
+server_mac.py text eol=lf

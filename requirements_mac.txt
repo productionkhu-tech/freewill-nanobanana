@@ -1,0 +1,9 @@
+# NanoBanana - macOS dependencies (run-from-source).
+# Install once:   pip3 install -r requirements_mac.txt
+#
+# pywebview / pythonnet are intentionally omitted: they are the Windows-only
+# native-window layer. On macOS the app runs in your default browser instead.
+flask>=3.0
+google-genai>=1.0
+openai>=1.50
+Pillow>=10.0

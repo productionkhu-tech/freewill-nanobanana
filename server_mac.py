@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""NanoBanana - macOS launcher (run-from-source local web app).
+
+Windows uses launcher.py + the packaged NanoBanana.exe. macOS instead runs the
+Flask app (app.py) directly and opens it in the default browser. This file never
+touches the Windows code path: app.py already exposes a headless server via its
+`if __name__ == "__main__"` block, so here we just load the user's keys, make
+sure the dependencies are present, open the browser, and start Flask.
+"""
+import os
+import sys
+import socket
+import threading
+import time
+import webbrowser
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HOST = "127.0.0.1"
+PORT = 5656
+URL = "http://%s:%d" % (HOST, PORT)
+
+
+def load_keys():
+    """Load KEY=VALUE lines from keys.env (next to this script) into os.environ.
+
+    Lines beginning with '#' are comments; surrounding quotes on values are
+    stripped. A relative GOOGLE_APPLICATION_CREDENTIALS path is resolved against
+    this folder so users can drop the Vertex service-account JSON right next to
+    the app and just write its file name.
+    """
+    path = os.path.join(HERE, "keys.env")
+    if not os.path.isfile(path):
+        print("[NanoBanana] keys.env not found.")
+        print("  -> Copy keys.env.example to keys.env and fill in your keys.")
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key:
+                os.environ[key] = val
+    cred = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if cred and not os.path.isabs(cred):
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(HERE, cred)
+
+
+def check_deps():
+    missing = []
+    for mod, pip_name in [("flask", "flask"),
+                          ("google.genai", "google-genai"),
+                          ("PIL", "Pillow")]:
+        try:
+            __import__(mod)
+        except Exception:
+            missing.append(pip_name)
+    if missing:
+        print("[NanoBanana] Missing Python packages: " + ", ".join(missing))
+        print("  -> Run:  pip3 install -r requirements_mac.txt")
+        sys.exit(1)
+
+
+def open_browser_when_ready():
+    """Poll the port until Flask is accepting connections, then open the browser."""
+    for _ in range(60):  # up to ~15s
+        try:
+            with socket.create_connection((HOST, PORT), timeout=0.5):
+                break
+        except OSError:
+            time.sleep(0.25)
+    try:
+        webbrowser.open(URL)
+    except Exception:
+        pass
+
+
+def auto_update():
+    """If this folder is a git clone, fast-forward to the latest main on launch.
+
+    Best-effort and silent on any problem: skips when offline, when this is a
+    ZIP download (no .git), or when there are local changes that would block a
+    fast-forward. keys.env and the Vertex JSON are gitignored, so they are never
+    touched. Set NANOBANANA_AUTO_UPDATE=0 in keys.env to turn this off.
+    """
+    flag = os.environ.get("NANOBANANA_AUTO_UPDATE", "1").strip().lower()
+    if flag in ("0", "false", "no", "off"):
+        return
+    if not os.path.isdir(os.path.join(HERE, ".git")):
+        return  # downloaded as ZIP, not a git clone -> manual updates only
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["git", "-C", HERE, "pull", "--ff-only"],
+            capture_output=True, text=True, timeout=20,
+        )
+        out = (r.stdout + " " + r.stderr).strip().lower()
+        if r.returncode != 0:
+            print("[NanoBanana] Skipped auto-update (using the current version).")
+            return
+        if "up to date" in out:
+            print("[NanoBanana] Already the latest version.")
+        else:
+            print("[NanoBanana] Updated to the latest version.")
+            print("  If anything looks off, run:  pip3 install -r requirements_mac.txt")
+    except Exception:
+        print("[NanoBanana] Skipped auto-update (offline or git unavailable).")
+
+
+def main():
+    os.chdir(HERE)
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    load_keys()
+    auto_update()
+    check_deps()
+    print("[NanoBanana] Starting on " + URL)
+    print("  Keep this Terminal window open while using the app (close it to quit).")
+    threading.Thread(target=open_browser_when_ready, daemon=True).start()
+    try:
+        import app as nb  # Flask app; templates/static resolve next to app.py
+    except Exception as e:
+        print("[NanoBanana] Failed to import app.py: %s" % e)
+        print("  -> Make sure you run this from the NanoBanana folder and that")
+        print("     dependencies are installed (pip3 install -r requirements_mac.txt).")
+        sys.exit(1)
+    threading.Thread(target=nb.init_app, daemon=True).start()
+    nb.app.run(host=HOST, port=PORT, debug=False, threaded=True)
+
+
+if __name__ == "__main__":
+    main()

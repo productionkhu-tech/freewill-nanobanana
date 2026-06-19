@@ -15,6 +15,11 @@ service_account*.json
 credentials*.json
 setup_env.bat
 
+# macOS run-from-source secrets — NEVER commit
+keys.env
+vertex-key.json
+*-key.json
+
 # Auto-updater overlay (user-local, not source)
 user_updates/
 

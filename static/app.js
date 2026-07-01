@@ -443,6 +443,15 @@ const MODEL_SPECS = {
     hint: "10 RPM limit — auto-throttled to ~8 RPM",
     refHint: "3rd-gen models support up to 14 reference images.",
   },
+  "gemini-3.1-flash-lite-image": {
+    aspects: ["auto","1:1","2:3","3:2","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1"],
+    resolutions: ["1K"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: false,
+    defaultAspect: "16:9", defaultResolution: "1K",
+    hint: "Lite: ultra-fast & low-cost. 1K only (2K/4K unsupported).",
+    refHint: "3rd-gen models support up to 14 reference images.",
+  },
   "gpt-image-2": {
     aspects: ["auto","1:1","3:2","2:3","4:3","3:4","4:5","5:4","16:9","9:16","21:9","9:21","3:1","1:3","custom"],
     resolutions: ["1K","2K","4K"],

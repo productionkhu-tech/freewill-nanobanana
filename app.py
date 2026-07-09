@@ -147,6 +147,125 @@ def _gemini_aspect_ok(model, aspect):
     valid = _GEMINI_ASPECTS_31 if "3.1" in (model or "") else _GEMINI_ASPECTS_BASE
     return aspect in valid
 
+
+# ==========================================
+# Seedream (BytePlus ModelArk) — OpenAI-SDK-compatible image provider
+# Same `openai` client library, different base_url + ARK_API_KEY. Isolated from
+# the gpt-image-2 path like GPT is isolated from Gemini.
+# ==========================================
+SEEDREAM_BASE_URL = "https://ark.ap-southeast.bytepluses.com/api/v3"
+SEEDREAM_MODEL_IDS = ("seedream-5-0-pro-260628", "seedream-4-5-251128")
+# output_format: pro accepts png/jpeg; 4-5 is jpeg-only (param unsupported -> omit)
+_SEEDREAM_OUTPUT_FORMAT = {
+    "seedream-5-0-pro-260628": "png",
+    "seedream-4-5-251128": None,
+}
+# aspect+resolution -> "WxH" (BytePlus official mapping)
+_SEEDREAM_SIZES = {
+    "seedream-5-0-pro-260628": {
+        "1K": {"1:1": "1024x1024", "4:3": "1152x864", "3:4": "864x1152", "16:9": "1312x736",
+               "9:16": "736x1312", "3:2": "1248x832", "2:3": "832x1248", "21:9": "1568x672"},
+        "2K": {"1:1": "2048x2048", "4:3": "2304x1728", "3:4": "1728x2304", "16:9": "2848x1600",
+               "9:16": "1600x2848", "3:2": "2496x1664", "2:3": "1664x2496", "21:9": "3136x1344"},
+    },
+    "seedream-4-5-251128": {
+        "2K": {"1:1": "2048x2048", "4:3": "2304x1728", "3:4": "1728x2304", "16:9": "2848x1600",
+               "9:16": "1600x2848", "3:2": "2496x1664", "2:3": "1664x2496", "21:9": "3136x1344"},
+        "4K": {"1:1": "4096x4096", "4:3": "4704x3520", "3:4": "3520x4704", "16:9": "5504x3040",
+               "9:16": "3040x5504", "3:2": "4992x3328", "2:3": "3328x4992", "21:9": "6240x2656"},
+    },
+}
+# Custom (explicit WxH) pixel bounds per model: (min_px, max_px). ratio<=16, 16-mult.
+_SEEDREAM_CUSTOM = {
+    "seedream-5-0-pro-260628": (921_600, 4_194_304),
+    "seedream-4-5-251128": (3_686_400, 16_777_216),
+}
+
+
+def _seedream_default_resolution(model):
+    return next(iter(_SEEDREAM_SIZES.get(model, {}).keys()), "2K")
+
+
+def _seedream_resolve_size(model, aspect, resolution):
+    """aspect + resolution -> 'WxH' from the per-model table (Method 1)."""
+    tbl = _SEEDREAM_SIZES.get(model, {})
+    res_tbl = tbl.get(resolution) or tbl.get(_seedream_default_resolution(model)) or {}
+    if aspect in res_tbl:
+        return res_tbl[aspect]
+    return res_tbl.get("1:1") or "2048x2048"
+
+
+def _seedream_custom_size(model, w, h):
+    """Correct a user W x H to a valid Seedream size for `model`.
+    Constraints: ratio(long/short) <= 16, total px in [min,max], both 16-multiples.
+    Returns (w, h, notes)."""
+    minpx, maxpx = _SEEDREAM_CUSTOM.get(model, _SEEDREAM_CUSTOM["seedream-4-5-251128"])
+    try:
+        w = max(16, int(round(float(w))))
+        h = max(16, int(round(float(h))))
+    except Exception:
+        return 2048, 2048, ["invalid"]
+    notes = []
+    if w > 16 * h:
+        h = _up16(w / 16.0); notes.append("ratio")
+    elif h > 16 * w:
+        w = _up16(h / 16.0); notes.append("ratio")
+    aw, ah = _r16(w), _r16(h)
+    if (aw != w or ah != h) and not notes:
+        notes.append("align16")
+    w, h = aw, ah
+    if w * h > maxpx:                        # too many pixels -> shrink both (keep ratio)
+        s = math.sqrt(maxpx / float(w * h))
+        w, h = _dn16(w * s), _dn16(h * s); notes.append("maxpx")
+    guard = 0
+    while w * h < minpx and guard < 64:      # too few pixels -> grow both (keep ratio)
+        s = math.sqrt(minpx / float(w * h))
+        nw, nh = _up16(w * s), _up16(h * s)
+        if nw == w and nh == h:
+            if w <= h: h = _up16(h + 16)
+            else:      w = _up16(w + 16)
+        else:
+            w, h = nw, nh
+        if "minpx" not in notes:
+            notes.append("minpx")
+        guard += 1
+    if w > 16 * h:
+        h = _up16(w / 16.0)
+    elif h > 16 * w:
+        w = _up16(h / 16.0)
+    return w, h, notes
+
+
+def _seedream_endpoint(model):
+    """Map an internal model id to the id we actually send to BytePlus. Some
+    models are not callable by their raw Model ID on a given account and need a
+    custom inference Endpoint ID (e.g. 'dola-seedream-5-0-pro-260628'). Kept
+    overridable via env so resellers can point at their own endpoint."""
+    if model == "seedream-5-0-pro-260628":
+        return os.environ.get("ARK_SEEDREAM_PRO_ENDPOINT", "dola-seedream-5-0-pro-260628")
+    if model == "seedream-4-5-251128":
+        return os.environ.get("ARK_SEEDREAM_45_ENDPOINT", "seedream-4-5-251128")
+    return model
+
+
+def _seedream_prompt(prompt):
+    """Seedream references inputs by natural position ('image 1', 'image 2'), not
+    Gemini-style byte-injected [Image N]. Convert our mention tokens to that text
+    so the reference-mention feature stays meaningful."""
+    import re as _re
+    return _re.sub(r"\[\s*Image\s*(\d+)\s*\]",
+                   lambda m: "image %s" % m.group(1), prompt or "", flags=_re.IGNORECASE)
+
+
+def _model_file_prefix(model):
+    """Default-naming filename prefix reflecting which model made the image:
+    GP2 (gpt-image-2), SD (BytePlus Seedream), nano (Gemini / Nano Banana)."""
+    if model == GPT2_MODEL_ID:
+        return "GP2"
+    if model in SEEDREAM_MODEL_IDS:
+        return "SD"
+    return "nano"
+
 def _gpt2_custom_size(w, h):
     """Correct a user-entered W×H to the nearest VALID gpt-image-2 size, keeping
     the user's pixels/aspect as much as possible (Custom always wins over refs).
@@ -309,6 +428,7 @@ class AppState:
         self.client_vertex = None
         self.client_studio = None
         self.client_openai = None
+        self.client_seedream = None
         # Rate limit: UI hint says "10 RPM auto-throttled to ~8 RPM". That's
         # 1 request every 7.5s per provider. Previously this was 0.5s (120
         # RPM) — we'd hit 429s constantly.
@@ -316,6 +436,8 @@ class AppState:
         self.studio_rate_limiter = RateLimiter(interval=7.5)
         # OpenAI Images API is less strict than Gemini preview; gentler cap.
         self.openai_rate_limiter = RateLimiter(interval=1.5)
+        # Seedream (BytePlus) allows 500 RPM; a light interval keeps us safe.
+        self.seedream_rate_limiter = RateLimiter(interval=0.3)
         self.is_generating = False
         self.cancel_flag = False
         self.done_count = 0
@@ -399,6 +521,7 @@ class AppState:
         self.vertex_status = "disconnected"
         self.studio_status = "disconnected"
         self.openai_status = "disconnected"
+        self.seedream_status = "disconnected"
         self.vertex_credentials_path = None
         self.vertex_session_disabled = False
 
@@ -551,6 +674,24 @@ class AppState:
         else:
             self.log("OpenAI: key not configured (skipped)")
             self.openai_status = "disconnected"
+
+        # Seedream (BytePlus ModelArk) — requires ARK_API_KEY. OpenAI-SDK-compatible
+        # endpoint, so we reuse the openai client library with a BytePlus base_url.
+        ark_key = os.environ.get("ARK_API_KEY", "")
+        if ark_key and _OpenAI is not None:
+            try:
+                self.client_seedream = _OpenAI(base_url=SEEDREAM_BASE_URL, api_key=ark_key)
+                self.log("Seedream (BytePlus) connected")
+                self.seedream_status = "connected"
+            except Exception as e:
+                self.log(f"Seedream error: {e}")
+                self.seedream_status = "error"
+        elif ark_key and _OpenAI is None:
+            self.log("Seedream: openai package not installed")
+            self.seedream_status = "error"
+        else:
+            self.log("Seedream: ARK_API_KEY not configured (skipped)")
+            self.seedream_status = "disconnected"
 
     def _openai_selftest(self):
         """앱 부팅 직후 OpenAI 연결을 1회 점검. models.list()는 무과금.
@@ -743,6 +884,8 @@ class AppState:
         if m == GPT2_MODEL_ID:
             # gpt-image-2 edits endpoint: OpenAI 가이드 기준 최대 16장.
             return 16
+        if m in SEEDREAM_MODEL_IDS:
+            return 10 if m == "seedream-5-0-pro-260628" else 14
         return 3 if m == "gemini-2.5-flash-image" else 14
 
     def _filled_ref_count(self):
@@ -1043,7 +1186,7 @@ class AppState:
             "padding": max(1, min(5, self.naming_padding)),
         }
 
-    def make_filename(self, seed, naming=None):
+    def make_filename(self, seed, naming=None, model=None):
         s = naming or self.get_naming_settings()
         if s["enabled"]:
             # Atomic read-increment-use under a lock. Without this, two
@@ -1061,7 +1204,7 @@ class AppState:
                 return f"{prefix}_{middle}_{number_part}.png"
             return f"{prefix}_{number_part}.png"
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return f"nano_{ts}_{seed}.png"
+        return f"{_model_file_prefix(model or self.model)}_{ts}_{seed}.png"
 
     def prepare_file_counter(self, naming=None):
         s = naming or self.get_naming_settings()
@@ -1610,9 +1753,89 @@ class AppState:
                         "error": detail[:300], "elapsed": elapsed}
         return {"status": "cancelled", "index": idx, "seed": seed}
 
+    def _generate_one_image_seedream(self, job, prompt, ref_payloads, model, img_cfg):
+        idx = job["index"]
+        total = job["total"]
+        seed = job["seed"]
+        label = "Seedream"
+        refs = [p for p in (ref_payloads or []) if p]
+        size = img_cfg.get("size", "2K")
+        outfmt = img_cfg.get("output_format")
+        self.log(f"[{idx+1}/{total}] Queued on {label} ({model}, size {size})")
+        if not self.client_seedream:
+            return {"status": "failed", "index": idx, "seed": seed,
+                    "error": "Seedream not connected (set ARK_API_KEY)", "elapsed": 0.0}
+        # [Image N] -> "image N" so Seedream's positional referencing works.
+        prompt_s = _seedream_prompt(prompt)
+        # Method 2: convey the aspect ratio in the prompt so the model maps it to
+        # the official table size for the chosen resolution level.
+        _asp = img_cfg.get("seedream_aspect")
+        if _asp:
+            prompt_s = prompt_s + ("\n\nOutput image aspect ratio: %s." % _asp)
+        # BytePlus-specific params live in extra_body. Watermark OFF, single image.
+        extra = {"watermark": False}
+        if refs:
+            uris = ["data:image/png;base64," + base64.b64encode(b).decode("ascii") for b in refs]
+            extra["image"] = uris if len(uris) > 1 else uris[0]
+        # 4-5 supports batch; force a single image. pro rejects this param -> omit.
+        if model == "seedream-4-5-251128":
+            extra["sequential_image_generation"] = "disabled"
+        kwargs = dict(model=_seedream_endpoint(model), prompt=prompt_s, size=size,
+                      response_format="b64_json", extra_body=extra)
+        if outfmt:  # pro -> "png"; 4-5 -> None (jpeg default, param unsupported)
+            kwargs["output_format"] = outfmt
+
+        max_retries = 5
+        delay = 10
+        start = time.time()
+        for attempt in range(max_retries):
+            if self.cancel_flag:
+                return {"status": "cancelled", "index": idx, "seed": seed}
+            limiter = self.seedream_rate_limiter
+            if limiter and not limiter.acquire(should_cancel=lambda: self.cancel_flag):
+                return {"status": "cancelled", "index": idx, "seed": seed}
+            try:
+                self.log(f"{label} requesting...")
+                t = time.time()
+                result = self.client_seedream.images.generate(**kwargs)
+                self.log(f"{label} OK ({time.time()-t:.1f}s)")
+                data_list = getattr(result, "data", None) or []
+                if not data_list:
+                    if attempt < max_retries - 1:
+                        if not self.sleep_with_cancel(3):
+                            return {"status": "cancelled", "index": idx, "seed": seed}
+                        continue
+                    return {"status": "failed", "index": idx, "seed": seed,
+                            "error": "No image in response", "elapsed": time.time() - start}
+                b64 = getattr(data_list[0], "b64_json", None)
+                if not b64:
+                    return {"status": "failed", "index": idx, "seed": seed,
+                            "error": "Seedream returned no b64_json", "elapsed": time.time() - start}
+                pil = _to_display_image(Image.open(io.BytesIO(base64.b64decode(b64))))
+                return {"status": "success", "index": idx, "seed": seed,
+                        "image": pil, "elapsed": time.time() - start, "api_used": "seedream"}
+            except Exception as e:
+                err = str(e)
+                if err == "Cancelled":
+                    return {"status": "cancelled", "index": idx, "seed": seed}
+                detail = f"{type(e).__name__}: {err}"
+                self.log(f"{label} failed: {detail[:400]}")
+                if self.is_retryable_error(err) and attempt < max_retries - 1:
+                    wt = delay + random.uniform(2, 8)
+                    if not self.sleep_with_cancel(wt):
+                        return {"status": "cancelled", "index": idx, "seed": seed}
+                    delay = min(delay * 2, 120)
+                    continue
+                return {"status": "failed", "index": idx, "seed": seed,
+                        "error": detail[:300], "elapsed": time.time() - start}
+        return {"status": "failed", "index": idx, "seed": seed,
+                "error": "Max retries exceeded", "elapsed": time.time() - start}
+
     def generate_one_image(self, job, prompt, ref_payloads, model, img_cfg, modalities):
         if model == GPT2_MODEL_ID:
             return self._generate_one_image_openai(job, prompt, ref_payloads, img_cfg)
+        if model in SEEDREAM_MODEL_IDS:
+            return self._generate_one_image_seedream(job, prompt, ref_payloads, model, img_cfg)
         idx = job["index"]
         total = job["total"]
         seed = job["seed"]
@@ -1840,7 +2063,7 @@ class AppState:
                         elapsed = result["elapsed"]
                         api_used = result["api_used"]
                         seed = result["seed"]
-                        fn = self.make_filename(seed, naming)
+                        fn = self.make_filename(seed, naming, model)
                         fp = os.path.join(job["output_dir"], fn)
                         self.save_generated_image(pil, fp, prompt, model)
                         self.done_count += 1
@@ -1890,6 +2113,7 @@ class AppState:
                             "filename": fn,
                             "elapsed": round(elapsed, 1),
                             "api_used": api_used,
+                            "model": model,
                             "done": self.done_count,
                             "failed": self.fail_count,
                             "total": self.queue_count,
@@ -2274,6 +2498,7 @@ def api_status():
         "vertex": state.vertex_status,
         "studio": state.studio_status,
         "openai": state.openai_status,
+        "seedream": state.seedream_status,
         "is_generating": state.is_generating,
         "done": state.done_count,
         "failed": state.fail_count,
@@ -2713,6 +2938,7 @@ def get_gallery():
             "aspect": item.get("aspect", ""),
             "elapsed_sec": round(item.get("elapsed_sec", 0), 1),
             "api_used": item.get("api_used", ""),
+            "model": item.get("generation_settings", {}).get("model", ""),
             "generated_at": item.get("generated_at", ""),
             "favorite": fp in state.favorites,
         })
@@ -2991,10 +3217,14 @@ def load_setup():
 def start_generate():
     model = state.model
     is_openai = (model == GPT2_MODEL_ID)
+    is_seedream = model in SEEDREAM_MODEL_IDS
 
     if is_openai:
         if not state.client_openai:
             return jsonify({"ok": False, "error": "OpenAI not connected — set OPENAI_API_KEY"})
+    elif is_seedream:
+        if not state.client_seedream:
+            return jsonify({"ok": False, "error": "Seedream not connected — set ARK_API_KEY"})
     else:
         if not state.client_vertex and not state.client_studio:
             return jsonify({"ok": False, "error": "No API connected"})
@@ -3005,6 +3235,8 @@ def start_generate():
 
     if is_openai:
         providers = ["openai"]
+    elif is_seedream:
+        providers = ["seedream"]
     else:
         providers = state.get_available_providers()
         if not providers:
@@ -3064,6 +3296,23 @@ def start_generate():
         else:
             size = gpt2_resolve_size(aspect, resolution, ref_size)
         img_cfg = {"size": size, "quality": state.quality or "high"}
+    elif is_seedream:
+        # Seedream size: Custom = explicit WxH (Method 1, clamped to the model's
+        # pixel cap). Named aspect / Auto = the resolution LEVEL (Method 2) with
+        # the aspect conveyed via the prompt, so we get the official table sizes
+        # (e.g. pro 2K 16:9 = 2848x1600) that the explicit-WxH path 400s on
+        # (Method-1 has a stricter pixel cap).
+        if aspect == "custom":
+            cw, ch, _sn = _seedream_custom_size(model, state.custom_w, state.custom_h)
+            img_cfg = {"size": "%dx%d" % (cw, ch)}
+        else:
+            level = resolution if resolution in _SEEDREAM_SIZES.get(model, {}) else _seedream_default_resolution(model)
+            img_cfg = {"size": level}
+            if aspect and aspect != "auto":
+                img_cfg["seedream_aspect"] = aspect
+        _of = _SEEDREAM_OUTPUT_FORMAT.get(model)
+        if _of:
+            img_cfg["output_format"] = _of
     else:
         # H2: Gemini "auto" = OMIT aspect_ratio so the model auto-matches the
         # input image ratio. Passing the literal "auto" string crashes

@@ -1002,6 +1002,7 @@ textarea.prompt-box { min-height: 82px; }
 .api-badge.vertex { color: var(--success); }
 .api-badge.studio { color: var(--warning); }
 .api-badge.openai { color: #64D2FF; }  /* cyan — distinct from warning-yellow (S) */
+.api-badge.seedream { color: #BF5AF2; }  /* purple — BytePlus Seedream */
 
 /* Meta row: resolution, aspect, timestamp */
 .card-meta {

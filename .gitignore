@@ -20,6 +20,11 @@ keys.env
 vertex-key.json
 *-key.json
 
+# Seedream (BytePlus) key installer — contains the real ARK key, NEVER commit
+시댄스 api key.bat
+시드림 api key.bat
+*api key.bat
+
 # Auto-updater overlay (user-local, not source)
 user_updates/
 

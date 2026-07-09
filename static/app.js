@@ -452,6 +452,24 @@ const MODEL_SPECS = {
     hint: "Lite: ultra-fast & low-cost. 1K only (2K/4K unsupported).",
     refHint: "3rd-gen models support up to 14 reference images.",
   },
+  "seedream-5-0-pro-260628": {
+    aspects: ["auto","1:1","4:3","3:4","16:9","9:16","3:2","2:3","21:9","custom"],
+    resolutions: ["1K","2K"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: false,
+    defaultAspect: "16:9", defaultResolution: "2K",
+    hint: "BytePlus Seedream 5.0 Pro - high precision. 1K/2K, png.",
+    refHint: "Up to 10 reference images. Mention them as 'image 1', 'image 2' in the prompt.",
+  },
+  "seedream-4-5-251128": {
+    aspects: ["auto","1:1","4:3","3:4","16:9","9:16","3:2","2:3","21:9","custom"],
+    resolutions: ["2K","4K"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: false,
+    defaultAspect: "16:9", defaultResolution: "2K",
+    hint: "BytePlus Seedream 4.5 - jpeg. 2K/4K.",
+    refHint: "Up to 14 reference images. Mention them as 'image 1', 'image 2' in the prompt.",
+  },
   "gpt-image-2": {
     aspects: ["auto","1:1","3:2","2:3","4:3","3:4","4:5","5:4","16:9","9:16","21:9","9:21","3:1","1:3","custom"],
     resolutions: ["1K","2K","4K"],
@@ -475,6 +493,25 @@ const _MODEL_ID_MIGRATIONS = {
 };
 function migrateModelId(m) {
   return _MODEL_ID_MIGRATIONS[m] || m;
+}
+
+// Short human-readable model name for gallery cards (the color badge only tells
+// the provider V/S/G/D, not which exact model made the image).
+const _MODEL_SHORT = {
+  "gemini-3-pro-image": "Gemini 3 Pro",
+  "gemini-3.1-flash-image": "Gemini 3.1 Flash",
+  "gemini-3.1-flash-lite-image": "Gemini 3.1 Lite",
+  "gemini-2.5-flash-image": "Gemini 2.5 Flash",
+  "gpt-image-2": "GPT Image 2",
+  "seedream-5-0-pro-260628": "Seedream 5 Pro",
+  "seedream-4-5-251128": "Seedream 4.5",
+};
+function _shortModel(m) {
+  if (!m) return "";
+  return _MODEL_SHORT[migrateModelId(m)] || m;
+}
+function _itemModel(item) {
+  return item.model || (item.generation_settings && item.generation_settings.model) || "";
 }
 
 function getModelSpec(model) {
@@ -550,6 +587,19 @@ function _cLcm(a,b){ return a/_cGcd(a,b)*b; }
 // Largest WxH at EXACTLY ratio p:q (both 16-multiples) within every gpt-image-2
 // cap (edge<=3840, pixels<=8.29M, ratio<=3:1). Returns [W,H] or null.
 function _customMaxAtRatio(p, q) {
+  const _m = document.getElementById("modelSelect").value;
+  if (_m && _m.indexOf("seedream-") === 0) {
+    // Seedream: no edge cap; largest 16-multiple size at ~this ratio within the
+    // model's max-pixel budget (ratio clamped to <=16:1). gpt's 3840/8.29M caps
+    // don't apply.
+    const _b = _SEEDREAM_CUSTOM_JS[_m] || _SEEDREAM_CUSTOM_JS["seedream-4-5-251128"];
+    const _g = _cGcd(p, q); let sp = p/_g, sq = q/_g;
+    if (sp > 16*sq) { sp = 16; sq = 1; } else if (sq > 16*sp) { sp = 1; sq = 16; }
+    const ar = sp/sq;
+    const W = _cFloor16(Math.sqrt(_b[1] * ar));
+    const H = _cFloor16(Math.sqrt(_b[1] / ar));
+    return (W >= 16 && H >= 16) ? [W, H] : null;
+  }
   const g=_cGcd(p,q); p=p/g; q=q/g;
   if (p > 3*q) { p=3; q=1; } else if (q > 3*p) { p=1; q=3; }   // clamp to <=3:1
   const t0=_cLcm(16/_cGcd(16,p), 16/_cGcd(16,q));
@@ -598,6 +648,43 @@ function gpt2CustomSize(w, h) {
 
 function _fmtPx(n){ return (n/1e6).toFixed(2) + "M px"; }
 
+// Seedream (BytePlus) custom-size mirror. Per-model pixel bounds; ratio<=16:1;
+// 16-multiple. Mirrors app.py _seedream_custom_size (server re-corrects on send).
+const _SEEDREAM_CUSTOM_JS = {
+  "seedream-5-0-pro-260628": [921600, 4194304],
+  "seedream-4-5-251128":     [3686400, 16777216],
+};
+function seedreamCustomSize(model, w, h) {
+  const b = _SEEDREAM_CUSTOM_JS[model] || _SEEDREAM_CUSTOM_JS["seedream-4-5-251128"];
+  const minpx = b[0], maxpx = b[1];
+  w = Math.max(16, Math.round(Number(w) || 0));
+  h = Math.max(16, Math.round(Number(h) || 0));
+  const notes = [];
+  if (w > 16*h) { h = _cCeil16(w/16); notes.push("16:1 클램프"); }
+  else if (h > 16*w) { w = _cCeil16(h/16); notes.push("16:1 클램프"); }
+  const aw = _cRound16(w), ah = _cRound16(h);
+  if ((aw !== w || ah !== h) && !notes.length) notes.push("16배수 정렬");
+  w = aw; h = ah;
+  if (w*h > maxpx) { const s = Math.sqrt(maxpx/(w*h)); w = _cFloor16(w*s); h = _cFloor16(h*s); notes.push("최대픽셀 축소"); }
+  let g = 0;
+  while (w*h < minpx && g < 64) {
+    const s = Math.sqrt(minpx/(w*h));
+    const nw = _cCeil16(w*s), nh = _cCeil16(h*s);
+    if (nw === w && nh === h) { if (w <= h) h = _cCeil16(h+16); else w = _cCeil16(w+16); }
+    else { w = nw; h = nh; }
+    if (!notes.includes("최소픽셀 확대")) notes.push("최소픽셀 확대");
+    g++;
+  }
+  if (w > 16*h) h = _cCeil16(w/16); else if (h > 16*w) w = _cCeil16(h/16);
+  return { w, h, notes };
+}
+// Model-aware custom-size correction (gpt-image-2 vs seedream-*).
+function customCorrectSize(w, h) {
+  const model = document.getElementById("modelSelect").value;
+  if (model && model.indexOf("seedream-") === 0) return seedreamCustomSize(model, w, h);
+  return gpt2CustomSize(w, h);
+}
+
 function updateCustomPreview() {
   const wEl = document.getElementById("customW"), hEl = document.getElementById("customH");
   const send = document.getElementById("customSend"), status = document.getElementById("customStatus");
@@ -608,7 +695,7 @@ function updateCustomPreview() {
     if (status) status.textContent = "";
     return;
   }
-  const { w, h, notes } = gpt2CustomSize(rw, rh);
+  const { w, h, notes } = customCorrectSize(rw, rh);
   send.textContent = `→ 전송: ${w} × ${h}`;
   send.className = "custom-send" + (notes.length ? " adjusted" : " ok");
   if (status) {
@@ -620,7 +707,7 @@ function updateCustomPreview() {
 function customSizeActive() {
   const model = document.getElementById("modelSelect").value;
   const asp = document.getElementById("aspectSelect").value;
-  return model === "gpt-image-2" && asp === "custom";
+  return asp === "custom" && getModelSpec(model).aspects.includes("custom");
 }
 
 function toggleCustomWrap() {
@@ -1919,10 +2006,12 @@ async function refreshGallery() {
       vertex: { cls: "vertex", text: " [V]" },
       studio: { cls: "studio", text: " [S]" },
       openai: { cls: "openai", text: " [G]" },
+      seedream: { cls: "seedream", text: " [D]" },
     };
     const bm = badgeMap[item.api_used] || badgeMap.studio;
     badge.className = "api-badge " + bm.cls;
     badge.textContent = bm.text;
+    badge.title = _shortModel(_itemModel(item)) || item.api_used;
     infoRight.appendChild(badge);
     infoRow.appendChild(infoRight);
     body.appendChild(infoRow);
@@ -1931,12 +2020,14 @@ async function refreshGallery() {
     const meta = document.createElement("div");
     meta.className = "card-meta";
     const parts = [];
+    const _mdl = _shortModel(_itemModel(item));
+    if (_mdl) parts.push(_mdl);
     if (item.aspect === "custom") {
       // Custom: show the real output pixels + ratio (the "4K"/"custom" labels are vague).
       const gs = item.generation_settings || {};
       const cw = Number(gs.custom_w), ch = Number(gs.custom_h);
       if (cw > 0 && ch > 0) {
-        const c = gpt2CustomSize(cw, ch);   // mirrors the server correction = actual output size
+        const c = customCorrectSize(cw, ch);   // mirrors the server correction = actual output size
         parts.push(`${c.w}×${c.h}`);
         parts.push(`${(Math.max(c.w, c.h) / Math.min(c.w, c.h)).toFixed(2)}:1`);
       } else {
@@ -2426,6 +2517,8 @@ async function refreshApiStatus() {
   document.getElementById("studioDot").className = "dot " + d.studio;
   const openaiDot = document.getElementById("openaiDot");
   if (openaiDot) openaiDot.className = "dot " + (d.openai || "disconnected");
+  const seedreamDot = document.getElementById("seedreamDot");
+  if (seedreamDot) seedreamDot.className = "dot " + (d.seedream || "disconnected");
   if (d.is_generating) updateGenUI(true, d.outstanding || 0);
   if (!d.is_generating && isGenerating) { updateGenUI(false, 0); refreshGallery(); }
   if (d.close_requested) showCloseDialog();

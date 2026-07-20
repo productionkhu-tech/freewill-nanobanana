@@ -254,6 +254,9 @@ Flask bg 스레드:
 9. `git push origin main`
 10. `git tag -a vXXX` + `git push origin vXXX`
 11. GitHub Release 생성 + EXE asset 업로드 (릴리스 body에 `sha256: <hex>` 포함 → 업데이터가 검증)
+    + **`NanoBanana.exe.sha256` 사이드카 asset도 반드시 업로드** (내용: `<hex>  NanoBanana.exe`).
+    api.github.com이 403(무인증 IP당 60회/h — 공유 IP에서 잘 터짐)일 때 업데이터가
+    `/releases/download/<tag>/...` 조립 URL로 폴백하는데, body를 못 읽으니 해시는 이 사이드카에서 가져옴 (v2026-07-2003+)
 
 ### 릴리스 노트 톤
 앱 내 "업데이트 완료" 팝업에 사용자가 봄. **개발자 용어 금지**:

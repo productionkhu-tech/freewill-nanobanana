@@ -143,27 +143,39 @@ def _find_release_assets(version_tag):
     If the release body contains a line like "sha256: <hex>" or there's a
     NanoBanana.exe.sha256 asset, that hash is returned and verified after
     download. Otherwise returns empty sha — size-only validation."""
-    req = urllib.request.Request(
-        f"{RELEASES_API}/tags/{version_tag}",
-        headers={
-            "User-Agent": "NanoBanana-Updater",
-            "Accept": "application/vnd.github+json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
     exe_url = ""
     sha_url = ""
-    for asset in data.get("assets", []):
-        name = asset.get("name", "").lower()
-        if name == "nanobanana.exe":
-            exe_url = asset.get("browser_download_url", "")
-        elif name == "nanobanana.exe.sha256":
-            sha_url = asset.get("browser_download_url", "")
-    # Inline sha256 in release body (preferred, no second asset needed)
-    body = (data.get("body") or "")
-    m = re.search(r"(?:sha-?256|hash)\s*[:=]\s*([0-9a-fA-F]{64})", body, re.IGNORECASE)
-    inline_sha = m.group(1).lower() if m else ""
+    inline_sha = ""
+    try:
+        req = urllib.request.Request(
+            f"{RELEASES_API}/tags/{version_tag}",
+            headers={
+                "User-Agent": "NanoBanana-Updater",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        for asset in data.get("assets", []):
+            name = asset.get("name", "").lower()
+            if name == "nanobanana.exe":
+                exe_url = asset.get("browser_download_url", "")
+            elif name == "nanobanana.exe.sha256":
+                sha_url = asset.get("browser_download_url", "")
+        # Inline sha256 in release body (preferred, no second asset needed)
+        body = (data.get("body") or "")
+        m = re.search(r"(?:sha-?256|hash)\s*[:=]\s*([0-9a-fA-F]{64})", body, re.IGNORECASE)
+        inline_sha = m.group(1).lower() if m else ""
+    except Exception as e:
+        # api.github.com can 403 on shared IPs (unauthenticated rate limit:
+        # 60 req/hour PER IP — corporate NAT burns through it). The actual
+        # release files live on /releases/download/ which has NO such limit,
+        # and the URL is fully determined by the tag — construct it.
+        print(f"  release API lookup failed ({e}); using constructed asset URLs")
+    if not exe_url:
+        exe_url = f"https://github.com/{REPO}/releases/download/{version_tag}/NanoBanana.exe"
+    if not sha_url and not inline_sha:
+        sha_url = f"https://github.com/{REPO}/releases/download/{version_tag}/NanoBanana.exe.sha256"
     # Fetch sidecar sha256 file if present
     remote_sha = ""
     if sha_url:

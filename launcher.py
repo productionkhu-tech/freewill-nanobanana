@@ -924,9 +924,11 @@ def main():
         except Exception as e:
             print(f"  Update check: {e}")
 
-    # NanoGPT 프로토타입 (오프라인 전용) — GitHub 릴리스 채널 없음. 자동
-    # 업데이트 체크 비활성. _bg_update_check 함수는 정의만 남기고 쓰레드는 안 띄움.
-    # threading.Thread(target=_bg_update_check, daemon=True).start()
+    # Auto-update check at every boot. This line was accidentally commented
+    # out for a "NanoGPT prototype" in v2026-06-1201 and shipped that way
+    # until v2026-07-2001 — every user on those builds got NO update popup
+    # (manual footer-click still worked). Do not disable on main again.
+    threading.Thread(target=_bg_update_check, daemon=True).start()
 
     # Start Flask server
     print(f"  Starting server on {APP_URL}")

@@ -18,11 +18,13 @@ import random
 import threading
 import base64
 import atexit
+import urllib.request
+import urllib.error
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 
 from flask import Flask, render_template, request, jsonify, send_file, Response
-from PIL import Image, ImageGrab
+from PIL import Image, ImageGrab, ImageDraw, ImageFilter
 from google import genai
 from google.genai import types
 
@@ -182,6 +184,19 @@ _SEEDREAM_CUSTOM = {
 }
 
 
+# ==========================================
+# Reve (api.reve.com) — REST image provider. NOT an SDK: plain HTTPS POST to
+# /v2/image/create with REVE_API_KEY as a bearer token. Isolated like GPT/Seedream.
+# Aspect-only (no resolution level / custom pixel). Phase 1 = text2img + refs.
+# v2 is synchronous (40-80s/image) -> request timeout must be >= 120s.
+# ==========================================
+REVE_BASE_URL = "https://api.reve.com"
+REVE_MODEL_IDS = ("reve-create",)
+# Full v2 aspect set (broader than our other models; includes extreme ratios + auto).
+REVE_ASPECTS = ("auto", "4:1", "3:1", "21:9", "2:1", "17:9", "16:9", "3:2",
+                "4:3", "5:4", "1:1", "4:5", "3:4", "2:3", "9:16", "1:2", "1:3", "1:4")
+
+
 def _seedream_default_resolution(model):
     return next(iter(_SEEDREAM_SIZES.get(model, {}).keys()), "2K")
 
@@ -264,6 +279,8 @@ def _model_file_prefix(model):
         return "GP2"
     if model in SEEDREAM_MODEL_IDS:
         return "SD"
+    if model in REVE_MODEL_IDS:
+        return "REV"
     return "nano"
 
 def _gpt2_custom_size(w, h):
@@ -429,6 +446,7 @@ class AppState:
         self.client_studio = None
         self.client_openai = None
         self.client_seedream = None
+        self.reve_api_key = None
         # Rate limit: UI hint says "10 RPM auto-throttled to ~8 RPM". That's
         # 1 request every 7.5s per provider. Previously this was 0.5s (120
         # RPM) — we'd hit 429s constantly.
@@ -438,6 +456,8 @@ class AppState:
         self.openai_rate_limiter = RateLimiter(interval=1.5)
         # Seedream (BytePlus) allows 500 RPM; a light interval keeps us safe.
         self.seedream_rate_limiter = RateLimiter(interval=0.3)
+        # Reve v2 is synchronous (40-80s/image); a light interval is fine.
+        self.reve_rate_limiter = RateLimiter(interval=0.3)
         self.is_generating = False
         self.cancel_flag = False
         self.done_count = 0
@@ -489,6 +509,8 @@ class AppState:
         # GPT Image 2 "Custom" aspect — raw user-entered pixels (pre-correction).
         self.custom_w = 1024
         self.custom_h = 1024
+        # Reve 전용 — remove_background postprocessing (누끼). 다른 모델은 무시.
+        self.reve_bg_remove = False
         self.fixed_prompt = ""
         self.prompt_sections = [""]
         self.naming_enabled = False
@@ -522,6 +544,7 @@ class AppState:
         self.studio_status = "disconnected"
         self.openai_status = "disconnected"
         self.seedream_status = "disconnected"
+        self.reve_status = "disconnected"
         self.vertex_credentials_path = None
         self.vertex_session_disabled = False
 
@@ -692,6 +715,16 @@ class AppState:
         else:
             self.log("Seedream: ARK_API_KEY not configured (skipped)")
             self.seedream_status = "disconnected"
+
+        # Reve (api.reve.com) — requires REVE_API_KEY. Plain REST (no SDK client).
+        reve_key = os.environ.get("REVE_API_KEY", "")
+        if reve_key:
+            self.reve_api_key = reve_key
+            self.log("Reve connected")
+            self.reve_status = "connected"
+        else:
+            self.log("Reve: REVE_API_KEY not configured (skipped)")
+            self.reve_status = "disconnected"
 
     def _openai_selftest(self):
         """앱 부팅 직후 OpenAI 연결을 1회 점검. models.list()는 무과금.
@@ -886,6 +919,8 @@ class AppState:
             return 16
         if m in SEEDREAM_MODEL_IDS:
             return 10 if m == "seedream-5-0-pro-260628" else 14
+        if m in REVE_MODEL_IDS:
+            return 8
         return 3 if m == "gemini-2.5-flash-image" else 14
 
     def _filled_ref_count(self):
@@ -1296,6 +1331,9 @@ class AppState:
             if filepath not in self.generated_paths:
                 self.generated_paths.append(filepath)
             self.project_dirty = True
+            # Change counter for lightweight pollers (preview window keeps
+            # its image list / metadata live off /api/gallery/rev).
+            self.gallery_rev = getattr(self, "gallery_rev", 0) + 1
         # Previously we wrote a per-image .meta.json sidecar here as a
         # "crash-recovery backup". In practice nothing in the codebase ever
         # read those files back, and _maybe_autosave() now flushes the whole
@@ -1324,6 +1362,7 @@ class AppState:
                     self.generated_paths.remove(filepath)
                 self.favorites.discard(filepath)
                 self.gallery_items.pop(filepath, None)
+                self.gallery_rev = getattr(self, "gallery_rev", 0) + 1
             # Also remove from refs if present — remove_ref grabs ref_lock.
             removed_ref_idx = None
             with self.ref_lock:
@@ -1339,6 +1378,7 @@ class AppState:
 
     def toggle_favorite(self, filepath):
         with self.gallery_lock:
+            self.gallery_rev = getattr(self, "gallery_rev", 0) + 1
             if filepath in self.favorites:
                 self.favorites.discard(filepath)
                 if filepath in self.gallery_items:
@@ -1428,6 +1468,7 @@ class AppState:
                 "quality": self.quality,
                 "custom_w": self.custom_w,
                 "custom_h": self.custom_h,
+                "reve_bg_remove": self.reve_bg_remove,
                 "count": str(self.count),
                 "output_dir": self.output_dir,
                 "naming": self.get_naming_settings(),
@@ -1491,6 +1532,7 @@ class AppState:
         self.quality = ui.get("quality", self.quality)
         self.custom_w = _safe_int(ui.get("custom_w"), self.custom_w, lo=16, hi=99999)
         self.custom_h = _safe_int(ui.get("custom_h"), self.custom_h, lo=16, hi=99999)
+        self.reve_bg_remove = bool(ui.get("reve_bg_remove", self.reve_bg_remove))
         # Tolerant parse — older projects sometimes have count="" which would
         # raise ValueError and abort load mid-way, losing the whole session.
         try:
@@ -1831,11 +1873,220 @@ class AppState:
         return {"status": "failed", "index": idx, "seed": seed,
                 "error": "Max retries exceeded", "elapsed": time.time() - start}
 
+    def _generate_one_image_reve(self, job, prompt, ref_payloads, model, img_cfg):
+        idx = job["index"]
+        total = job["total"]
+        seed = job["seed"]
+        label = "Reve"
+        refs = [p for p in (ref_payloads or []) if p]
+        self.log(f"[{idx+1}/{total}] Queued on {label} ({model})")
+        if not self.reve_api_key:
+            return {"status": "failed", "index": idx, "seed": seed,
+                    "error": "Reve not connected (set REVE_API_KEY)", "elapsed": 0.0}
+        # [Image N] -> "image N" (Reve has no positional tag; describe in words).
+        prompt_s = _seedream_prompt(prompt)
+        body = {"prompt": prompt_s, "version": "latest"}
+        asp = img_cfg.get("reve_aspect")
+        if asp:
+            body["aspect_ratio"] = asp
+        if refs:
+            # v2/image/create takes raw image objects directly in `references`.
+            body["references"] = [
+                {"data": base64.b64encode(b).decode("ascii")} for b in refs
+            ]
+        pp = img_cfg.get("postprocessing")
+        if pp:
+            body["postprocessing"] = pp
+        data = json.dumps(body).encode("utf-8")
+        headers = {
+            "Authorization": "Bearer " + self.reve_api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        url = REVE_BASE_URL + "/v2/image/create"
+
+        max_retries = 5
+        delay = 10
+        start = time.time()
+        for attempt in range(max_retries):
+            if self.cancel_flag:
+                return {"status": "cancelled", "index": idx, "seed": seed}
+            limiter = self.reve_rate_limiter
+            if limiter and not limiter.acquire(should_cancel=lambda: self.cancel_flag):
+                return {"status": "cancelled", "index": idx, "seed": seed}
+            try:
+                self.log(f"{label} requesting...")
+                t = time.time()
+                req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+                # v2 is synchronous 40-80s; give it 180s of slack.
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    raw = resp.read()
+                    ecode = resp.headers.get("X-Reve-Error-Code")
+                self.log(f"{label} OK ({time.time()-t:.1f}s)")
+                if ecode:
+                    return {"status": "failed", "index": idx, "seed": seed,
+                            "error": "Reve: %s" % ecode, "elapsed": time.time() - start}
+                obj = json.loads(raw.decode("utf-8"))
+                if obj.get("content_violation"):
+                    return {"status": "failed", "index": idx, "seed": seed,
+                            "error": "Content policy violation", "elapsed": time.time() - start}
+                b64 = obj.get("image")
+                if not b64:
+                    return {"status": "failed", "index": idx, "seed": seed,
+                            "error": "Reve returned no image", "elapsed": time.time() - start}
+                pil = _to_display_image(Image.open(io.BytesIO(base64.b64decode(b64))))
+                return {"status": "success", "index": idx, "seed": seed,
+                        "image": pil, "elapsed": time.time() - start, "api_used": "reve"}
+            except urllib.error.HTTPError as e:
+                try:
+                    ebody = e.read().decode("utf-8", "replace")
+                except Exception:
+                    ebody = ""
+                ecode = ""
+                try:
+                    ecode = json.loads(ebody).get("error_code", "")
+                except Exception:
+                    pass
+                detail = "HTTP %s %s %s" % (e.code, ecode, ebody[:200])
+                self.log(f"{label} failed: {detail[:400]}")
+                if (e.code == 429 or e.code >= 500) and attempt < max_retries - 1:
+                    wt = delay + random.uniform(2, 8)
+                    if not self.sleep_with_cancel(wt):
+                        return {"status": "cancelled", "index": idx, "seed": seed}
+                    delay = min(delay * 2, 120)
+                    continue
+                return {"status": "failed", "index": idx, "seed": seed,
+                        "error": detail[:300], "elapsed": time.time() - start}
+            except Exception as e:
+                err = str(e)
+                if err == "Cancelled":
+                    return {"status": "cancelled", "index": idx, "seed": seed}
+                detail = f"{type(e).__name__}: {err}"
+                self.log(f"{label} failed: {detail[:400]}")
+                if self.is_retryable_error(err) and attempt < max_retries - 1:
+                    wt = delay + random.uniform(2, 8)
+                    if not self.sleep_with_cancel(wt):
+                        return {"status": "cancelled", "index": idx, "seed": seed}
+                    delay = min(delay * 2, 120)
+                    continue
+                return {"status": "failed", "index": idx, "seed": seed,
+                        "error": detail[:300], "elapsed": time.time() - start}
+        return {"status": "failed", "index": idx, "seed": seed,
+                "error": "Max retries exceeded", "elapsed": time.time() - start}
+
+    # ---- Reve layout pipeline (Phase 2 edit window) -------------------------
+    def _reve_post(self, path, body, want_image, max_retries=4):
+        """Shared Reve REST POST for the layout endpoints. Returns a result dict
+        {"ok", "layout"?, "image"?(PIL), "credits_used"?, "error"?}.
+
+        429 (MODEL_THROTTLED — transient server-side congestion, seen live
+        2026-07-16) and 5xx are retried with backoff instead of failing the
+        whole pipeline; the editor's busy counter just keeps ticking."""
+        if not self.reve_api_key:
+            return {"ok": False, "error": "Reve not connected (set REVE_API_KEY)"}
+        data = json.dumps(body).encode("utf-8")
+        headers = {"Authorization": "Bearer " + self.reve_api_key,
+                   "Content-Type": "application/json", "Accept": "application/json"}
+        delay = 8
+        last_err = "request failed"
+        for attempt in range(max_retries):
+            req = urllib.request.Request(REVE_BASE_URL + path, data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    raw = resp.read()
+                    ecode = resp.headers.get("X-Reve-Error-Code")
+                if ecode:
+                    return {"ok": False, "error": "Reve: %s" % ecode}
+                obj = json.loads(raw.decode("utf-8"))
+                if obj.get("content_violation"):
+                    return {"ok": False, "error": "Content policy violation"}
+                out = {"ok": True, "layout": obj.get("layout"),
+                       "credits_used": obj.get("credits_used"),
+                       "credits_remaining": obj.get("credits_remaining")}
+                if want_image:
+                    b64 = obj.get("image")
+                    if not b64:
+                        return {"ok": False, "error": "Reve returned no image"}
+                    out["image"] = _to_display_image(Image.open(io.BytesIO(base64.b64decode(b64))))
+                return out
+            except urllib.error.HTTPError as e:
+                try:
+                    ebody = e.read().decode("utf-8", "replace")
+                    ec = json.loads(ebody).get("error_code", "")
+                except Exception:
+                    ebody = ""
+                    ec = ""
+                # Keep the full params section — Reve's validation errors put
+                # the offending parameter_name/constraint past 200 chars.
+                last_err = "HTTP %s %s %s" % (e.code, ec, ebody[:600])
+                if (e.code == 429 or e.code >= 500) and attempt < max_retries - 1:
+                    time.sleep(delay + random.uniform(1, 4))
+                    delay = min(delay * 2, 45)
+                    continue
+                return {"ok": False, "error": last_err}
+            except Exception as e:
+                # Network blips (URLError/timeout) are worth one more shot too.
+                last_err = "%s: %s" % (type(e).__name__, str(e)[:200])
+                if attempt < max_retries - 1:
+                    time.sleep(delay + random.uniform(1, 4))
+                    delay = min(delay * 2, 45)
+                    continue
+                return {"ok": False, "error": last_err}
+        return {"ok": False, "error": last_err}
+
+    def _reve_extract_layout(self, image_bytes, prompt=None):
+        """Reve extract_layout: image -> structured layout JSON."""
+        body = {"image": {"data": base64.b64encode(image_bytes).decode("ascii")},
+                "version": "latest"}
+        if prompt:
+            body["prompt"] = prompt
+        return self._reve_post("/v2/image/extract_layout", body, want_image=False)
+
+    def _reve_edit(self, instruction, image_bytes, postprocessing=None):
+        """Reve v1/image/edit: the DEDICATED editing model (reve-edit@...).
+        Targeted edits that preserve the rest of the image far better than
+        regenerating via create. Single reference image + plain instruction
+        (auto-enhanced by the model, <= 2560 chars). Aspect ratio omitted ->
+        follows the reference image."""
+        body = {"edit_instruction": instruction,
+                "reference_image": base64.b64encode(image_bytes).decode("ascii"),
+                "version": "latest"}
+        if postprocessing:
+            body["postprocessing"] = postprocessing
+        return self._reve_post("/v1/image/edit", body, want_image=True)
+
+    def _reve_render_layout(self, layout, refs=None, postprocessing=None,
+                            source_image=None, source_layout=None):
+        """Reve render_layout: target layout (+ optional refs) -> image.
+
+        source_image/source_layout: the image being EDITED and the layout that
+        describes it, sent together as compound reference #0 ({image, layout} =
+        the documented pixel<->structure mapping). Without it Reve regenerates
+        a brand-new image that merely matches the boxes+text — a completely
+        different picture. Callers that pass source must have shifted any
+        region image_index by +1 (user refs start at index 1)."""
+        body = {"layout": layout, "version": "latest"}
+        ref_list = []
+        if source_image:
+            ent = {"image": {"data": base64.b64encode(source_image).decode("ascii")}}
+            if isinstance(source_layout, dict) and source_layout.get("regions"):
+                ent["layout"] = source_layout
+            ref_list.append(ent)
+        for b in (refs or []):
+            ref_list.append({"image": {"data": base64.b64encode(b).decode("ascii")}})
+        if ref_list:
+            body["references"] = ref_list
+        if postprocessing:
+            body["postprocessing"] = postprocessing
+        return self._reve_post("/v2/image/render_layout", body, want_image=True)
+
     def generate_one_image(self, job, prompt, ref_payloads, model, img_cfg, modalities):
         if model == GPT2_MODEL_ID:
             return self._generate_one_image_openai(job, prompt, ref_payloads, img_cfg)
         if model in SEEDREAM_MODEL_IDS:
             return self._generate_one_image_seedream(job, prompt, ref_payloads, model, img_cfg)
+        if model in REVE_MODEL_IDS:
+            return self._generate_one_image_reve(job, prompt, ref_payloads, model, img_cfg)
         idx = job["index"]
         total = job["total"]
         seed = job["seed"]
@@ -2388,6 +2639,7 @@ def viewer():
     return _render_html("viewer.html")
 
 
+
 @app.route("/prompt-popup")
 def prompt_popup():
     return _render_html("prompt_popup.html")
@@ -2499,6 +2751,7 @@ def api_status():
         "studio": state.studio_status,
         "openai": state.openai_status,
         "seedream": state.seedream_status,
+        "reve": state.reve_status,
         "is_generating": state.is_generating,
         "done": state.done_count,
         "failed": state.fail_count,
@@ -2520,6 +2773,7 @@ def get_settings():
         "quality": state.quality,
         "custom_w": state.custom_w,
         "custom_h": state.custom_h,
+        "reve_bg_remove": state.reve_bg_remove,
         "count": state.count,
         "output_dir": state.output_dir,
         "fixed_prompt": state.fixed_prompt,
@@ -2566,6 +2820,8 @@ def update_settings():
         state.output_dir = str(d["output_dir"])
     if "naming_enabled" in d:
         state.naming_enabled = bool(d.get("naming_enabled"))
+    if "reve_bg_remove" in d:
+        state.reve_bg_remove = bool(d.get("reve_bg_remove"))
     if "naming_padding" in d:
         state.naming_padding = _safe_int(d.get("naming_padding"), state.naming_padding, lo=1, hi=5)
     if "prompt_sections" in d:
@@ -2945,6 +3201,70 @@ def get_gallery():
     return jsonify({"items": items, "count": len(items)})
 
 
+# --- Reve layout edit window (Phase 2) ---
+def _reve_load_source_bytes(path):
+    """Load an image file and downscale it to Reve's per-image input limits
+    (each side <= 8192, <= 33,554,432 px). Returns PNG bytes."""
+    img = _to_display_image(Image.open(path))
+    w, h = img.size
+    scale = 1.0
+    if w > 8192 or h > 8192:
+        scale = min(8192.0 / w, 8192.0 / h)
+    if (w * scale) * (h * scale) > 33_554_432:
+        scale = min(scale, (33_554_432.0 / (w * h)) ** 0.5)
+    if scale < 1.0:
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _reve_apply_crop_edit(base, bbox, instruction):
+    """Crop bbox(+margin) out of base, run the crop through v1/edit with the
+    given instruction, feather-paste the result back in place. Mutates base.
+    Returns (ok, error, credits_used). Used as the fallback when create_layout
+    ignores a change command (small regions, measured 2026-07-16) — the crop
+    path applies the edit locally and keeps every other pixel untouched."""
+    W, H = base.size
+    try:
+        x0 = float(bbox.get("x0", 0)); y0 = float(bbox.get("y0", 0))
+        x1 = float(bbox.get("x1", 1)); y1 = float(bbox.get("y1", 1))
+    except (TypeError, ValueError):
+        return False, "bad bbox", 0
+    if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
+        return False, "bad bbox", 0
+    bw = (x1 - x0) * W; bh = (y1 - y0) * H
+    mx = max(bw * 0.25, 32.0); my = max(bh * 0.25, 32.0)
+    if bw + 2 * mx < 288: mx = (288 - bw) / 2
+    if bh + 2 * my < 288: my = (288 - bh) / 2
+    cx0 = max(0, int(x0 * W - mx)); cy0 = max(0, int(y0 * H - my))
+    cx1 = min(W, int(x1 * W + mx)); cy1 = min(H, int(y1 * H + my))
+    if cx1 - cx0 < 16 or cy1 - cy0 < 16:
+        return False, "region too small", 0
+    crop = base.crop((cx0, cy0, cx1, cy1))
+    cw, ch = crop.size
+    send = crop
+    scale = 1.0
+    if cw > 8192 or ch > 8192:
+        scale = min(8192.0 / cw, 8192.0 / ch)
+    if (cw * scale) * (ch * scale) > 33_554_432:
+        scale = min(scale, (33_554_432.0 / (cw * ch)) ** 0.5)
+    if scale < 1.0:
+        send = crop.resize((max(1, int(cw * scale)), max(1, int(ch * scale))), Image.LANCZOS)
+    buf = io.BytesIO()
+    send.save(buf, "PNG")
+    res = state._reve_edit(instruction, buf.getvalue())
+    if not res.get("ok"):
+        return False, res.get("error", "edit failed"), 0
+    patch = res["image"].resize((cw, ch), Image.LANCZOS).convert(base.mode)
+    f = max(6, int(min(cw, ch) * 0.05))
+    mask = Image.new("L", (cw, ch), 255)
+    ImageDraw.Draw(mask).rectangle([0, 0, cw - 1, ch - 1], outline=0, width=f)
+    mask = mask.filter(ImageFilter.GaussianBlur(f))
+    base.paste(patch, (cx0, cy0), mask)
+    return True, None, (res.get("credits_used") or 0)
+
+
 def _is_path_allowed(fp):
     """Only allow files that the app itself produced or the user explicitly
     pulled into the app. Prevents /api/gallery/image?path=C:\\Windows\\win.ini
@@ -3016,12 +3336,95 @@ def _is_path_allowed(fp):
     return False
 
 
+@app.route("/api/gallery/rev")
+def gallery_rev():
+    """Cheap change counter — the preview window polls this to keep its
+    image list, counter and OK컷 states live (delete / new generation /
+    favorite toggles in the main window)."""
+    return jsonify({"rev": getattr(state, "gallery_rev", 0)})
+
+
 @app.route("/api/gallery/image")
 def serve_gallery_image():
     fp = request.args.get("path", "")
     if not fp or not _is_path_allowed(fp):
         return "", 404
     return send_file(fp, mimetype="image/png")
+
+
+# --- Viewer -> main window bridge -----------------------------------------
+# The preview window and the main window are separate WebView2 pages; the
+# main window already polls /api/events, so the viewer reports through the
+# same event queue: which image is on screen (gallery follows + highlights),
+# selection toggles, and "refresh your cards" after a favorite change.
+
+@app.route("/api/viewer/state", methods=["POST"])
+def viewer_report_state():
+    d = request.json or {}
+    fp = d.get("filepath", "")
+    if fp:
+        state.push_event({"type": "viewer_state", "path": fp})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/viewer/select", methods=["POST"])
+def viewer_report_select():
+    d = request.json or {}
+    fp = d.get("filepath", "")
+    if fp:
+        state.push_event({"type": "viewer_select", "path": fp,
+                          "selected": bool(d.get("selected"))})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/viewer/refresh", methods=["POST"])
+def viewer_request_refresh():
+    state.push_event({"type": "gallery_dirty"})
+    return jsonify({"ok": True})
+
+
+# Card drag relay: native OLE drag-drop between the main window and the
+# viewer (same process, same UI thread) can DEADLOCK WebView2, so the main
+# window posts dragstart/dragend here and the viewer polls + consumes when
+# the release point landed inside its bounds.
+
+@app.route("/api/viewer/drag", methods=["POST"])
+def viewer_drag_start():
+    d = request.json or {}
+    fp = d.get("filepath", "")
+    state.viewer_drag = {"path": fp, "ts": time.time(), "drop": None, "consumed": False}
+    return jsonify({"ok": True})
+
+
+@app.route("/api/viewer/drag_end", methods=["POST"])
+def viewer_drag_end():
+    d = request.json or {}
+    vd = getattr(state, "viewer_drag", None)
+    if vd and vd.get("path") and vd.get("path") == d.get("filepath"):
+        try:
+            vd["drop"] = {"x": float(d.get("x")), "y": float(d.get("y")),
+                          "ts": time.time()}
+        except (TypeError, ValueError):
+            pass
+    return jsonify({"ok": True})
+
+
+@app.route("/api/viewer/pending_drop")
+def viewer_pending_drop():
+    vd = getattr(state, "viewer_drag", None)
+    if (vd and vd.get("drop") and not vd.get("consumed")
+            and time.time() - vd["drop"]["ts"] < 3.0):
+        return jsonify({"ok": True, "path": vd["path"],
+                        "x": vd["drop"]["x"], "y": vd["drop"]["y"]})
+    return jsonify({"ok": False})
+
+
+@app.route("/api/viewer/consume_drop", methods=["POST"])
+def viewer_consume_drop():
+    vd = getattr(state, "viewer_drag", None)
+    if vd:
+        vd["consumed"] = True
+    return jsonify({"ok": True})
 
 
 @app.route("/api/gallery/thumb")
@@ -3039,7 +3442,8 @@ def serve_gallery_thumb():
             pil = _to_rgb_flatten(img)
             pil.thumbnail((size, size), Image.LANCZOS)
             buf = io.BytesIO()
-            pil.save(buf, "JPEG", quality=85)
+            # Larger previews (2-column and up) deserve less JPEG mush.
+            pil.save(buf, "JPEG", quality=(92 if size >= 1024 else 85))
         buf.seek(0)
         return send_file(buf, mimetype="image/jpeg")
     except Exception:
@@ -3081,11 +3485,39 @@ def toggle_fav():
 def open_explorer():
     d = request.json or {}
     fp = d.get("filepath", "")
-    if fp and os.path.exists(fp):
-        if sys.platform == "win32":
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(fp)])
-        return jsonify({"ok": True})
-    return jsonify({"ok": False})
+    if not fp or not os.path.exists(fp):
+        return jsonify({"ok": False})
+    if sys.platform == "win32":
+        # Popen(["explorer", "/select,", path]) is unreliable: the first call
+        # often just opens the folder and only a SECOND call selects the file
+        # (user-reported). SHOpenFolderAndSelectItems selects in one shot.
+        try:
+            import ctypes
+            from ctypes import wintypes
+            ole32 = ctypes.windll.ole32
+            shell32 = ctypes.windll.shell32
+            shell32.ILCreateFromPathW.restype = ctypes.c_void_p
+            shell32.ILCreateFromPathW.argtypes = [ctypes.c_wchar_p]
+            shell32.SHOpenFolderAndSelectItems.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, wintypes.DWORD]
+            shell32.ILFree.argtypes = [ctypes.c_void_p]
+            _co = ole32.CoInitialize(None)   # 0=S_OK, 1=S_FALSE(already) — both fine
+            try:
+                pidl = shell32.ILCreateFromPathW(os.path.normpath(fp))
+                if not pidl:
+                    raise OSError("ILCreateFromPathW failed")
+                try:
+                    hr = shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0)
+                    if hr != 0:
+                        raise OSError("SHOpenFolderAndSelectItems hr=%r" % hr)
+                finally:
+                    shell32.ILFree(pidl)
+            finally:
+                if _co in (0, 1):
+                    ole32.CoUninitialize()
+        except Exception:
+            subprocess.Popen('explorer /select,"%s"' % os.path.normpath(fp))
+    return jsonify({"ok": True})
 
 
 @app.route("/api/gallery/use-as-ref", methods=["POST"])
@@ -3218,6 +3650,7 @@ def start_generate():
     model = state.model
     is_openai = (model == GPT2_MODEL_ID)
     is_seedream = model in SEEDREAM_MODEL_IDS
+    is_reve = model in REVE_MODEL_IDS
 
     if is_openai:
         if not state.client_openai:
@@ -3225,6 +3658,9 @@ def start_generate():
     elif is_seedream:
         if not state.client_seedream:
             return jsonify({"ok": False, "error": "Seedream not connected — set ARK_API_KEY"})
+    elif is_reve:
+        if not state.reve_api_key:
+            return jsonify({"ok": False, "error": "Reve not connected — set REVE_API_KEY"})
     else:
         if not state.client_vertex and not state.client_studio:
             return jsonify({"ok": False, "error": "No API connected"})
@@ -3237,6 +3673,8 @@ def start_generate():
         providers = ["openai"]
     elif is_seedream:
         providers = ["seedream"]
+    elif is_reve:
+        providers = ["reve"]
     else:
         providers = state.get_available_providers()
         if not providers:
@@ -3313,6 +3751,34 @@ def start_generate():
         _of = _SEEDREAM_OUTPUT_FORMAT.get(model)
         if _of:
             img_cfg["output_format"] = _of
+    elif is_reve:
+        # Reve reference budget (documented):
+        #   per image: <= 33,554,432 px, <= 40MB, each dim <= 8192
+        #   per call : <= 50,331,648 px AND <= 100MB across all refs
+        _rpx = 0
+        _rby = 0
+        for _r, _p in zip(ref_snapshots, ref_payloads):
+            if _r is None or _p is None:
+                continue
+            _w, _h = _r.size
+            _ipx = _w * _h
+            _iby = len(_p)
+            _rpx += _ipx
+            _rby += _iby
+            if _ipx > 33_554_432 or _w > 8192 or _h > 8192 or _iby > 41_943_040:
+                return jsonify({"ok": False, "error":
+                    "Reve reference too large: %dx%d — per image max 8192/side, 33.5M px, 40MB." % (_w, _h)})
+        if _rpx > 50_331_648 or _rby > 104_857_600:
+            return jsonify({"ok": False, "error":
+                "Reve reference budget exceeded (%.1fM/50.3M px, %.0f/100 MB) — use fewer/smaller images."
+                % (_rpx / 1e6, _rby / 1024 / 1024)})
+        # Reve: aspect-only (no resolution level / custom pixel). "auto" -> omit
+        # so the model picks.
+        img_cfg = {}
+        if aspect and aspect != "auto":
+            img_cfg["reve_aspect"] = aspect
+        if state.reve_bg_remove:
+            img_cfg["postprocessing"] = [{"process": "remove_background"}]
     else:
         # H2: Gemini "auto" = OMIT aspect_ratio so the model auto-matches the
         # input image ratio. Passing the literal "auto" string crashes

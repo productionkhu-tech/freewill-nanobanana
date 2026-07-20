@@ -20,13 +20,17 @@ keys.env
 vertex-key.json
 *-key.json
 
-# Seedream (BytePlus) key installer — contains the real ARK key, NEVER commit
+# Seedream (BytePlus) / Reve key installers — contain real API keys, NEVER commit
 시댄스 api key.bat
 시드림 api key.bat
+레베 api key.bat
 *api key.bat
 
 # Auto-updater overlay (user-local, not source)
 user_updates/
+
+# Retired feature sources kept for reference (excluded from build & repo)
+_retired/
 
 # User output
 NanoBanana_Output/

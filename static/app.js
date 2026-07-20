@@ -4,6 +4,7 @@
 let galleryColumns = 2;
 let favoritesOnly = false;
 let selectedPaths = [];
+let _previewPath = null;   // image currently (or last) shown in the preview window
 let selectionAnchor = null;
 let viewerPath = null;
 let viewerState = null;
@@ -345,6 +346,8 @@ async function loadSettings() {
     count: String(d.count),
     quality: d.quality || "high",
   });
+  const _bgc = document.getElementById("reveBgRemoveChk");
+  if (_bgc) _bgc.checked = !!d.reve_bg_remove;
   // H7: applyModelSpec() above already populated AND selected each dropdown
   // (loaded value, else this model's default). Raw-setting .value here would
   // bypass that fallback and blank out any value the model no longer offers
@@ -470,6 +473,17 @@ const MODEL_SPECS = {
     hint: "BytePlus Seedream 4.5 - jpeg. 2K/4K.",
     refHint: "Up to 14 reference images. Mention them as 'image 1', 'image 2' in the prompt.",
   },
+  "reve-create": {
+    aspects: ["auto","4:1","3:1","21:9","2:1","17:9","16:9","3:2","4:3","5:4","1:1","4:5","3:4","2:3","9:16","1:2","1:3","1:4"],
+    resolutions: ["auto"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: false,
+    showResolution: false,
+    showBgRemove: true,
+    defaultAspect: "16:9", defaultResolution: "auto",
+    hint: "Reve 2.1 — text & reference-to-image. Wide aspects (4:1..1:4). ~40-80s/image.",
+    refHint: "Up to 8 reference images. Describe them in the prompt (no [Image N] tags).",
+  },
   "gpt-image-2": {
     aspects: ["auto","1:1","3:2","2:3","4:3","3:4","4:5","5:4","16:9","9:16","21:9","9:21","3:1","1:3","custom"],
     resolutions: ["1K","2K","4K"],
@@ -505,6 +519,7 @@ const _MODEL_SHORT = {
   "gpt-image-2": "GPT Image 2",
   "seedream-5-0-pro-260628": "Seedream 5 Pro",
   "seedream-4-5-251128": "Seedream 4.5",
+  "reve-create": "Reve 2.1",
 };
 function _shortModel(m) {
   if (!m) return "";
@@ -536,12 +551,58 @@ function repopulateSelect(id, values, preferred, fallback) {
   else sel.value = values[values.length - 1];
 }
 
+// Reve is budget-limited (not count-limited): total ref pixels <= 50.3M px AND
+// <= 100MB bytes across all refs. Show a live pixel gauge (bytes guarded server-side).
+const REVE_PX_BUDGET = 50331648;   // total across all refs
+const REVE_PX_PER_IMG = 33554432;  // per single image
+const REVE_DIM_MAX = 8192;         // each dimension, per image
+let _lastRefs = [];                // last /api/refs snapshot (for the budget gauge)
+function updateReveRefBudget(refs) {
+  const el = document.getElementById("reveRefBudget");
+  if (!el) return;
+  const model = document.getElementById("modelSelect").value;
+  if (model !== "reve-create") { el.style.display = "none"; return; }
+  let px = 0, n = 0; const bad = [];
+  (refs || []).forEach((r, i) => {
+    if (r && !r.empty && r.w && r.h) {
+      px += r.w * r.h; n++;
+      if (r.w * r.h > REVE_PX_PER_IMG || r.w > REVE_DIM_MAX || r.h > REVE_DIM_MAX) bad.push(i + 1);
+    }
+  });
+  el.style.display = "";
+  let msg = "Reve 레퍼런스 예산: " + (px / 1e6).toFixed(1) + "M / "
+          + (REVE_PX_BUDGET / 1e6).toFixed(1) + "M px (" + n + "장)";
+  if (bad.length) msg += " · " + bad.join(",") + "번 이미지 초과 (1장 33.5MP·8192px 한도)";
+  el.textContent = msg;
+  el.classList.toggle("hint-warn", px > REVE_PX_BUDGET || bad.length > 0);
+}
+
+// ============================================================
+// Reve layout editor — entry points only. The editor itself now
+// lives in its OWN window (/reve-editor + static/reve_editor.js)
+// so its close button can never be confused with the app's close
+// button. Single instance: JsApi.open_reve_editor reuses the
+// existing editor window (pywebview); the browser dev fallback
+// reuses a named window.
+// ============================================================
+let _reveOn = false;   // Reve API key present (from /api/status)
+// (Reve layout editor removed 2026-07-20 — generation only. History in
+// 인수인계_2026-07-15_Reve2.1.md; retired sources in _retired/.)
+// Reve-only sidebar toggle: remove_background postprocessing on generate.
+function onReveBgRemoveChange(v) {
+  api("/api/settings", { method: "POST", body: { reve_bg_remove: !!v } });
+}
+
 function applyModelSpec(model, preserved) {
   const spec = getModelSpec(model);
   // H8: migrate the wrong "0.5K" token (shipped v1201/02) back to "512px".
   const prefRes = preserved ? migrateResolution(preserved.resolution) : undefined;
   repopulateSelect("aspectSelect",     spec.aspects,     preserved?.aspect, spec.defaultAspect);
   repopulateSelect("resolutionSelect", spec.resolutions, prefRes,           spec.defaultResolution);
+  const rw = document.getElementById("resolutionWrap");
+  if (rw) rw.style.display = (spec.showResolution === false) ? "none" : "";
+  const bgRow = document.getElementById("reveBgRow");
+  if (bgRow) bgRow.style.display = spec.showBgRemove ? "" : "none";
   repopulateSelect("countSelect",      spec.counts,      preserved?.count);
   if (spec.showQuality) {
     repopulateSelect("qualitySelect", ["low","medium","high","auto"], preserved?.quality, spec.defaultQuality || "high");
@@ -561,6 +622,7 @@ function applyModelSpec(model, preserved) {
   }
   // Show/hide the Custom pixel inputs for the current model+aspect.
   if (typeof toggleCustomWrap === "function") toggleCustomWrap();
+  updateReveRefBudget(_lastRefs);
 }
 
 function onModelChange() {
@@ -1527,6 +1589,8 @@ async function refreshRefs() {
   const d = await api("/api/refs");
   refCount = d.count || 0;
   refSlotCount = d.slot_count || (d.refs ? d.refs.length : 0);
+  _lastRefs = d.refs || [];
+  updateReveRefBudget(_lastRefs);
   refFilledSlots = new Set();
   (d.refs || []).forEach((ref, i) => { if (!ref.empty) refFilledSlots.add(i + 1); });
   // Auto-follow slot-1 dimensions into the Custom inputs (no chip click needed).
@@ -1925,7 +1989,8 @@ async function refreshGallery() {
 
   items.forEach(item => {
     const card = document.createElement("div");
-    card.className = "card" + (selectedPaths.includes(item.filepath) ? " selected" : "");
+    card.className = "card" + (selectedPaths.includes(item.filepath) ? " selected" : "")
+      + (item.filepath === _previewPath ? " previewing" : "");
     card.dataset.path = item.filepath;
 
     // Allow dragging the card onto the reference area to "Use as Ref".
@@ -1938,6 +2003,22 @@ async function refreshGallery() {
         e.dataTransfer.setData("application/x-nb-gallery-path", item.filepath);
         e.dataTransfer.setData("text/plain", item.filepath);
       } catch (_) {}
+      // Relay for the PREVIEW window: native OLE drop between two WebView2
+      // windows in one process can deadlock, so the viewer refuses the
+      // native drop and consumes this instead (dragend posts the release
+      // point; the viewer polls and matches it against its own bounds).
+      api("/api/viewer/drag", { method: "POST", body: { filepath: item.filepath } }).catch(() => {});
+    });
+    card.addEventListener("dragend", (e) => {
+      // Relay ONLY when no native target accepted the drop (dropEffect
+      // "none"): a drop the ref area (or any in-app target) already handled
+      // must not ALSO reach the viewer — the windows can overlap, and the
+      // viewer's bounds check alone can't tell who was on top.
+      if (e.dataTransfer && e.dataTransfer.dropEffect !== "none") return;
+      api("/api/viewer/drag_end", {
+        method: "POST",
+        body: { filepath: item.filepath, x: e.screenX, y: e.screenY },
+      }).catch(() => {});
     });
 
     // --- Media frame ---
@@ -1960,7 +2041,9 @@ async function refreshGallery() {
     // dragstart (which stamps application/x-nb-gallery-path) effectively
     // never runs, and drops onto the ref area see nothing useful.
     img.draggable = false;
-    img.src = `/api/gallery/thumb?path=${encodeURIComponent(item.filepath)}&size=${thumbSize}`;
+    img.src = thumbSize > 0
+      ? `/api/gallery/thumb?path=${encodeURIComponent(item.filepath)}&size=${thumbSize}`
+      : `/api/gallery/image?path=${encodeURIComponent(item.filepath)}`;
     img.loading = "lazy";
     img.alt = item.filename || "";
     // Refine aspect from the actual image once loaded (handles legacy items
@@ -2007,6 +2090,7 @@ async function refreshGallery() {
       studio: { cls: "studio", text: " [S]" },
       openai: { cls: "openai", text: " [G]" },
       seedream: { cls: "seedream", text: " [D]" },
+      reve: { cls: "reve", text: " [R]" },
     };
     const bm = badgeMap[item.api_used] || badgeMap.studio;
     badge.className = "api-badge " + bm.cls;
@@ -2097,7 +2181,9 @@ async function refreshGallery() {
 }
 
 function getThumbSize() {
-  return galleryColumns <= 1 ? 920 : galleryColumns <= 2 ? 560 : galleryColumns <= 4 ? 320 : 180;
+  // 0 = serve the ORIGINAL file (1-column is the "확인용" full-width view —
+  // a 920px JPEG stretched across the window read as low quality).
+  return galleryColumns <= 1 ? 0 : galleryColumns <= 2 ? 1024 : galleryColumns <= 4 ? 480 : 240;
 }
 
 function filterGallery() {
@@ -2443,6 +2529,25 @@ async function pollEvents() {
       lastOutstanding = ev.outstanding;
       const sk = document.querySelector(".skeleton");
       if (sk) sk.remove();
+    } else if (ev.type === "viewer_state") {
+      // Preview window reports what it shows: mark + follow in the gallery.
+      // The mark stays after the viewer closes ("마지막으로 본 이미지").
+      _previewPath = ev.path;
+      document.querySelectorAll(".card.previewing").forEach(c => c.classList.remove("previewing"));
+      const pc = document.querySelector(`.card[data-path="${CSS.escape(ev.path)}"]`);
+      if (pc) {
+        pc.classList.add("previewing");
+        pc.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }
+    } else if (ev.type === "viewer_select") {
+      // Selection toggled from the preview window -> mirror into the grid.
+      const has = selectedPaths.includes(ev.path);
+      if (ev.selected && !has) selectedPaths = [...selectedPaths, ev.path];
+      if (!ev.selected && has) selectedPaths = selectedPaths.filter(p => p !== ev.path);
+      updateSelectionUI();
+    } else if (ev.type === "gallery_dirty") {
+      // e.g. favorite toggled in the preview window.
+      scheduleGalleryRefresh();
     } else if (ev.type === "update_status") {
       // Background check result. If an update is available, show the
       // in-page confirm dialog (frontend-owned, no Python MessageBox).
@@ -2519,6 +2624,10 @@ async function refreshApiStatus() {
   if (openaiDot) openaiDot.className = "dot " + (d.openai || "disconnected");
   const seedreamDot = document.getElementById("seedreamDot");
   if (seedreamDot) seedreamDot.className = "dot " + (d.seedream || "disconnected");
+  const reveDot = document.getElementById("reveDot");
+  if (reveDot) reveDot.className = "dot " + (d.reve || "disconnected");
+  _reveOn = (d.reve === "connected");
+  document.body.classList.toggle("reve-off", !_reveOn);
   if (d.is_generating) updateGenUI(true, d.outstanding || 0);
   if (!d.is_generating && isGenerating) { updateGenUI(false, 0); refreshGallery(); }
   if (d.close_requested) showCloseDialog();
@@ -2905,17 +3014,31 @@ let _marqueePreSelected = [];
 // (reference-monitor style, like the original desktop app).
 // Falls back to the in-page canvas modal when pywebview bridge is unavailable.
 // ==========================================
-function openViewerWindow(filepath) {
+function openViewerWindow(filepath, cmp) {
   if (window.pywebview && window.pywebview.api && window.pywebview.api.open_viewer) {
     try {
-      window.pywebview.api.open_viewer(filepath);
+      window.pywebview.api.open_viewer(filepath, cmp || null);
       return;
     } catch (e) {
       console.error("pywebview.api.open_viewer failed:", e);
     }
   }
+  if (cmp) {
+    window.open(`/viewer?path=${encodeURIComponent(filepath)}&cmp=${encodeURIComponent(cmp)}`, "nbViewer");
+    return;
+  }
   // Fallback: in-page modal viewer
   openViewer(filepath);
+}
+
+// Gallery header "⇆ 비교": open the split-compare viewer on the 2 selected
+// images (left = first selected).
+function openCompareSelected() {
+  if (selectedPaths.length !== 2) {
+    showToast("비교하려면 이미지 2개를 선택하세요 (Ctrl+클릭)", "warn");
+    return;
+  }
+  openViewerWindow(selectedPaths[0], selectedPaths[1]);
 }
 
 function openViewer(filepath) {

@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="nb-csrf" content="__CSRF_TOKEN__">
 <title>Image Viewer</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -51,6 +52,101 @@ header .nav button {
   font-family: inherit;
 }
 header .nav button:hover { background: #2D2F36; color: #F5F5F7; }
+header .act {
+  height: 28px;
+  border: 1px solid #2D2F36;
+  border-radius: 14px;
+  background: #18191C;
+  color: #A1A1A6;
+  font-size: 11px;
+  font-family: inherit;
+  padding: 0 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+header .act:hover { background: #2D2F36; color: #F5F5F7; }
+header .act:disabled { opacity: .4; cursor: default; }
+header .act.on-fav { background: #3A2A12; color: #FFD166; border-color: #FFD166; }
+header .act.on-sel { background: #2A1B22; color: #FF9EC4; border-color: #FF6FA5; }
+/* Per-image corner panels: filename / model·dims / actions */
+.sideTag {
+  position: absolute;
+  top: 10px;
+  z-index: 8;
+  max-width: 44%;
+  background: rgba(10,10,12,.82);
+  border: 1px solid #2D2F36;
+  border-radius: 8px;
+  padding: 7px 9px;
+  pointer-events: auto;
+}
+.sideTag.left { left: 10px; }
+.sideTag.right { right: 10px; text-align: right; }
+.sideTag .tg-name {
+  font-size: 11px;
+  font-weight: bold;
+  color: #F5F5F7;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sideTag .tg-sub {
+  font-size: 10px;
+  color: #A8B0BA;
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sideTag .tg-btns { margin-top: 6px; display: flex; gap: 4px; }
+.sideTag.right .tg-btns { justify-content: flex-end; }
+.sideTag .tg-btns button {
+  height: 22px;
+  border: 1px solid #2D2F36;
+  border-radius: 11px;
+  background: #18191C;
+  color: #A1A1A6;
+  font-size: 10px;
+  font-family: inherit;
+  padding: 0 9px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sideTag .tg-btns button:hover { background: #2D2F36; color: #F5F5F7; }
+.sideTag .tg-btns button:disabled { opacity: .4; cursor: default; }
+.sideTag .tg-btns button.on-fav { background: #3A2A12; color: #FFD166; border-color: #FFD166; }
+.sideTag .tg-btns button.on-sel { background: #2A1B22; color: #FF9EC4; border-color: #FF6FA5; }
+
+/* Drop guide: shows WHERE the dragged image will land (left=기준 / right=비교) */
+#dropGuide {
+  position: absolute;
+  inset: 0;
+  z-index: 15;
+  display: none;
+  pointer-events: none;
+  gap: 8px;
+  padding: 8px;
+}
+#dropGuide.show { display: flex; }
+#dropGuide .dg {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed rgba(255,158,196,.35);
+  border-radius: 10px;
+  color: rgba(255,158,196,.55);
+  font-size: 15px;
+  font-weight: bold;
+  background: rgba(255,158,196,.04);
+  transition: border-color .1s, color .1s, background .1s;
+  text-shadow: 0 1px 6px rgba(0,0,0,.7);
+}
+#dropGuide .dg.active {
+  border-color: #FF9EC4;
+  color: #FF9EC4;
+  background: rgba(255,158,196,.13);
+}
 header .counter {
   font-size: 10px;
   color: #636366;
@@ -62,13 +158,107 @@ header .hint {
   font-size: 10px;
   color: #636366;
 }
-#canvas {
+#stage {
+  position: relative;
   flex: 1;
+  min-height: 0;
+}
+#canvas {
+  width: 100%;
+  height: 100%;
   display: block;
   background: #050505;
   cursor: grab;
 }
 #canvas:active { cursor: grabbing; }
+/* Wide side click zones: prev (left) / next (right). Hidden while zoomed in
+   so panning a magnified image never fights them. */
+.navzone {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 16%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 5;
+  opacity: 0;
+  transition: opacity .15s;
+}
+.navzone:hover { opacity: 1; }
+.navzone.left  { left: 0;  background: linear-gradient(to right, rgba(0,0,0,.35), transparent); }
+.navzone.right { right: 0; background: linear-gradient(to left,  rgba(0,0,0,.35), transparent); }
+.navzone .arrow {
+  font-size: 46px;
+  color: rgba(245,245,247,.85);
+  text-shadow: 0 2px 10px rgba(0,0,0,.8);
+}
+/* Shortcut guide popup (top-right, ~5s on first open) */
+#hintPop {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 20;
+  background: rgba(17,17,20,.94);
+  border: 1px solid #2D2F36;
+  border-radius: 10px;
+  padding: 12px 16px;
+  font-size: 12px;
+  line-height: 1.8;
+  color: #D6D6DB;
+  box-shadow: 0 6px 24px rgba(0,0,0,.5);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .35s;
+}
+#hintPop.show { opacity: 1; pointer-events: auto; }
+#hintPop b { color: #FF9EC4; font-weight: 600; }
+#hintPop .t { font-weight: bold; color: #F5F5F7; margin-bottom: 4px; font-size: 12px; }
+/* Custom context menu */
+#ctxMenu {
+  position: fixed;
+  z-index: 30;
+  display: none;
+  background: #18191C;
+  border: 1px solid #2D2F36;
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.55);
+}
+#ctxMenu button {
+  display: block;
+  width: 100%;
+  border: none;
+  background: none;
+  color: #E8E8EC;
+  font-size: 12px;
+  font-family: inherit;
+  text-align: left;
+  padding: 7px 12px;
+  border-radius: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+#ctxMenu button:hover { background: #2D2F36; }
+/* Toast */
+#toast {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 25;
+  background: rgba(17,17,20,.95);
+  border: 1px solid #2D2F36;
+  color: #F5F5F7;
+  font-size: 12px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .25s;
+}
+#toast.show { opacity: 1; }
 footer {
   min-height: 48px;
   max-height: 160px;
@@ -97,13 +287,54 @@ footer {
 <header>
   <span class="title" id="title">Loading…</span>
   <span class="counter" id="counter"></span>
-  <div class="nav">
-    <button id="prevBtn" title="Previous (←)">&larr;</button>
-    <button id="nextBtn" title="Next (→)">&rarr;</button>
-  </div>
-  <span class="hint">Wheel = zoom, Drag = pan, ← → = navigate, Esc = close, 0 = fit</span>
+  <button class="act" id="cmpCloseBtn" style="display:none" title="비교 모드 종료 (Esc)">비교 닫기</button>
+  <span class="hint">휠 = 이전/다음 · Ctrl+휠 = 줌 · 더블클릭 = 화면 맞춤 · Ctrl+C = 복사 · F/S · Esc</span>
 </header>
-<canvas id="canvas"></canvas>
+<div id="stage">
+  <canvas id="canvas"></canvas>
+  <div class="navzone left" id="zonePrev" title="이전 이미지"><span class="arrow">&#8592;</span></div>
+  <div class="navzone right" id="zoneNext" title="다음 이미지"><span class="arrow">&#8594;</span></div>
+  <!-- Per-image info + actions, anchored to the image corners (헤더에 몰지
+       않기: 파일명·모델이 있는 자리에서 그 이미지의 버튼을 바로 누른다) -->
+  <div class="sideTag left" id="tagL">
+    <div class="tg-name" id="tagLName"></div>
+    <div class="tg-sub" id="tagLSub"></div>
+    <div class="tg-btns">
+      <button id="tagLFav" title="OK컷(★ 즐겨찾기) 토글 (F)">☆ OK컷</button>
+      <button id="tagLSel" title="갤러리에서 선택 토글 (S)">▢ 선택</button>
+      <button id="tagLFolder" title="저장 폴더 열기 (파일 선택된 채로)">폴더</button>
+    </div>
+  </div>
+  <div class="sideTag right" id="tagR" style="display:none">
+    <div class="tg-name" id="tagRName"></div>
+    <div class="tg-sub" id="tagRSub"></div>
+    <div class="tg-btns">
+      <button id="tagRFav" title="OK컷(★ 즐겨찾기) 토글">☆ OK컷</button>
+      <button id="tagRFolder" title="저장 폴더 열기">폴더</button>
+    </div>
+  </div>
+  <div id="dropGuide">
+    <div class="dg" id="dgL"><span>왼쪽(기준)으로 교체</span></div>
+    <div class="dg" id="dgR"><span>오른쪽(비교)으로</span></div>
+  </div>
+  <div id="hintPop">
+    <div class="t">단축키 안내</div>
+    <b>휠 ↑/↓</b> 다음/이전 이미지<br>
+    <b>Ctrl + 휠</b> 확대·축소 · <b>드래그</b> 이동<br>
+    <b>더블클릭</b> 또는 <b>0</b> 화면 맞춤 복귀<br>
+    <b>좌/우 가장자리 클릭</b> 이전/다음<br>
+    <b>Ctrl + C</b> / <b>우클릭</b> 이미지 복사<br>
+    <b>F</b> OK컷(★ 즐겨찾기) · <b>S</b> 갤러리에서 선택 · <b>Esc</b> 닫기<br>
+    <b>갤러리·외부 이미지를 끌어다 놓기</b> 나란히 비교 (놓는 쪽에 배치)
+  </div>
+  <div id="toast"></div>
+</div>
+<div id="ctxMenu">
+  <button id="ctxCopy">이미지 복사 (Ctrl+C)</button>
+  <button id="ctxFav">즐겨찾기 토글 (F)</button>
+  <button id="ctxSel">선택 토글 (S)</button>
+  <button id="ctxFit">화면 맞춤 (더블클릭 / 0)</button>
+</div>
 <footer>
   <div class="label">Prompt</div>
   <div id="prompt" class="empty">—</div>
@@ -111,42 +342,246 @@ footer {
 
 <script>
 const canvas = document.getElementById("canvas");
+const stage = document.getElementById("stage");
 const ctx = canvas.getContext("2d");
-let state = { img: null, scale: 1, offsetX: 0, offsetY: 0, dragging: false, lastX: 0, lastY: 0 };
+const CSRF = (document.querySelector('meta[name="nb-csrf"]') || {}).content || "";
+let state = { img: null, scale: 1, fitScale: 1, offsetX: 0, offsetY: 0,
+              dragging: false, lastX: 0, lastY: 0 };
 
 let currentPath = new URLSearchParams(location.search).get("path") || "";
 let galleryPaths = [];
+// Split-compare mode: left pane = currentPath, right pane = cmp.path, BOTH
+// drawn at the SAME scale (fit of the higher-res image) with synced zoom/pan.
+// Wipe compare: both images aligned full-canvas at the SAME scale (fit of
+// the higher-res one); a draggable divider shows LEFT=current, RIGHT=compare.
+const cmp = { on: false, img: null, path: "", objUrl: null, split: 0.5, dragSplit: false };
+const _cmpParam = new URLSearchParams(location.search).get("cmp") || "";
+let galleryMeta = {};   // filepath -> gallery item (model/resolution/aspect...)
 
+// Canvas backing store follows devicePixelRatio — without this, Windows
+// display scaling (125/150%) renders the image below native resolution and
+// everything looks soft. Drawing math stays in CSS pixels via setTransform.
 function resizeCanvas() {
-  canvas.width = canvas.clientWidth;
-  canvas.height = canvas.clientHeight;
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+  const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  if (canvas.width !== w) canvas.width = w;
+  if (canvas.height !== h) canvas.height = h;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function viewSize() {
+  return { w: canvas.clientWidth, h: canvas.clientHeight };
 }
 
 function fit() {
   if (!state.img) return;
   resizeCanvas();
-  const s = Math.min(canvas.width / state.img.width, canvas.height / state.img.height);
+  const v = viewSize();
+  const s = Math.min(v.w / state.img.width, v.h / state.img.height);
   state.scale = s;
-  state.offsetX = (canvas.width - state.img.width * s) / 2;
-  state.offsetY = (canvas.height - state.img.height * s) / 2;
+  state.fitScale = s;
+  state.offsetX = (v.w - state.img.width * s) / 2;
+  state.offsetY = (v.h - state.img.height * s) / 2;
   render();
 }
 
 function render() {
   if (!state.img) return;
   resizeCanvas();
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const v = viewSize();
+  ctx.clearRect(0, 0, v.w, v.h);
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
+  if (cmp.on && cmp.img) { renderWipe(v); return; }
   ctx.drawImage(state.img, state.offsetX, state.offsetY,
     state.img.width * state.scale, state.img.height * state.scale);
 }
 
+// --- wipe compare --------------------------------------------------------
+// Both images centered full-canvas with one shared scale/pan; the divider
+// clips LEFT=current image, RIGHT=compare image.
+function fitCmp() {
+  if (!state.img || !cmp.img) return;
+  resizeCanvas();
+  const v = viewSize();
+  // Both sides render at the SAME DISPLAY HEIGHT (differing heights read as
+  // "비율이 안 맞는다"); at fit, the height is the largest that lets BOTH
+  // images fit the canvas fully. state.scale is that height / tallest image.
+  const hiH = Math.max(state.img.height, cmp.img.height);
+  const fitH = Math.min(
+    state.img.height * Math.min(v.w / state.img.width, v.h / state.img.height),
+    cmp.img.height * Math.min(v.w / cmp.img.width, v.h / cmp.img.height));
+  state.scale = fitH / hiH;
+  state.fitScale = state.scale;
+  state.offsetX = 0;
+  state.offsetY = 0;
+  render();
+}
+
+// Info for one side of the wipe: filename + model + pixel dims.
+function _sideInfo(path, im, external) {
+  const name = (path || "").split(/[/\\]/).pop() || "";
+  const meta = galleryMeta[path];
+  const model = external ? "외부 이미지"
+    : ((meta && (meta.model || meta.api_used)) || "");
+  const dims = im ? `${im.naturalWidth || im.width}×${im.naturalHeight || im.height}` : "";
+  const fav = !external && !!(meta && meta.favorite);
+  return { name: (fav ? "★ " : "") + name, sub: [model, dims].filter(Boolean).join(" · ") };
+}
+
+function renderWipe(v) {
+  const imgs = [state.img, cmp.img];
+  const sx = Math.max(0, Math.min(1, cmp.split)) * v.w;
+  // SAME display height for both sides, horizontally centered together —
+  // resolutions and even aspect ratios can differ, the wipe still reads as
+  // one continuous picture.
+  const hiH = Math.max(state.img.height, cmp.img.height);
+  const dh = hiH * state.scale;
+  const dy = (v.h - dh) / 2 + state.offsetY;
+  for (let i = 0; i < 2; i++) {
+    const im = imgs[i];
+    const si = dh / im.height;
+    const dw = im.width * si;
+    const dx = (v.w - dw) / 2 + state.offsetX;
+    ctx.save();
+    ctx.beginPath();
+    if (i === 0) ctx.rect(0, 0, sx, v.h);
+    else ctx.rect(sx, 0, v.w - sx, v.h);
+    ctx.clip();
+    ctx.drawImage(im, dx, dy, dw, dh);
+    ctx.restore();
+  }
+  // divider + drag handle
+  ctx.fillStyle = "rgba(255,255,255,.92)";
+  ctx.fillRect(sx - 1, 0, 2, v.h);
+  ctx.beginPath();
+  ctx.arc(sx, v.h / 2, 16, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(17,17,20,.9)";
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = "rgba(255,255,255,.92)";
+  ctx.stroke();
+  ctx.fillStyle = "#F5F5F7";
+  ctx.font = "bold 12px 'Segoe UI',sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("◀ ▶", sx, v.h / 2 + 1);
+  ctx.textAlign = "start";
+  ctx.textBaseline = "alphabetic";
+  // (per-side info + actions live in the DOM corner panels — .sideTag)
+}
+
+function syncCmpUI() {
+  document.getElementById("cmpCloseBtn").style.display = cmp.on ? "" : "none";
+  document.getElementById("zonePrev").style.display = cmp.on ? "none" : "flex";
+  document.getElementById("zoneNext").style.display = cmp.on ? "none" : "flex";
+  if (!cmp.on) canvas.style.cursor = "grab";
+  updateTitleAndCounter();
+  updateActButtons();
+}
+
+function _cmpDropObjUrl() {
+  if (cmp.objUrl) {
+    try { URL.revokeObjectURL(cmp.objUrl); } catch (_) {}
+    cmp.objUrl = null;
+  }
+}
+
+function enterCompare(pathB) {
+  const seq = ++_cmpSeq;
+  const im = new Image();
+  im.onload = () => {
+    if (seq !== _cmpSeq) return;   // superseded by a newer compare load
+    _cmpDropObjUrl();
+    cmp.img = im;
+    cmp.path = pathB;
+    cmp.on = true;
+    cmp.split = 0.5;
+    _cmpKnown = !!galleryMeta[pathB];
+    syncCmpUI();
+    fitCmp();
+  };
+  im.onerror = () => { if (seq === _cmpSeq) showToast("비교 이미지를 불러오지 못했습니다"); };
+  im.src = `/api/gallery/image?path=${encodeURIComponent(pathB)}`;
+}
+
+// OS file drop (Explorer, browser download 등) -> right pane. Ephemeral by
+// nature: switching the viewer image or closing the window ends it. The
+// same-scale rule already favors the higher-resolution side.
+function enterCompareExternal(file) {
+  const seq = ++_cmpSeq;
+  const url = URL.createObjectURL(file);
+  const im = new Image();
+  im.onload = () => {
+    if (seq !== _cmpSeq) { try { URL.revokeObjectURL(url); } catch (_) {} return; }
+    _cmpDropObjUrl();
+    cmp.objUrl = url;
+    cmp.img = im;
+    cmp.path = file.name || "외부 이미지";
+    cmp.on = true;
+    cmp.split = 0.5;
+    _cmpKnown = false;   // not a gallery image — deletion sync doesn't apply
+    syncCmpUI();
+    fitCmp();
+    showToast("외부 이미지와 비교 — 배율은 고해상도 쪽 기준");
+  };
+  im.onerror = () => {
+    try { URL.revokeObjectURL(url); } catch (_) {}
+    if (seq === _cmpSeq) showToast("이미지 파일을 불러오지 못했습니다");
+  };
+  im.src = url;
+}
+
+function exitCompare() {
+  _cmpDropObjUrl();
+  cmp.on = false;
+  cmp.img = null;
+  cmp.path = "";
+  syncCmpUI();
+  fit();
+}
+
+// Wheel / arrows while comparing: swap the RIGHT image through the gallery
+// (left stays fixed) — compare one base against many variants.
+function cmpNavigate(step) {
+  if (!cmp.on || !galleryPaths.length) return;
+  let idx = galleryPaths.indexOf(cmp.path);
+  if (idx === -1) idx = 0;
+  idx = (idx + step + galleryPaths.length) % galleryPaths.length;
+  if (galleryPaths[idx] === cmp.path) return;
+  const p = galleryPaths[idx];
+  const seq = ++_cmpSeq;
+  cmp.path = p;   // advance the cursor NOW so rapid wheel steps chain in order
+  updateTitleAndCounter();
+  const im = new Image();
+  im.onload = () => {
+    if (seq !== _cmpSeq) return;   // superseded by a newer right-pane load
+    const sameDims = cmp.img && im.width === cmp.img.width && im.height === cmp.img.height;
+    _cmpDropObjUrl();   // external image replaced by a gallery one
+    cmp.img = im;
+    _cmpKnown = !!galleryMeta[p];
+    cmp.split = 0.5;   // fresh pair member -> divider back to center
+    if (sameDims) render(); else fitCmp();
+    updateTitleAndCounter();
+    updateActButtons();
+  };
+  im.src = `/api/gallery/image?path=${encodeURIComponent(p)}`;
+}
+
 function updateTitleAndCounter() {
   const name = currentPath.split(/[/\\]/).pop() || "Image Viewer";
+  const counter = document.getElementById("counter");
+  if (cmp.on) {
+    const nameB = cmp.path.split(/[/\\]/).pop() || "";
+    document.title = `${name} ⇆ ${nameB}`;
+    document.getElementById("title").textContent = `${name}  ⇆  ${nameB}`;
+    const idxB = galleryPaths.indexOf(cmp.path);
+    counter.textContent = idxB >= 0 ? `비교 ${idxB + 1} / ${galleryPaths.length}` : "비교";
+    return;
+  }
   document.title = name;
   document.getElementById("title").textContent = name;
-  const counter = document.getElementById("counter");
   if (galleryPaths.length > 0) {
     const idx = galleryPaths.indexOf(currentPath);
     counter.textContent = idx >= 0 ? `${idx + 1} / ${galleryPaths.length}` : "";
@@ -155,86 +590,514 @@ function updateTitleAndCounter() {
   }
 }
 
-function loadImage(filepath) {
-  currentPath = filepath;
+// Session-local selection marks (mirrored into the main gallery via events).
+const selSet = new Set();
+let currentFav = false;
+
+function post(url, body) {
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-NB-Token": CSRF },
+    body: JSON.stringify(body || {}),
+  }).then(r => r.json());
+}
+
+function updateActButtons() {
+  // All per-image info + actions live in the corner panels (사이드 태그) —
+  // left panel = current/기준 image, right panel = 비교 image.
+  const li = _sideInfo(currentPath, state.img, false);
+  document.getElementById("tagLName").textContent = li.name || "—";
+  document.getElementById("tagLSub").textContent = li.sub || "";
+  const lf = document.getElementById("tagLFav");
+  lf.textContent = currentFav ? "★ OK컷" : "☆ OK컷";
+  lf.classList.toggle("on-fav", currentFav);
+  const ls = document.getElementById("tagLSel");
+  const on = selSet.has(currentPath);
+  ls.textContent = on ? "▣ 선택됨" : "▢ 선택";
+  ls.classList.toggle("on-sel", on);
+  // 비교 중엔 개념을 OK컷 하나로 유지 — 선택 버튼은 단일 뷰 전용.
+  ls.style.display = cmp.on ? "none" : "";
+
+  const tagR = document.getElementById("tagR");
+  tagR.style.display = cmp.on ? "" : "none";
+  if (cmp.on) {
+    const extern = !!cmp.objUrl;
+    const ri = _sideInfo(cmp.path, cmp.img, extern);
+    document.getElementById("tagRName").textContent = ri.name || "—";
+    document.getElementById("tagRSub").textContent = ri.sub || "";
+    const rf = document.getElementById("tagRFav");
+    const rFav = !extern && !!(galleryMeta[cmp.path] && galleryMeta[cmp.path].favorite);
+    rf.textContent = rFav ? "★ OK컷" : "☆ OK컷";
+    rf.classList.toggle("on-fav", rFav);
+    rf.disabled = extern;
+    rf.title = extern ? "외부 이미지는 OK컷 표시 불가" : "OK컷(★ 즐겨찾기) 토글";
+    const rfo = document.getElementById("tagRFolder");
+    rfo.disabled = extern;
+    rfo.title = extern ? "외부 이미지는 폴더를 알 수 없습니다" : "저장 폴더 열기";
+  }
+}
+
+// Async-completion guards: rapid wheel navigation fires overlapping image
+// loads and /api/gallery fetches; without sequence tokens an EARLIER (still
+// decoding) image could land on screen AFTER a later one — display, ★ state
+// and folder/copy actions would then belong to DIFFERENT images.
+let _loadSeq = 0;    // left/current image loads
+let _cmpSeq = 0;     // right/compare image loads
+let _curKnown = false;   // currentPath was seen in the gallery list
+let _cmpKnown = false;   // cmp.path was seen in the gallery list
+let _lastIdx = 0;        // last known gallery index of currentPath
+
+// Apply a fresh gallery snapshot: list, metadata, counter, panels — and
+// react to images that were DELETED in the main window while on screen.
+function _applyGalleryData(items) {
+  galleryPaths = (items || []).map(i => i.filepath);
+  galleryMeta = {};
+  (items || []).forEach(i => { galleryMeta[i.filepath] = i; });
+  const meta = galleryMeta[currentPath];
+  if (meta) {
+    _curKnown = true;
+    _lastIdx = galleryPaths.indexOf(currentPath);
+    currentFav = !!meta.favorite;
+    const box = document.getElementById("prompt");
+    box.textContent = meta.prompt || "—";
+    box.classList.toggle("empty", !meta.prompt);
+  }
   updateTitleAndCounter();
+  updateActButtons();
+  if (cmp.on) render();   // ★ prefix on the corner panels
+  // Right side deleted (gallery images only — external files unaffected).
+  if (cmp.on && !cmp.objUrl && cmp.path && !galleryMeta[cmp.path]) {
+    if (_cmpKnown) {
+      _cmpKnown = false;
+      showToast("비교 이미지가 삭제되어 비교를 닫습니다");
+      exitCompare();
+    }
+  } else if (cmp.on && !cmp.objUrl && galleryMeta[cmp.path]) {
+    _cmpKnown = true;
+  }
+  // Left side deleted -> move to the nearest remaining image.
+  if (currentPath && !meta && _curKnown) {
+    _curKnown = false;
+    if (galleryPaths.length) {
+      const idx = Math.min(Math.max(_lastIdx, 0), galleryPaths.length - 1);
+      showToast("보던 이미지가 삭제되어 다른 이미지로 이동합니다");
+      loadImage(galleryPaths[idx]);
+    } else {
+      showToast("보던 이미지가 삭제되었습니다 — 갤러리가 비어 있습니다");
+      document.getElementById("title").textContent = "(삭제된 이미지)";
+    }
+  }
+}
+
+function loadImage(filepath) {
+  const seq = ++_loadSeq;
+  currentPath = filepath;
+  _curKnown = false;   // re-established by the next gallery snapshot
+  updateTitleAndCounter();
+  updateActButtons();
+  // Tell the main window what is on screen — its gallery scrolls to and
+  // highlights this card, and keeps the mark after the viewer closes.
+  post("/api/viewer/state", { filepath }).catch(() => {});
   const img = new Image();
-  img.onload = () => { state.img = img; fit(); };
-  img.onerror = () => { document.getElementById("title").textContent = "Failed to load image"; };
+  // Every image opens at the fit view (줌 0%) — confirmed as the intended
+  // behavior; the WINDOW size/position is what persists (launcher side).
+  img.onload = () => {
+    if (seq !== _loadSeq) return;   // superseded by a newer navigation
+    state.img = img;
+    if (cmp.on && cmp.img) {
+      cmp.split = 0.5;   // fresh pair member -> divider back to center
+      fitCmp();
+    } else {
+      fit();
+    }
+    updateActButtons();   // corner panel dims come from the loaded image
+  };
+  img.onerror = () => {
+    if (seq !== _loadSeq) return;
+    document.getElementById("title").textContent = "Failed to load image";
+  };
   img.src = `/api/gallery/image?path=${encodeURIComponent(filepath)}`;
 
-  // Load prompt for this filepath
   const box = document.getElementById("prompt");
   box.textContent = "—";
   box.classList.add("empty");
   fetch("/api/gallery").then(r => r.json()).then(d => {
-    galleryPaths = (d.items || []).map(i => i.filepath);
-    updateTitleAndCounter();
-    const item = (d.items || []).find(i => i.filepath === filepath);
-    if (item && item.prompt) {
-      box.textContent = item.prompt;
-      box.classList.remove("empty");
-    }
-  });
+    if (seq !== _loadSeq) return;   // stale response for an older image
+    _applyGalleryData(d.items || []);
+  }).catch(() => {});
 }
+
+// Live sync with the main window: cheap rev poll -> full refetch on change.
+// Covers deletes, NEW generations (wheel reaches them immediately, counter
+// updates) and favorite toggles made in the dashboard.
+let _galleryRev = null;
+setInterval(async () => {
+  try {
+    const d = await (await fetch("/api/gallery/rev")).json();
+    if (typeof d.rev !== "number" || d.rev === _galleryRev) return;
+    _galleryRev = d.rev;
+    const g = await (await fetch("/api/gallery")).json();
+    _applyGalleryData(g.items || []);
+  } catch (_) {}
+}, 1200);
+
+function toggleFavPath(p, sideLabel) {
+  if (!p) return;
+  post("/api/gallery/favorite", { filepath: p }).then(d => {
+    if (!d.ok) { showToast("OK컷 표시 실패: " + (d.error || "")); return; }
+    if (p === currentPath) currentFav = !!d.favorite;
+    galleryMeta[p] = galleryMeta[p] || {};
+    galleryMeta[p].favorite = !!d.favorite;
+    updateActButtons();
+    render();   // ★ prefix on the wipe tags
+    const name = sideLabel || "이";
+    showToast(d.favorite
+      ? name + " 이미지를 OK컷(★ 즐겨찾기)으로 표시했습니다"
+      : name + " 이미지를 OK컷에서 해제했습니다");
+    post("/api/viewer/refresh", {}).catch(() => {});
+  }).catch(e => showToast("OK컷 표시 실패: " + e));
+}
+
+function toggleFav() { toggleFavPath(currentPath, cmp.on ? "왼쪽" : ""); }
+
+function toggleSelPath(p, label) {
+  if (!p) return;
+  const on = !selSet.has(p);
+  if (on) selSet.add(p); else selSet.delete(p);
+  updateActButtons();
+  showToast((label ? label + " " : "") +
+    (on ? "이미지를 갤러리에서 선택했습니다 (" + selSet.size + "개)" : "선택을 해제했습니다"));
+  post("/api/viewer/select", { filepath: p, selected: on }).catch(() => {});
+}
+
+function toggleSel() { toggleSelPath(currentPath, ""); }
 
 function navigate(step) {
   if (!galleryPaths.length) return;
   let idx = galleryPaths.indexOf(currentPath);
   if (idx === -1) idx = 0;
   idx = (idx + step + galleryPaths.length) % galleryPaths.length;
+  if (galleryPaths[idx] === currentPath) return;   // single image: no flicker-reload
   loadImage(galleryPaths[idx]);
 }
 
-document.getElementById("prevBtn").addEventListener("click", () => navigate(-1));
-document.getElementById("nextBtn").addEventListener("click", () => navigate(1));
+// --- clipboard ---
+let _copyBusy = false;
+function copyCurrent() {
+  if (!currentPath || _copyBusy) return;
+  _copyBusy = true;
+  fetch("/api/copy-to-clipboard", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-NB-Token": CSRF },
+    body: JSON.stringify({ filepath: currentPath }),
+  }).then(r => r.json()).then(d => {
+    showToast(d.ok ? "이미지를 클립보드에 복사했습니다" : ("복사 실패: " + (d.error || "")));
+  }).catch(e => showToast("복사 실패: " + e))
+    .finally(() => { _copyBusy = false; });
+}
 
-canvas.addEventListener("mousedown", (e) => {
+let _toastTimer = null;
+function showToast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  if (_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => t.classList.remove("show"), 2200);
+}
+
+// Side zones stay active while zoomed. A drag that STARTS on a zone still
+// pans (guard below distinguishes pan from click).
+let _dragMoved = 0;
+function zoneNav(step) {
+  if (_dragMoved > 6) return;   // that was a pan, not a click
+  navigate(step);
+}
+document.getElementById("zonePrev").addEventListener("click", () => zoneNav(-1));
+document.getElementById("zoneNext").addEventListener("click", () => zoneNav(1));
+// Corner-panel actions (left = current/기준, right = 비교)
+document.getElementById("tagLFav").addEventListener("click", () => toggleFavPath(currentPath, cmp.on ? "왼쪽" : ""));
+document.getElementById("tagLSel").addEventListener("click", toggleSel);
+document.getElementById("tagRFav").addEventListener("click", () => {
+  if (cmp.objUrl) { showToast("외부 이미지는 OK컷 표시가 불가합니다"); return; }
+  toggleFavPath(cmp.path, "오른쪽");
+});
+
+// Drag-to-pan starts anywhere on the stage (canvas OR side zones — the zones
+// must not steal panning while zoomed).
+function _nearSplit(e) {
+  if (!(cmp.on && cmp.img)) return false;
+  const r = canvas.getBoundingClientRect();
+  return Math.abs((e.clientX - r.left) - cmp.split * canvas.clientWidth) < 16;
+}
+stage.addEventListener("mousedown", (e) => {
+  if (e.button !== 0) return;
+  if (e.target.closest("#hintPop") || e.target.closest("#toast") || e.target.closest(".sideTag")) return;
+  if (_nearSplit(e)) {   // grab the wipe divider instead of panning
+    cmp.dragSplit = true;
+    _dragMoved = 0;
+    return;
+  }
   state.dragging = true;
+  _dragMoved = 0;
   state.lastX = e.clientX;
   state.lastY = e.clientY;
 });
 window.addEventListener("mousemove", (e) => {
+  if (cmp.dragSplit) {
+    const r = canvas.getBoundingClientRect();
+    cmp.split = Math.max(0.02, Math.min(0.98, (e.clientX - r.left) / canvas.clientWidth));
+    render();
+    return;
+  }
   if (!state.dragging) return;
+  _dragMoved += Math.abs(e.clientX - state.lastX) + Math.abs(e.clientY - state.lastY);
   state.offsetX += e.clientX - state.lastX;
   state.offsetY += e.clientY - state.lastY;
   state.lastX = e.clientX;
   state.lastY = e.clientY;
   render();
 });
-window.addEventListener("mouseup", () => { state.dragging = false; });
-
-canvas.addEventListener("wheel", (e) => {
-  if (!state.img) return;
-  e.preventDefault();
-  const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-  const r = canvas.getBoundingClientRect();
-  const cx = e.clientX - r.left, cy = e.clientY - r.top;
-  const ix = (cx - state.offsetX) / state.scale;
-  const iy = (cy - state.offsetY) / state.scale;
-  state.scale = Math.max(0.05, Math.min(10, state.scale * factor));
-  state.offsetX = cx - ix * state.scale;
-  state.offsetY = cy - iy * state.scale;
-  render();
-}, { passive: false });
-
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") { window.close(); return; }
-  if (e.key === "0") { fit(); return; }
-  if (e.key === "ArrowLeft") { e.preventDefault(); navigate(-1); return; }
-  if (e.key === "ArrowRight") { e.preventDefault(); navigate(1); return; }
+window.addEventListener("mouseup", () => { state.dragging = false; cmp.dragSplit = false; });
+// Cursor feedback: resize arrows near the divider, grab elsewhere. Regular
+// mouse movement also means any drag is over -> drop guide must be gone.
+stage.addEventListener("mousemove", (e) => {
+  _hideDropGuide();
+  if (state.dragging || cmp.dragSplit) return;
+  canvas.style.cursor = _nearSplit(e) ? "ew-resize" : "grab";
 });
 
-// Throttled resize — recompute viewport fit at most every 100ms while dragging
-// the window edge, preventing render thrashing.
+// Double-click anywhere on the image = back to the fit view (same as 0).
+canvas.addEventListener("dblclick", () => { if (cmp.on) fitCmp(); else fit(); });
+
+// Drag a gallery card onto the viewer -> split compare with the dropped
+// image on the right (works while already comparing too: replaces right).
+// Native drop is accepted ONLY for OS file drags (Explorer is a different
+// process — safe). Gallery-card drags come from the MAIN window, which is
+// the SAME process/UI thread: accepting that OLE drop can DEADLOCK both
+// windows (user-reported freeze). Cards are delivered via a server-side
+// relay instead: main posts dragstart/dragend(+screen point), we poll and
+// consume when the release point lands inside this window.
+// Live guide showing WHERE the drag will land. External files always land
+// on the RIGHT (compare); gallery cards go to the side under the cursor.
+function _updateDropGuide(e, isFile) {
+  const g = document.getElementById("dropGuide");
+  const L = document.getElementById("dgL");
+  const R = document.getElementById("dgR");
+  g.classList.add("show");
+  if (!cmp.on) {
+    L.style.display = "none";
+    R.querySelector("span").textContent = "놓으면 나란히 비교 시작";
+    R.classList.add("active");
+    return;
+  }
+  L.style.display = isFile ? "none" : "";
+  L.querySelector("span").textContent = "왼쪽(기준)으로 교체";
+  R.querySelector("span").textContent = isFile ? "오른쪽(비교)으로 — 외부 이미지" : "오른쪽(비교)으로 교체";
+  // Hit test = screen half, identical to applyCardDrop (NOT the divider).
+  const rc = canvas.getBoundingClientRect();
+  const leftSide = !isFile && (e.clientX - rc.left) < canvas.clientWidth / 2;
+  L.classList.toggle("active", leftSide);
+  R.classList.toggle("active", !leftSide);
+}
+function _hideDropGuide() {
+  const g = document.getElementById("dropGuide");
+  g.classList.remove("show");
+  document.getElementById("dgL").classList.remove("active");
+  document.getElementById("dgR").classList.remove("active");
+  document.getElementById("dgL").style.display = "";
+}
+stage.addEventListener("dragover", (e) => {
+  const types = Array.from((e.dataTransfer && e.dataTransfer.types) || []);
+  if (types.includes("Files")) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    _updateDropGuide(e, true);
+  } else if (types.includes("application/x-nb-gallery-path") || types.includes("text/plain")) {
+    // Guide only — the drop itself arrives through the relay.
+    _updateDropGuide(e, false);
+  }
+});
+stage.addEventListener("dragleave", (e) => {
+  if (e.target === stage || !stage.contains(e.relatedTarget)) _hideDropGuide();
+});
+stage.addEventListener("drop", (e) => {
+  e.preventDefault();
+  _hideDropGuide();
+  const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (!f) return;   // card drags are handled by the relay poller
+  if (!(f.type && f.type.startsWith("image/"))) { showToast("이미지 파일이 아닙니다"); return; }
+  enterCompareExternal(f);
+});
+
+// Apply a relayed gallery-card drop (path + page coords already computed).
+// Drop side = SCREEN HALF (matches the 50/50 guide), NOT the wipe divider —
+// the divider is a viewing tool; tying the hit test to it made the left
+// zone unreachable once the divider was pushed left (user-reported).
+function applyCardDrop(p, px) {
+  if (cmp.on) {
+    const rc = canvas.getBoundingClientRect();
+    const leftSide = (px - rc.left) < canvas.clientWidth / 2;
+    if (leftSide) { loadImage(p); showToast("기준(왼쪽) 이미지를 교체했습니다"); }
+    else enterCompare(p);
+    return;
+  }
+  if (p === currentPath) { showToast("같은 이미지입니다 — 다른 이미지를 끌어다 놓으세요"); return; }
+  enterCompare(p);
+  showToast("비교 모드 — 가운데 선 드래그 · 휠 = 커서 쪽 이미지 전환 · Esc = 종료");
+}
+
+// Poll the relay for a card released over THIS window.
+setInterval(async () => {
+  try {
+    const d = await (await fetch("/api/viewer/pending_drop")).json();
+    if (!d.ok || !d.path) return;
+    const frameX = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
+    const frameTop = Math.max(0, (window.outerHeight - window.innerHeight) - frameX);
+    const px = d.x - window.screenX - frameX;
+    const py = d.y - window.screenY - frameTop;
+    const M = 12;   // tolerance for frame/DPI rounding
+    if (px < -M || py < -M || px > window.innerWidth + M || py > window.innerHeight + M) return;
+    await post("/api/viewer/consume_drop", {});
+    _hideDropGuide();
+    applyCardDrop(d.path, px);
+  } catch (_) {}
+}, 400);
+document.getElementById("cmpCloseBtn").addEventListener("click", exitCompare);
+function openFolderOf(p) {
+  if (!p) return;
+  post("/api/gallery/open-explorer", { filepath: p }).then(d => {
+    if (!d.ok) showToast("폴더를 열지 못했습니다");
+  }).catch(() => showToast("폴더를 열지 못했습니다"));
+}
+document.getElementById("tagLFolder").addEventListener("click", () => openFolderOf(currentPath));
+document.getElementById("tagRFolder").addEventListener("click", () => {
+  if (cmp.objUrl) { showToast("외부 이미지는 폴더를 알 수 없습니다"); return; }
+  openFolderOf(cmp.path);
+});
+
+// Wheel = fast prev/next (mouse-only browsing); Ctrl+Wheel = zoom.
+// Throttle navigation so trackpad delta bursts don't skip several images.
+let _wheelGate = 0;
+stage.addEventListener("wheel", (e) => {
+  if (!state.img) return;
+  e.preventDefault();
+  if (e.ctrlKey) {
+    const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    const r = canvas.getBoundingClientRect();
+    const cx = e.clientX - r.left, cy = e.clientY - r.top;
+    if (cmp.on && cmp.img) {
+      // Wipe zoom: both sides share height dh = hiH*scale, horizontally
+      // centered — anchor vertically on the shared band and horizontally on
+      // the shared center so both stay in step.
+      const v = viewSize();
+      const hiH = Math.max(state.img.height, cmp.img.height);
+      const os = state.scale;
+      const ns = Math.max(0.02, Math.min(10, os * factor));
+      const dh = hiH * os, dh2 = hiH * ns;
+      const by = (v.h - dh) / 2 + state.offsetY;
+      const fy = (cy - by) / dh;
+      state.offsetY = cy - fy * dh2 - (v.h - dh2) / 2;
+      const cxc = cx - (v.w / 2 + state.offsetX);
+      state.offsetX = cx - v.w / 2 - cxc * (ns / os);
+      state.scale = ns;
+      render();
+      return;
+    }
+    const ix = (cx - state.offsetX) / state.scale;
+    const iy = (cy - state.offsetY) / state.scale;
+    state.scale = Math.max(0.05, Math.min(10, state.scale * factor));
+    state.offsetX = cx - ix * state.scale;
+    state.offsetY = cy - iy * state.scale;
+    render();
+    return;
+  }
+  const now = Date.now();
+  if (now - _wheelGate < 140) return;
+  _wheelGate = now;
+  const dir = e.deltaY < 0 ? 1 : -1;   // Wheel Up = next, Wheel Down = prev
+  if (cmp.on) {
+    // The side the CURSOR is on decides which image the wheel swaps —
+    // left of the divider = base(왼쪽), right of it = compare(오른쪽).
+    const rc = canvas.getBoundingClientRect();
+    const leftSide = (e.clientX - rc.left) < cmp.split * canvas.clientWidth;
+    if (leftSide) navigate(dir); else cmpNavigate(dir);
+  } else {
+    navigate(dir);
+  }
+}, { passive: false });
+
+// Right-click: small custom menu with image copy.
+const ctxMenu = document.getElementById("ctxMenu");
+stage.addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+  ctxMenu.style.display = "block";
+  const mw = ctxMenu.offsetWidth, mh = ctxMenu.offsetHeight;
+  ctxMenu.style.left = Math.min(e.clientX, window.innerWidth - mw - 6) + "px";
+  ctxMenu.style.top = Math.min(e.clientY, window.innerHeight - mh - 6) + "px";
+});
+document.getElementById("ctxCopy").addEventListener("click", () => {
+  ctxMenu.style.display = "none";
+  copyCurrent();
+});
+document.getElementById("ctxFav").addEventListener("click", () => {
+  ctxMenu.style.display = "none";
+  toggleFav();
+});
+document.getElementById("ctxSel").addEventListener("click", () => {
+  ctxMenu.style.display = "none";
+  toggleSel();
+});
+document.getElementById("ctxFit").addEventListener("click", () => {
+  ctxMenu.style.display = "none";
+  fit();
+});
+document.addEventListener("mousedown", (e) => {
+  if (!ctxMenu.contains(e.target)) ctxMenu.style.display = "none";
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if (cmp.on) { exitCompare(); return; }   // first Esc leaves compare
+    window.close();
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && (e.key === "c" || e.key === "C")) { e.preventDefault(); copyCurrent(); return; }
+  if (e.key === "0") { if (cmp.on) fitCmp(); else fit(); return; }
+  if (e.key === "ArrowLeft") { e.preventDefault(); if (cmp.on) cmpNavigate(-1); else navigate(-1); return; }
+  if (e.key === "ArrowRight") { e.preventDefault(); if (cmp.on) cmpNavigate(1); else navigate(1); return; }
+  if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (e.key === "f" || e.key === "F") { toggleFav(); return; }
+    if (e.key === "s" || e.key === "S") {
+      if (cmp.on) { showToast("비교 중에는 ◀/▶ OK컷 버튼으로 좋은 쪽을 표시하세요"); return; }
+      toggleSel();
+      return;
+    }
+  }
+});
+
 let _resizeTimer = null;
 window.addEventListener("resize", () => {
   if (_resizeTimer) return;
-  _resizeTimer = setTimeout(() => { _resizeTimer = null; fit(); }, 100);
+  _resizeTimer = setTimeout(() => {
+    _resizeTimer = null;
+    if (cmp.on) fitCmp(); else fit();
+  }, 100);
 });
 
-// Kick off
+// Shortcut guide: ~5s on the first open of this viewer window (load_url
+// swaps reuse the window, so sessionStorage keeps it from nagging).
+(function () {
+  try {
+    if (sessionStorage.getItem("nbViewerHintShown")) return;
+    sessionStorage.setItem("nbViewerHintShown", "1");
+  } catch (e) { /* storage unavailable -> just show it */ }
+  const pop = document.getElementById("hintPop");
+  pop.classList.add("show");
+  setTimeout(() => pop.classList.remove("show"), 5000);
+})();
+
 loadImage(currentPath);
+if (_cmpParam) enterCompare(_cmpParam);
 </script>
 </body>
 </html>

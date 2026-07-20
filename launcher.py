@@ -510,38 +510,72 @@ class JsApi:
         except Exception as e:
             print(f"  cleanup_temp error: {e}")
 
-    def open_viewer(self, filepath):
-        """Open image viewer in new pywebview window (dedupe by filepath).
-        Skips over windows that have already been destroyed — pywebview doesn't
-        always remove them from its windows list, so we test each one."""
+    def open_viewer(self, filepath, cmp=None):
+        """Open the image viewer as a SINGLE reusable pywebview window.
+        If a viewer window is already open, swap its content to the new image
+        (load_url) instead of stacking another window. Dead handles (user
+        closed the window; pywebview keeps them listed) are skipped.
+        cmp: optional second image path -> the viewer boots in split-compare
+        mode (two panes, same scale)."""
         print(f"  JS -> open_viewer({filepath!r})")
         try:
             import urllib.parse
+            encoded = urllib.parse.quote(filepath, safe="")
+            viewer_url = f"{APP_URL}/viewer?path={encoded}"
+            title = os.path.basename(filepath) or "Image Viewer"
+            if cmp:
+                viewer_url += "&cmp=" + urllib.parse.quote(cmp, safe="")
+                title = f"{title} vs {os.path.basename(cmp)}"
             for w in list(webview.windows):
                 if w is _window:
                     continue
-                # If the handle is gone (user closed the viewer), skip it.
                 try:
-                    if getattr(w, "_nb_filepath", None) != filepath:
+                    if not getattr(w, "_nb_viewer", False):
                         continue
-                    w.show()
-                    w.restore()
+                    # ALWAYS reload: the viewer navigates internally (wheel /
+                    # arrows), so _nb_filepath goes stale — comparing it can
+                    # skip the load and leave the WRONG image on screen.
+                    w.load_url(viewer_url)
+                    w._nb_filepath = filepath
+                    try:
+                        w.set_title(title)
+                    except Exception:
+                        pass
+                    # Keep the window EXACTLY as the user left it — a
+                    # maximized viewer must STAY maximized (restore() knocked
+                    # it out of fullscreen and changed the canvas ratio).
+                    # Only un-minimize, then just bring it to the front.
+                    _wstate = ""
+                    try:
+                        _wstate = str(getattr(w.native, "WindowState", ""))
+                    except Exception:
+                        _wstate = ""
+                    if "Minimized" in _wstate:
+                        w.restore()
+                    try:
+                        w.native.Activate()
+                    except Exception:
+                        try:
+                            w.show()
+                        except Exception:
+                            pass
                     return
                 except Exception:
                     # Window is dead — move on and open a fresh one.
                     continue
-            encoded = urllib.parse.quote(filepath, safe="")
-            viewer_url = f"{APP_URL}/viewer?path={encoded}"
-            title = os.path.basename(filepath) or "Image Viewer"
-            kwargs = dict(
+            # Fresh preview window; the real geometry (90% of the main
+            # window, centered over it) is applied post-show in PHYSICAL
+            # pixels — DPI/monitor-proof.
+            new_win = webview.create_window(
                 title=title, url=viewer_url,
                 width=1200, height=800,
                 min_size=(600, 400),
                 resizable=True,
             )
-            new_win = webview.create_window(**kwargs)
             try:
+                new_win._nb_viewer = True
                 new_win._nb_filepath = filepath
+                new_win.events.shown += (lambda *a, w=new_win: _place_viewer_over_main(w))
             except Exception:
                 pass
         except Exception as e:
@@ -562,6 +596,40 @@ class JsApi:
             )
         except Exception as e:
             print(f"  open_prompt_popup error: {e}")
+
+def _place_viewer_over_main(win):
+    """Size/position the freshly SHOWN viewer window to 90% of the MAIN
+    window, centered over it — done post-creation with Win32 physical
+    coordinates (GetWindowRect -> SetWindowPos). Doing this in logical units
+    before creation broke on mixed-DPI/multi-monitor setups (viewer larger
+    than the app on 4K, mis-placed on 2K)."""
+    try:
+        import ctypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        def _hwnd(w):
+            h = w.native.Handle
+            return h.ToInt32() if hasattr(h, "ToInt32") else int(h)
+
+        r = RECT()
+        if not user32.GetWindowRect(_hwnd(_window), ctypes.byref(r)):
+            return
+        mw, mh = r.right - r.left, r.bottom - r.top
+        if mw < 300 or mh < 200:
+            return
+        vw = max(600, int(mw * 0.9))
+        vh = max(420, int(mh * 0.9))
+        x = r.left + (mw - vw) // 2
+        y = r.top + (mh - vh) // 2
+        SWP_NOZORDER, SWP_NOACTIVATE = 0x0004, 0x0010
+        user32.SetWindowPos(_hwnd(win), 0, x, y, vw, vh,
+                            SWP_NOZORDER | SWP_NOACTIVATE)
+    except Exception:
+        pass
 
 
 def _set_close_requested_flag():

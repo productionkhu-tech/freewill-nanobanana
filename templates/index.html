@@ -21,6 +21,7 @@
       <span id="studioDot" class="dot"></span><span class="status-label">Studio</span>
       <span id="openaiDot" class="dot"></span><span class="status-label">OpenAI</span>
       <span id="seedreamDot" class="dot"></span><span class="status-label">Seedream</span>
+      <span id="reveDot" class="dot"></span><span class="status-label">Reve</span>
     </div>
     <button id="topGenBtn" class="btn-accent" onclick="generate()">Generate</button>
     <button id="alwaysOnTopBtn" class="pin-btn" onclick="toggleAlwaysOnTop()" title="Always on top">&#128204;</button>
@@ -42,6 +43,7 @@
         <option value="seedream-5-0-pro-260628">seedream-5-0-pro</option>
         <option value="seedream-4-5-251128">seedream-4-5</option>
         <option value="gpt-image-2">gpt-image-2 (OpenAI)</option>
+        <option value="reve-create">Reve 2.1</option>
       </select>
       <p class="hint" id="modelHint">10 RPM limit &mdash; auto-throttled to ~8 RPM</p>
 
@@ -84,6 +86,7 @@
         <button class="btn-sm" onclick="clearRefs()">Clear All</button>
       </div>
       <p class="hint" id="refLimitHint">3rd-gen models support up to 14 reference images.</p>
+      <p class="hint" id="reveRefBudget" style="display:none"></p>
 
       <!-- Settings -->
       <div class="section-title">Settings</div>
@@ -96,7 +99,7 @@
             <option selected>16:9</option><option>21:9</option>
           </select>
         </div>
-        <div>
+        <div id="resolutionWrap">
           <label class="field-label">Resolution</label>
           <select id="resolutionSelect">
             <option>512px</option><option>1K</option><option>2K</option><option selected>4K</option>
@@ -115,6 +118,11 @@
             <option>low</option><option>medium</option><option selected>high</option><option>auto</option>
           </select>
         </div>
+      </div>
+
+      <!-- Reve-only: postprocessing toggle -->
+      <div id="reveBgRow" style="display:none">
+        <label class="reve-bg-check" title="Reve 후처리: 배경을 투명하게 지운 PNG로 저장"><input type="checkbox" id="reveBgRemoveChk" onchange="onReveBgRemoveChange(this.checked)"> 누끼 (배경 제거)</label>
       </div>
 
       <!-- GPT-2 Custom pixel input (shown only when Aspect = Custom) -->
@@ -208,6 +216,7 @@
     <div class="gallery-header">
       <span class="gallery-title">Generated Images</span>
       <div class="gallery-actions">
+        <button id="cmpBtn" class="cmp-btn" onclick="openCompareSelected()" title="선택한 2개 이미지를 나란히 비교 (Ctrl+클릭으로 2개 선택 후)">⇆ 비교</button>
         <input type="text" id="gallerySearch" placeholder="Search prompts..." oninput="filterGallery()" oncompositionend="filterGalleryImmediate()">
         <div class="layout-btns">
           <button class="layout-btn" data-cols="1" onclick="setColumns(1)">1</button>

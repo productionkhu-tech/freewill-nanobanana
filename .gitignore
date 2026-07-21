@@ -19,6 +19,7 @@ setup_env.bat
 keys.env
 vertex-key.json
 *-key.json
+맥_키_설치_붙여넣기.txt
 
 # Seedream (BytePlus) / Reve key installers — contain real API keys, NEVER commit
 시댄스 api key.bat

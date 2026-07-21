@@ -1084,6 +1084,22 @@ window.addEventListener("resize", () => {
   }, 100);
 });
 
+// The stage box also changes WITHOUT any window resize: the prompt footer
+// (min 48 / max 160px) grows when the async /api/gallery fetch fills in a
+// long prompt AFTER fit() already sized the canvas backing store. Flex
+// steals that height from the stage, CSS squeezes the stale backing store
+// into the smaller box, and the image looks ratio-stretched until the next
+// re-render (the "double-click fixes the ratio" bug). Compare mode
+// self-healed via _applyGalleryData's render(); single view needs this.
+// Observing the stage box covers footer growth, window resizes, and the
+// post-shown SetWindowPos repositioning in one place.
+if (typeof ResizeObserver !== "undefined") {
+  new ResizeObserver(() => {
+    if (!state.img) return;
+    if (cmp.on) fitCmp(); else fit();
+  }).observe(stage);
+}
+
 // Shortcut guide: ~5s on the first open of this viewer window (load_url
 // swaps reuse the window, so sessionStorage keeps it from nagging).
 (function () {

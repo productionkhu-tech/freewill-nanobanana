@@ -56,6 +56,25 @@ def load_keys():
     print("[NanoBanana] Loaded keys from: " + path)
 
 
+def _fix_ssl_certs():
+    """python.org macOS Python ships with an EMPTY CA bundle until the user
+    runs 'Install Certificates.command' - most people skip that step. The SDK
+    providers (Gemini/OpenAI/Seedream via httpx) bundle certifi so they still
+    work, but Reve and every other plain-urllib call in app.py dies with
+    CERTIFICATE_VERIFY_FAILED (seen live 2026-07-21). Point the stdlib ssl
+    default-context lookup at certifi's bundle (certifi is always present as
+    an openai/httpx dependency). keys.env can override by setting
+    SSL_CERT_FILE itself."""
+    if os.environ.get("SSL_CERT_FILE"):
+        return
+    try:
+        import certifi
+        os.environ["SSL_CERT_FILE"] = certifi.where()
+        print("[NanoBanana] SSL certificates: using the certifi bundle.")
+    except Exception:
+        pass
+
+
 def _missing_deps():
     m = []
     for mod, pip_name in [("flask", "flask"),
@@ -141,6 +160,19 @@ def auto_update():
 
 
 def main():
+    # Python floor guard. The Xcode CommandLineTools python3 is 3.9: pip can
+    # only give it google-genai <= 1.47.0, whose ImageConfig has no image_size
+    # field, so every Gemini 2K/4K request dies instantly with a cryptic
+    # pydantic "extra_forbidden" error (seen live 2026-07-21). Fail fast with
+    # instructions instead.
+    if sys.version_info < (3, 10):
+        print("[NanoBanana] 이 Python(%d.%d)은 너무 오래됐습니다 - 3.10 이상이 필요해요." % sys.version_info[:2])
+        print("  (Xcode 명령줄 도구에 딸린 Python이면 Gemini 2K/4K 생성이 동작하지 않습니다)")
+        print("  해결:")
+        print("   1) https://www.python.org/downloads/macos/ 에서 최신 Python 3 설치")
+        print("   2) 설치 후 열리는 폴더에서 'Install Certificates.command' 더블클릭")
+        print("   3) 터미널을 완전히 닫고 새로 연 뒤 NanoBanana.command 다시 실행")
+        sys.exit(1)
     os.chdir(HERE)
     if HERE not in sys.path:
         sys.path.insert(0, HERE)
@@ -156,6 +188,7 @@ def main():
     load_keys()
     auto_update()
     check_deps()
+    _fix_ssl_certs()
     print("[NanoBanana] Starting on " + URL)
     print("  Keep this Terminal window open while using the app (close it to quit).")
     threading.Thread(target=open_browser_when_ready, daemon=True).start()

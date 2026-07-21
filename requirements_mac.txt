@@ -4,6 +4,11 @@
 # pywebview / pythonnet are intentionally omitted: they are the Windows-only
 # native-window layer. On macOS the app runs in your default browser instead.
 flask>=3.0
-google-genai>=1.0
+# 2.8 floor: ImageConfig.image_size (2K/4K) needs it. Also implies Python
+# 3.10+ — server_mac.py refuses older interpreters with instructions.
+google-genai>=2.8
 openai>=1.50
 Pillow>=10.0
+# Explicit (already an openai dependency): server_mac points SSL_CERT_FILE at
+# this bundle so skipping "Install Certificates.command" can't break Reve.
+certifi

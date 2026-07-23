@@ -712,8 +712,11 @@ function _fmtPx(n){ return (n/1e6).toFixed(2) + "M px"; }
 
 // Seedream (BytePlus) custom-size mirror. Per-model pixel bounds; ratio<=16:1;
 // 16-multiple. Mirrors app.py _seedream_custom_size (server re-corrects on send).
+// pro max = documented 2048*2048*1.1025 = 4,624,220 (NOT plain 2048^2). Must
+// match app.py _SEEDREAM_CUSTOM so the live preview and "최대 화질" button agree
+// with the server's re-correction.
 const _SEEDREAM_CUSTOM_JS = {
-  "seedream-5-0-pro-260628": [921600, 4194304],
+  "seedream-5-0-pro-260628": [921600, 4624220],
   "seedream-4-5-251128":     [3686400, 16777216],
 };
 function seedreamCustomSize(model, w, h) {

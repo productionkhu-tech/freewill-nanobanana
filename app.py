@@ -178,8 +178,12 @@ _SEEDREAM_SIZES = {
     },
 }
 # Custom (explicit WxH) pixel bounds per model: (min_px, max_px). ratio<=16, 16-mult.
+# pro max is the DOCUMENTED Method-2 ceiling 2048*2048*1.1025 = 4,624,220, NOT a
+# plain 2048^2 (4,194,304). The earlier plain-square value silently shrank
+# custom sizes that BytePlus would actually have accepted (e.g. 4800x960 =
+# 4,608,000 px, valid, was being cut to 4576x912). Do NOT drop the 1.1025.
 _SEEDREAM_CUSTOM = {
-    "seedream-5-0-pro-260628": (921_600, 4_194_304),
+    "seedream-5-0-pro-260628": (921_600, 4_624_220),
     "seedream-4-5-251128": (3_686_400, 16_777_216),
 }
 

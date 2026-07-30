@@ -2702,6 +2702,13 @@ async function pollEvents() {
       if (ev.phase === "failed") {
         hideUpdateOverlay();
         showToast(ev.message || "업데이트 실패", "error");
+      } else if (ev.phase === "not_ready") {
+        // Release published, asset still uploading. Nothing is broken and the
+        // next launch installs it — a red failure toast here just scared
+        // people during the few seconds a release takes to finish uploading.
+        hideUpdateOverlay();
+        _autoUpdateStarted = false;
+        showToast(ev.message || "새 버전을 준비 중입니다", "info");
       } else if (ev.phase === "noop") {
         hideUpdateOverlay();
         showToast(ev.message || "이미 최신입니다", "info");

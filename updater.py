@@ -29,11 +29,93 @@ import hashlib
 import shutil
 import tempfile
 import urllib.request
+import urllib.error
 
 REPO = "productionkhu-tech/freewill-nanobanana"
 BRANCH = "main"
 REMOTE_VERSION_URL = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}/VERSION"
 RELEASES_API = f"https://api.github.com/repos/{REPO}/releases"
+
+
+class UpdateNotReady(Exception):
+    """The release exists but its EXE asset is not downloadable yet.
+
+    GitHub publishes a release the moment it is created, so /releases/latest
+    starts advertising the new tag SECONDS BEFORE the 36MB asset finishes
+    uploading (measured 4-5s per release on 2026-07-30). An app that checks in
+    that window downloads from a URL that does not exist yet and gets a 404.
+    That is not a broken update - it is an update that is not ready. Callers
+    should stay quiet, keep the attempt budget intact, and simply try again on
+    the next launch. (The publish procedure now uploads assets to a DRAFT
+    release first, which closes the window at the source; this class keeps
+    already-shipped clients safe regardless.)
+    """
+
+
+# --- Auto-update attempt bookkeeping ---------------------------------------
+# Lives here (not in launcher.py) so BOTH the launcher (which decides whether
+# to auto-apply) and app.py (which runs the install and may need to refund a
+# non-fault attempt) can reach it without importing the launcher module - the
+# launcher is the frozen entry point and re-importing it would re-run its
+# module-level side effects.
+AUTO_UPDATE_MAX_ATTEMPTS = 2
+
+
+def auto_update_state_file():
+    d = os.path.join(os.path.expanduser("~"), ".nanobanana")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(d, "auto_update_state.json")
+
+
+def auto_update_attempts(target):
+    try:
+        with open(auto_update_state_file(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if str(data.get("target", "")) != str(target):
+            return 0
+        return int(data.get("attempts", 0))
+    except Exception:
+        return 0
+
+
+def _write_auto_update_attempts(target, n):
+    try:
+        p = auto_update_state_file()
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"target": str(target), "attempts": int(n)}, f)
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
+def bump_auto_update_attempts(target):
+    n = auto_update_attempts(target) + 1
+    _write_auto_update_attempts(target, n)
+    return n
+
+
+def refund_auto_update_attempt(target):
+    """Give back an attempt consumed by a NON-fault outcome (asset not
+    uploaded yet). Without this, two unlucky launches during publish windows
+    would exhaust the budget and push the user to the manual dialog for a
+    version that was never actually broken."""
+    n = auto_update_attempts(target)
+    if n > 0:
+        _write_auto_update_attempts(target, n - 1)
+    return max(0, n - 1)
+
+
+def clear_auto_update_state():
+    try:
+        p = auto_update_state_file()
+        if os.path.isfile(p):
+            os.remove(p)
+    except Exception:
+        pass
 
 
 def _version_tuple(v):
@@ -200,7 +282,17 @@ def _download_with_retry(url, dest_path, attempts=3, on_progress=None):
     for i in range(attempts):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "NanoBanana-Updater"})
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            try:
+                resp_cm = urllib.request.urlopen(req, timeout=120)
+            except urllib.error.HTTPError as he:
+                # 404 = the asset is not there (yet). Do not burn the remaining
+                # retries on it: either we are inside the publish window, in
+                # which case the next launch succeeds, or the release genuinely
+                # has no EXE and retrying cannot help.
+                if he.code == 404:
+                    raise UpdateNotReady("asset not published yet (404)")
+                raise
+            with resp_cm as resp:
                 total = int(resp.headers.get("Content-Length") or 0)
                 done = 0
                 chunk_size = 1 << 15  # 32KB
@@ -225,6 +317,14 @@ def _download_with_retry(url, dest_path, attempts=3, on_progress=None):
             if total and got != total:
                 raise IOError(f"Short read: got {got}, expected {total}")
             return
+        except UpdateNotReady:
+            # Not a failure to retry - propagate so the caller can stay quiet
+            # and keep the attempt budget intact.
+            try:
+                os.remove(dest_path)
+            except Exception:
+                pass
+            raise
         except Exception as e:
             last_err = e
             print(f"  download attempt {i+1}/{attempts} failed: {e}")

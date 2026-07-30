@@ -63,6 +63,12 @@ Copy-Item "C:\NanoBanana_build\src\dist\NanoBanana.exe" ".\dist\NanoBanana\NanoB
 
 ## 4. GitHub Release 생성 + 자산 2종 업로드
 
+**⚠ 반드시 draft:true로 만들고 → 자산 2종 업로드 → 마지막에 draft:false로 공개 (2026-07-30 사고)**
+릴리스를 공개 상태로 먼저 만들면 GitHub이 **그 즉시** `/releases/latest`에 새 태그를 노출한다.
+36MB EXE 업로드에 4~5초가 걸리므로 그 사이에 업데이트를 시도한 앱은 아직 없는 파일을 받으려다
+**HTTP 404**를 맞는다(실측: 모든 릴리스에서 4~5초 창 존재). 자동 업데이트가 켜진 지금은
+그 창에 걸린 사용자에게 실패로 보인다. **draft로 올리면 자산이 다 붙기 전엔 아무도 못 보므로 창이 0초**가 된다.
+
 한국어 body는 **반드시 Python urllib으로 JSON 바이트 POST** (bash/PS 인라인은 cp949로 깨짐).
 스크래치 폴더에 아래 스크립트를 쓰고 빌드 venv 파이썬으로 실행한다 (`PYTHONIOENCODING=utf-8`, `PYTHONUTF8=1`).
 
@@ -80,12 +86,14 @@ body = """- 사용자용 한국어 bullet
 
 sha256: %s""" % sha
 
-payload = json.dumps({"tag_name": tag, "name": tag, "body": body}, ensure_ascii=False).encode("utf-8")
+# draft:true -> 자산이 다 붙을 때까지 /releases/latest에 안 보인다 (404 창 제거)
+payload = json.dumps({"tag_name": tag, "name": tag, "body": body, "draft": True},
+                     ensure_ascii=False).encode("utf-8")
 req = urllib.request.Request("https://api.github.com/repos/%s/releases" % repo, method="POST", data=payload,
     headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
              "Content-Type": "application/json; charset=utf-8", "User-Agent": "NB"})
 rid = json.loads(urllib.request.urlopen(req, timeout=30).read())["id"]
-print("release id:", rid)
+print("release id (draft):", rid)
 
 # 자산 1: EXE
 r = subprocess.run(["curl", "-sS", "-X", "POST", "-H", "Authorization: Bearer " + token,
@@ -103,9 +111,19 @@ r2 = subprocess.run(["curl", "-sS", "-X", "POST", "-H", "Authorization: Bearer "
     "https://uploads.github.com/repos/%s/releases/%s/assets?name=NanoBanana.exe.sha256" % (repo, rid)],
     capture_output=True, text=True, timeout=120)
 print(json.loads(r2.stdout).get("state"))
+
+# ★ 자산 2종이 다 올라간 뒤에만 공개 (여기서부터 사용자에게 보임)
+pub = json.dumps({"draft": False}).encode("utf-8")
+req3 = urllib.request.Request("https://api.github.com/repos/%s/releases/%s" % (repo, rid),
+    method="PATCH", data=pub,
+    headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+             "Content-Type": "application/json", "User-Agent": "NB"})
+print("published:", json.loads(urllib.request.urlopen(req3, timeout=30).read())["draft"] is False)
 ```
 
-업로드 후 확인: `GET /releases/latest`의 tag_name이 새 태그이고 draft/prerelease가 false인지.
+업로드 후 확인: `GET /releases/latest`의 tag_name이 새 태그이고 draft/prerelease가 false이며
+**자산 2종(NanoBanana.exe, NanoBanana.exe.sha256)이 모두 붙어 있는지**. 공개 직후 바로 다운로드
+URL을 한 번 눌러 200이 나오는지도 확인하면 확실하다.
 
 ## 5. E2E 검증 (업데이트 경로 변경 시 의무, 그 외에도 강력 권장)
 

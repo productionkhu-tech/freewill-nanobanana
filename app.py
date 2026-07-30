@@ -2717,7 +2717,8 @@ def api_apply_update():
 
     def _worker():
         try:
-            from updater import check_for_update, apply_update_and_relaunch
+            from updater import (check_for_update, apply_update_and_relaunch,
+                                 UpdateNotReady)
             has_update, current, remote = check_for_update()
             if not has_update:
                 state.push_event({"type": "update_swap", "phase": "noop",
@@ -2743,6 +2744,21 @@ def api_apply_update():
             # os._exit releases our EXE file handle so the --updater
             # child can atomically replace it.
             os._exit(0)
+        except UpdateNotReady:
+            # The release is published but its EXE asset is still uploading
+            # (GitHub advertises the tag first; measured 4-5s per release).
+            # Nothing is wrong with this machine, so: refund the attempt the
+            # launcher spent, say something calm, and let the next launch
+            # pick it up. Showing a red "update failed" here was pure noise.
+            try:
+                from updater import refund_auto_update_attempt
+                refund_auto_update_attempt(remote)
+            except Exception:
+                pass
+            state.log(f"Update {remote} not published yet - will retry on next launch")
+            state.push_event({"type": "update_swap", "phase": "not_ready",
+                              "message": "새 버전을 준비 중입니다. 다음 실행 때 자동으로 설치됩니다."})
+            _apply_update_running[0] = False
         except Exception as e:
             state.log(f"apply-update failed: {str(e)[:120]}")
             state.push_event({"type": "update_swap", "phase": "failed",

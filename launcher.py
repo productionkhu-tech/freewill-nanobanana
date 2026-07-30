@@ -208,51 +208,32 @@ def _sweep_stale_mei():
 #   - attempt 1..MAX  -> auto-apply silently
 #   - beyond MAX      -> stop auto-applying, fall back to the manual dialog
 #   - reached target  -> state cleared, budget resets for the next version
-AUTO_UPDATE_MAX_ATTEMPTS = 2
-
-
-def _auto_update_state_file():
-    d = os.path.join(os.path.expanduser("~"), ".nanobanana")
-    try:
-        os.makedirs(d, exist_ok=True)
-    except Exception:
-        pass
-    return os.path.join(d, "auto_update_state.json")
-
-
+#
+# The state itself lives in updater.py so app.py can refund an attempt that was
+# spent on a non-fault outcome (asset still uploading) without importing this
+# module - launcher is the frozen entry point and re-importing it would re-run
+# its module-level side effects.
 def _auto_update_attempts(target):
-    """How many times we already auto-applied THIS target version."""
-    try:
-        import json as _json
-        with open(_auto_update_state_file(), "r", encoding="utf-8") as f:
-            data = _json.load(f)
-        if str(data.get("target", "")) != str(target):
-            return 0
-        return int(data.get("attempts", 0))
-    except Exception:
-        return 0
+    from updater import auto_update_attempts
+    return auto_update_attempts(target)
 
 
 def _bump_auto_update_attempts(target):
-    n = _auto_update_attempts(target) + 1
-    try:
-        import json as _json
-        tmp = _auto_update_state_file() + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            _json.dump({"target": str(target), "attempts": n}, f)
-        os.replace(tmp, _auto_update_state_file())
-    except Exception:
-        pass
-    return n
+    from updater import bump_auto_update_attempts
+    return bump_auto_update_attempts(target)
 
 
 def _clear_auto_update_state():
+    from updater import clear_auto_update_state
+    clear_auto_update_state()
+
+
+def _auto_update_max_attempts():
     try:
-        p = _auto_update_state_file()
-        if os.path.isfile(p):
-            os.remove(p)
+        from updater import AUTO_UPDATE_MAX_ATTEMPTS as _m
+        return _m
     except Exception:
-        pass
+        return 2
 
 
 # --- Close flow state ---
@@ -968,10 +949,11 @@ def main():
                     msg = f"Update available: {current} -> {remote}"
                     kind = "available"
                     tried = _auto_update_attempts(remote)
-                    if tried < AUTO_UPDATE_MAX_ATTEMPTS:
+                    _max = _auto_update_max_attempts()
+                    if tried < _max:
                         n = _bump_auto_update_attempts(remote)
                         auto = True
-                        state.log(f"Auto-installing update (attempt {n}/{AUTO_UPDATE_MAX_ATTEMPTS})")
+                        state.log(f"Auto-installing update (attempt {n}/{_max})")
                     else:
                         # Auto path already failed twice for this version - stop
                         # restarting the user in a loop and let them decide.

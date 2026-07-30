@@ -744,6 +744,51 @@ textarea.prompt-box { min-height: 82px; }
 /* Hover-hold to REPLACE was removed in v2008 — the only REPLACE target
    is now the Change button itself. Its drop-target style lives above. */
 
+/* Reference hover preview — large popup shown next to a ref cell on hover.
+   pointer-events:none is essential: the popup floats over the sidebar and the
+   cell underneath is a drag source + drop target, so it must never intercept
+   the pointer (that would break reorder / replace-on-drop). */
+.ref-hover-preview {
+  position: fixed;
+  z-index: 9000;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.12s ease;
+  background: var(--panel, #1C1C1E);
+  border: 1px solid var(--border, #48484A);
+  border-radius: 12px;
+  padding: 8px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+  max-width: min(60vw, 720px);
+}
+.ref-hover-preview.show { opacity: 1; visibility: visible; }
+.ref-hover-preview img {
+  display: block;
+  max-width: min(58vw, 700px);
+  max-height: 74vh;
+  width: auto;
+  height: auto;               /* keep the real aspect ratio, never stretch */
+  border-radius: 8px;
+  /* Checkerboard so a transparent PNG cutout reads as transparent instead of
+     blending into the dark panel. */
+  background-color: #2a2a2e;
+  background-image:
+    linear-gradient(45deg, #232326 25%, transparent 25%, transparent 75%, #232326 75%),
+    linear-gradient(45deg, #232326 25%, transparent 25%, transparent 75%, #232326 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 8px 8px;
+}
+.ref-hover-preview .rhp-cap {
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--text2, #A1A1A6);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Always-on-top pin button in the header */
 .pin-btn {
   border: 1px solid var(--border);

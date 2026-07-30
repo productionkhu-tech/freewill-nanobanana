@@ -199,6 +199,62 @@ def _sweep_stale_mei():
         print(f"  _MEI sweep: {_e}")
 
 
+# --- Auto-update attempt bookkeeping ---------------------------------------
+# The boot check applies an available update AUTOMATICALLY (the user only has
+# to close and reopen the app). That convenience needs a loop guard: if a swap
+# keeps failing for reasons we cannot control (AV quarantine, a sync client
+# holding the file, read-only folder), a blind auto-apply would re-download and
+# restart on every launch forever. So we count attempts per target version:
+#   - attempt 1..MAX  -> auto-apply silently
+#   - beyond MAX      -> stop auto-applying, fall back to the manual dialog
+#   - reached target  -> state cleared, budget resets for the next version
+AUTO_UPDATE_MAX_ATTEMPTS = 2
+
+
+def _auto_update_state_file():
+    d = os.path.join(os.path.expanduser("~"), ".nanobanana")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(d, "auto_update_state.json")
+
+
+def _auto_update_attempts(target):
+    """How many times we already auto-applied THIS target version."""
+    try:
+        import json as _json
+        with open(_auto_update_state_file(), "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        if str(data.get("target", "")) != str(target):
+            return 0
+        return int(data.get("attempts", 0))
+    except Exception:
+        return 0
+
+
+def _bump_auto_update_attempts(target):
+    n = _auto_update_attempts(target) + 1
+    try:
+        import json as _json
+        tmp = _auto_update_state_file() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            _json.dump({"target": str(target), "attempts": n}, f)
+        os.replace(tmp, _auto_update_state_file())
+    except Exception:
+        pass
+    return n
+
+
+def _clear_auto_update_state():
+    try:
+        p = _auto_update_state_file()
+        if os.path.isfile(p):
+            os.remove(p)
+    except Exception:
+        pass
+
+
 # --- Close flow state ---
 _force_close = False
 _window = None
@@ -898,18 +954,32 @@ def main():
             print(f"  Local={current}  Remote={remote}  HasUpdate={has_update}")
             try:
                 from app import state
+                auto = False
                 if not remote:
                     msg = f"Update check failed (local {current}) - network blocked?"
                     kind = "error"
                 elif remote == current:
                     msg = f"Already on latest version ({current})"
                     kind = "current"
+                    # We are ON the target -> a previous auto-apply succeeded
+                    # (or none was needed). Reset the attempt budget.
+                    _clear_auto_update_state()
                 elif has_update:
                     msg = f"Update available: {current} -> {remote}"
                     kind = "available"
+                    tried = _auto_update_attempts(remote)
+                    if tried < AUTO_UPDATE_MAX_ATTEMPTS:
+                        n = _bump_auto_update_attempts(remote)
+                        auto = True
+                        state.log(f"Auto-installing update (attempt {n}/{AUTO_UPDATE_MAX_ATTEMPTS})")
+                    else:
+                        # Auto path already failed twice for this version - stop
+                        # restarting the user in a loop and let them decide.
+                        state.log(f"Auto-install gave up after {tried} tries - asking the user")
                 else:
                     msg = f"Local {current} >= remote {remote} (no update)"
                     kind = "ahead"
+                    _clear_auto_update_state()
                 state.log(msg)
                 state.push_event({
                     "type": "update_status",
@@ -918,6 +988,8 @@ def main():
                     "current": current,
                     "remote": remote,
                     "has_update": bool(has_update),
+                    # Frontend applies without asking when this is set.
+                    "auto": bool(auto),
                 })
             except Exception as e:
                 print(f"  update_status push: {e}")

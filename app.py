@@ -2467,6 +2467,15 @@ def _api_500(e):
 @app.errorhandler(Exception)
 def _api_unhandled(e):
     if request.path.startswith("/api/"):
+        # Routing/HTTP errors (404 on an unmatched path, 405, ...) are NOT
+        # server faults - report their real status instead of dressing them up
+        # as a 500 with a traceback. Without this, a URL the int converter
+        # rejects (e.g. /api/refs/preview/-1) came back as a 500, which looks
+        # like a crash in the log for what is simply "no such thing".
+        # Still JSON, so clients calling r.json() keep working.
+        from werkzeug.exceptions import HTTPException
+        if isinstance(e, HTTPException):
+            return jsonify({"ok": False, "error": e.name}), (e.code or 500)
         import traceback
         return jsonify({
             "ok": False,
@@ -3163,6 +3172,42 @@ def replace_ref_upload(idx):
 def paste_ref():
     ok, msg = state.paste_clipboard_ref()
     return jsonify({"ok": ok, "message": msg})
+
+
+@app.route("/api/refs/preview/<int:idx>")
+def ref_preview(idx):
+    """Large preview of ref slot `idx` for the hover popup.
+
+    Served from the IN-MEMORY PIL image (same source as the thumbnail), never
+    from the file path. That is deliberate: refs come from clipboard pastes,
+    gallery images, uploads and arbitrary external files the user browsed to,
+    and the file can be moved/renamed/deleted after it was added. Reading the
+    in-memory copy means the hover preview can never 404 or hit the
+    _is_path_allowed allowlist, whatever the source was.
+
+    PNG so transparency survives (a cutout ref must not gain a white halo).
+    """
+    try:
+        size = int(request.args.get("size", 900))
+    except (TypeError, ValueError):
+        size = 900
+    size = max(160, min(size, 2048))
+    # Snapshot under the lock so a concurrent remove/replace can't close the
+    # image object out from under us mid-encode.
+    with state.ref_lock:
+        if idx < 0 or idx >= len(state.ref_images) or state.ref_images[idx] is None:
+            return "", 404
+        pil = state.ref_images[idx].copy()
+    try:
+        if max(pil.size) > size:
+            pil.thumbnail((size, size), Image.LANCZOS)
+        buf = io.BytesIO()
+        pil.save(buf, "PNG")
+        buf.seek(0)
+        return send_file(buf, mimetype="image/png")
+    except Exception as e:
+        state.log(f"ref preview failed: {str(e)[:80]}")
+        return "", 500
 
 
 @app.route("/api/refs/thumb/<int:idx>")

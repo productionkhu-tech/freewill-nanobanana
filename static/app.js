@@ -310,6 +310,31 @@ function showUpdateConfirmModal(current, remote) {
   });
 }
 
+// Auto-install path: the boot check found an update and the launcher's attempt
+// guard says we may apply it without asking. The user experience is simply
+// "close and reopen the app and it is up to date" — no dialog, no click. The
+// overlay still shows real download progress so a slow connection doesn't look
+// like a freeze. Falls back to the confirm dialog while a batch is running, so
+// an auto-restart can never kill in-flight generations.
+let _autoUpdateStarted = false;
+async function startAutoUpdate(current, remote) {
+  if (_autoUpdateStarted) return;
+  _autoUpdateStarted = true;
+  showUpdateOverlay();
+  const lbl = document.getElementById("nbUpdateLabel");
+  const sub = document.getElementById("nbUpdateSub");
+  if (lbl) lbl.textContent = "새 버전으로 업데이트 중…";
+  if (sub) sub.textContent = `${current || ""} → ${remote || ""} · 잠시만 기다려 주세요`;
+  const r = await api("/api/apply-update", { method: "POST" });
+  if (!r.ok) {
+    hideUpdateOverlay();
+    _autoUpdateStarted = false;
+    // Auto path failed at the request stage — let the user drive it instead.
+    showUpdateConfirmModal(current, remote);
+    showToast(r.error || "자동 업데이트 실패", "warn");
+  }
+}
+
 function showUpdateOverlay() {
   if (document.getElementById("nbUpdateOverlay")) return;
   const o = document.createElement("div");
@@ -1588,7 +1613,98 @@ async function _fillSlotFromDrop(e, i) {
   return false;
 }
 
+// ==========================================
+// Reference hover preview
+// ==========================================
+// Hovering a filled ref cell pops a large preview next to it. The image comes
+// from /api/refs/preview/<idx>, which reads the IN-MEMORY PIL copy — so it
+// works identically for clipboard pastes, gallery images, uploads and external
+// files, and still works if the original file was moved or deleted afterwards.
+// The popup is passive: pointer-events none, never a drop target, and it hides
+// on any gesture that could conflict (drag, scroll, click, key, blur).
+let _refHoverEl = null;
+let _refHoverTimer = null;
+let _refHoverIdx = -1;
+const REF_HOVER_DELAY = 220;   // don't flash while the pointer sweeps across
+
+function _ensureRefHoverEl() {
+  if (_refHoverEl && document.body.contains(_refHoverEl)) return _refHoverEl;
+  const el = document.createElement("div");
+  el.id = "refHoverPreview";
+  el.className = "ref-hover-preview";
+  el.innerHTML = '<img alt=""><div class="rhp-cap"></div>';
+  document.body.appendChild(el);
+  _refHoverEl = el;
+  return el;
+}
+
+function hideRefHover() {
+  if (_refHoverTimer) { clearTimeout(_refHoverTimer); _refHoverTimer = null; }
+  _refHoverIdx = -1;
+  if (_refHoverEl) {
+    _refHoverEl.classList.remove("show");
+    // Drop the bytes so a big ref isn't held in the decoder while hidden.
+    const im = _refHoverEl.querySelector("img");
+    if (im) im.removeAttribute("src");
+  }
+}
+
+// Place the popup beside `cell`, preferring the right (the ref grid lives in
+// the left sidebar). Clamped so it never leaves the viewport.
+function _positionRefHover(el, cell) {
+  const r = cell.getBoundingClientRect();
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const w = el.offsetWidth || 320, h = el.offsetHeight || 320;
+  const GAP = 12;
+  let left = r.right + GAP;
+  if (left + w > vw - 8) left = r.left - GAP - w;   // no room right -> flip left
+  if (left < 8) left = Math.max(8, Math.min(r.left, vw - w - 8));
+  let top = r.top + r.height / 2 - h / 2;
+  top = Math.max(8, Math.min(top, vh - h - 8));
+  el.style.left = left + "px";
+  el.style.top = top + "px";
+}
+
+function showRefHover(cell, idx, ref, stamp) {
+  const el = _ensureRefHoverEl();
+  _refHoverIdx = idx;
+  const im = el.querySelector("img");
+  const cap = el.querySelector(".rhp-cap");
+  const dims = (ref && ref.w && ref.h) ? `${ref.w} x ${ref.h}` : "";
+  const name = (ref && ref.filename) ? ref.filename : `Image ${idx + 1}`;
+  cap.textContent = dims ? `${name}  ·  ${dims}` : name;
+  im.onload = () => {
+    if (_refHoverIdx !== idx) return;         // pointer already moved on
+    el.classList.add("show");
+    _positionRefHover(el, cell);              // re-place once real size is known
+  };
+  im.onerror = () => { if (_refHoverIdx === idx) hideRefHover(); };
+  im.src = `/api/refs/preview/${idx}?size=900&t=${stamp}`;
+  _positionRefHover(el, cell);
+}
+
+function _wireRefHover(cell, media, idx, ref, stamp) {
+  media.addEventListener("mouseenter", () => {
+    if (_refHoverTimer) clearTimeout(_refHoverTimer);
+    _refHoverTimer = setTimeout(() => showRefHover(cell, idx, ref, stamp), REF_HOVER_DELAY);
+  });
+  media.addEventListener("mouseleave", hideRefHover);
+  // A drag must never fight the popup (it would sit under the cursor and the
+  // cell is a reorder drag source).
+  cell.addEventListener("dragstart", hideRefHover);
+  media.addEventListener("mousedown", hideRefHover);
+}
+
+// Global escape hatches — anything that moves the cell out from under the
+// popup, or takes focus away, kills it.
+document.addEventListener("scroll", hideRefHover, true);
+window.addEventListener("blur", hideRefHover);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") hideRefHover(); });
+
 async function refreshRefs() {
+  // Cells are about to be destroyed and rebuilt — drop any open popup so it
+  // can't linger pointing at a slot that no longer exists.
+  hideRefHover();
   const d = await api("/api/refs");
   refCount = d.count || 0;
   refSlotCount = d.slot_count || (d.refs ? d.refs.length : 0);
@@ -1712,8 +1828,11 @@ async function refreshRefs() {
     const media = document.createElement("div");
     media.className = "ref-media";
 
+    // One stamp per cell render, shared by the thumbnail and the hover
+    // preview, so a replaced slot busts both caches together.
+    const _stamp = Date.now();
     const img = document.createElement("img");
-    img.src = `/api/refs/thumb/${i}?t=${Date.now()}`;
+    img.src = `/api/refs/thumb/${i}?t=${_stamp}`;
     img.alt = `ref ${i + 1}`;
     // Kill the native image drag so dragging the thumbnail moves the whole
     // cell (reorder) instead of starting an image drag with no payload.
@@ -1735,6 +1854,8 @@ async function refreshRefs() {
     media.appendChild(rmBtn);
 
     cell.appendChild(media);
+    // Hover -> large preview beside the cell (all ref sources, file-independent)
+    _wireRefHover(cell, media, i, ref, _stamp);
 
     // [Image N] label
     const lbl = document.createElement("div");
@@ -2552,10 +2673,16 @@ async function pollEvents() {
       // e.g. favorite toggled in the preview window.
       scheduleGalleryRefresh();
     } else if (ev.type === "update_status") {
-      // Background check result. If an update is available, show the
-      // in-page confirm dialog (frontend-owned, no Python MessageBox).
+      // Background check result. ev.auto means the launcher cleared this
+      // version for a hands-free install (attempt budget not exhausted) —
+      // restart alone is enough to update. Otherwise fall back to the in-page
+      // confirm dialog (frontend-owned, no Python MessageBox).
       if (ev.has_update) {
-        showUpdateConfirmModal(ev.current, ev.remote);
+        if (ev.auto && !isGenerating) {
+          startAutoUpdate(ev.current, ev.remote);
+        } else {
+          showUpdateConfirmModal(ev.current, ev.remote);
+        }
       } else {
         const kind = ev.kind === "error" ? "warn" : "info";
         showToast(ev.message || "Update check complete", kind);

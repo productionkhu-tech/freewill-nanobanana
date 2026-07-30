@@ -552,9 +552,21 @@ function cmpNavigate(step) {
   if (galleryPaths[idx] === cmp.path) return;
   const p = galleryPaths[idx];
   const seq = ++_cmpSeq;
+  const prevPath = cmp.path;   // for rollback if the new one fails to load
   cmp.path = p;   // advance the cursor NOW so rapid wheel steps chain in order
   updateTitleAndCounter();
   const im = new Image();
+  // Without this, a right-pane image that fails to load (deleted a moment ago,
+  // transient read error) left the header/counter showing the NEW name while
+  // the canvas still displayed the OLD image - labels and pixels disagreeing.
+  // Roll the cursor back so what you read is what you see.
+  im.onerror = () => {
+    if (seq !== _cmpSeq) return;
+    cmp.path = prevPath;
+    updateTitleAndCounter();
+    updateActButtons();
+    showToast("비교 이미지를 불러오지 못했습니다");
+  };
   im.onload = () => {
     if (seq !== _cmpSeq) return;   // superseded by a newer right-pane load
     const sameDims = cmp.img && im.width === cmp.img.width && im.height === cmp.img.height;

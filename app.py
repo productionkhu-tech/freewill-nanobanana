@@ -150,6 +150,24 @@ def _gemini_aspect_ok(model, aspect):
     return aspect in valid
 
 
+# Gemini image_size (resolution tier) support per model. The dropdown already
+# restricts this client-side; this is the server-side twin so a value that
+# survived a model switch (hand-edited project JSON, a page whose spec is out of
+# sync, a settings POST that raced the switch) cannot 400 the request. Notably
+# the LITE model matches the "gemini-3" prefix test but only supports 1K.
+_GEMINI_IMAGE_SIZES = {
+    "gemini-3-pro-image": {"1K", "2K", "4K"},
+    "gemini-3.1-flash-image": {"512px", "1K", "2K", "4K"},
+    "gemini-3.1-flash-lite-image": {"1K"},
+}
+
+
+def _gemini_image_size_ok(model, size):
+    allowed = _GEMINI_IMAGE_SIZES.get(_normalize_model_name(model))
+    # Unknown model id -> don't block; the API is the authority for it.
+    return True if allowed is None else (size in allowed)
+
+
 # ==========================================
 # Seedream (BytePlus ModelArk) — OpenAI-SDK-compatible image provider
 # Same `openai` client library, different base_url + ARK_API_KEY. Isolated from
@@ -3840,7 +3858,12 @@ def start_generate():
         # Reve: aspect-only (no resolution level / custom pixel). "auto" -> omit
         # so the model picks.
         img_cfg = {}
-        if aspect and aspect != "auto":
+        # Reve takes aspect_ratio as a REAL API parameter (unlike Seedream,
+        # where it is just prose in the prompt), so an unsupported value is a
+        # hard 400 - not a soft miss. Only forward values Reve actually knows;
+        # anything else (a GPT-only 9:21, a Gemini 1:8, or the "custom"
+        # sentinel that survived a model switch) is dropped so the model picks.
+        if aspect and aspect != "auto" and aspect in REVE_ASPECTS:
             img_cfg["reve_aspect"] = aspect
         if state.reve_bg_remove:
             img_cfg["postprocessing"] = [{"process": "remove_background"}]
@@ -3858,7 +3881,13 @@ def start_generate():
             # The Gemini API token is "512px", not "0.5K". v1201/02 shipped the
             # wrong token; translate it here so even a project saved with "0.5K"
             # (loaded straight into state) can't send the 400-causing value.
-            img_cfg["image_size"] = "512px" if resolution == "0.5K" else resolution
+            _size = "512px" if resolution == "0.5K" else resolution
+            # H10: only forward a tier this model actually supports. The lite
+            # model matches the "gemini-3" test above but is 1K-only, so a 2K/4K
+            # value carried over from another model would 400. Omitting the key
+            # lets the model use its own default instead of failing the job.
+            if _gemini_image_size_ok(model, _size):
+                img_cfg["image_size"] = _size
     ref_paths = list(state.ref_path_list)
     pinned_ref_paths = [
         p for i, p in enumerate(state.ref_path_list)

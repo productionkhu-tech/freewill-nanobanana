@@ -652,7 +652,14 @@ function applyModelSpec(model, preserved) {
 
 function onModelChange() {
   const model = document.getElementById("modelSelect").value;
-  applyModelSpec(model);
+  // 해상도는 새 모델의 기본값으로 되돌린다. "1K/2K/4K"는 모델마다 실제 픽셀이 다른
+  // 라벨이라(GPT 4K=8.29M, Seedream 4.5 4K=4096², Gemini는 또 다름) 이전 모델의 값을
+  // 물고 오면 의도와 다른 결과가 나온다 — Gemini에서 1K로 작업하다 Seedream 5.0 Pro로
+  // 오면 권장 2K가 아니라 1K에 묶여 저화질로 생성되던 사용자 제보가 이 경우다.
+  // 종횡비는 모델과 무관한 '모양'이므로 그대로 유지한다(새 모델이 못 받는 값일 때만
+  // repopulateSelect가 기본값으로 떨어뜨린다).
+  const spec = getModelSpec(model);
+  applyModelSpec(model, { resolution: spec.defaultResolution });
   saveSettings();
 }
 

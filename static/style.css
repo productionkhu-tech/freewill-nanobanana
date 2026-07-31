@@ -921,6 +921,44 @@ textarea.prompt-box { min-height: 82px; }
 
 /* Marquee selection rectangle */
 #gallery { position: relative; }
+
+/* Jump-to-end buttons (bottom-right of the gallery).
+   Rules that keep them out of the way:
+   - the wrapper never takes the pointer (only the buttons do), so cards
+     underneath stay clickable and grid marquee-drag is unaffected
+   - hidden entirely until the grid is long enough to be annoying to scroll
+   - the button for the edge you are already at dims and stops responding */
+.gallery-jump {
+  position: absolute;
+  right: 22px;              /* clears the grid scrollbar */
+  bottom: 16px;
+  z-index: 6;               /* above cards, below the marquee overlay */
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity .15s ease;
+}
+.gallery-jump.show { opacity: 1; visibility: visible; }
+.jump-btn {
+  pointer-events: auto;
+  width: 34px;
+  height: 34px;
+  border-radius: 17px;
+  border: 1px solid var(--border);
+  background: rgba(44, 44, 46, 0.88);
+  color: var(--text2);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.45);
+  transition: background .12s, color .12s, opacity .12s;
+}
+.jump-btn:hover { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+.jump-btn.at-edge { opacity: .3; pointer-events: none; }
+
 .marquee {
   position: absolute;
   border: 1px solid var(--accent);

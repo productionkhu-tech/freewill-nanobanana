@@ -2309,7 +2309,74 @@ async function refreshGallery() {
 
     grid.appendChild(card);
   });
+
+  // Card count just changed, so the scrollable height did too. The grid's own
+  // box size doesn't change (flex:1), so the ResizeObserver never fires for
+  // this — re-evaluate explicitly, plus once more after lazy images settle.
+  updateGalleryJump();
+  setTimeout(updateGalleryJump, 300);
 }
+
+// ==========================================
+// Gallery jump-to-end buttons
+// ==========================================
+// Appear only once the grid is genuinely long (a couple of screens), so a
+// small session never sees them. The button for the edge you're already at
+// dims out, which doubles as a "where am I" hint.
+const JUMP_MIN_OVERFLOW = 600;   // px of hidden content before the buttons earn their place
+const JUMP_EDGE_SLACK = 40;      // treat "within 40px" as being at the edge
+
+function updateGalleryJump() {
+  const grid = document.getElementById("galleryGrid");
+  const wrap = document.getElementById("galleryJump");
+  if (!grid || !wrap) return;
+  const overflow = grid.scrollHeight - grid.clientHeight;
+  if (overflow < JUMP_MIN_OVERFLOW) {
+    wrap.classList.remove("show");
+    wrap.setAttribute("aria-hidden", "true");
+    return;
+  }
+  wrap.classList.add("show");
+  wrap.setAttribute("aria-hidden", "false");
+  document.getElementById("jumpTopBtn")
+    ?.classList.toggle("at-edge", grid.scrollTop <= JUMP_EDGE_SLACK);
+  document.getElementById("jumpBottomBtn")
+    ?.classList.toggle("at-edge", grid.scrollTop >= overflow - JUMP_EDGE_SLACK);
+}
+
+// Deliberately a plain assignment — no scrollTo({behavior:"smooth"}), no rAF
+// tween. Both of those depend on the frame loop, and a window that is not
+// actively painting (minimised, backgrounded, or an embedded host that
+// throttles rAF) stops delivering frames: the animation silently never runs
+// and the button does nothing. Assigning scrollTop always lands. A jump button
+// wants to be AT the end anyway — the same contract as Home/End.
+function jumpGallery(where) {
+  const grid = document.getElementById("galleryGrid");
+  if (!grid) return;
+  grid.scrollTop = where === "top" ? 0 : Math.max(0, grid.scrollHeight - grid.clientHeight);
+  updateGalleryJump();
+}
+
+(function setupGalleryJump() {
+  const grid = document.getElementById("galleryGrid");
+  if (!grid) return;
+  // Timestamp throttle, not rAF: the dim/undim state has to stay correct even
+  // when the frame loop is throttled (see jumpGallery). Trailing timer catches
+  // the final resting position after the last event.
+  let last = 0, trail = null;
+  grid.addEventListener("scroll", () => {
+    const now = Date.now();
+    if (now - last >= 100) { last = now; updateGalleryJump(); }
+    clearTimeout(trail);
+    trail = setTimeout(updateGalleryJump, 140);
+  }, { passive: true });
+  window.addEventListener("resize", updateGalleryJump);
+  // Cards load lazily and change the grid height after render.
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(updateGalleryJump).observe(grid);
+  }
+  updateGalleryJump();
+})();
 
 function getThumbSize() {
   // 0 = serve the ORIGINAL file (1-column is the "확인용" full-width view —

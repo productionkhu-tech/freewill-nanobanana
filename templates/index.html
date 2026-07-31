@@ -231,6 +231,13 @@
     <div id="galleryGrid" class="gallery-grid cols-2">
       <div id="emptyState" class="empty-state">No images yet<br>Configure prompt and click Generate</div>
     </div>
+    <!-- Jump-to-end buttons. Only appear once the grid is actually long enough
+         to be a nuisance to scroll; the wrapper is pointer-events:none so the
+         cards underneath stay fully clickable and marquee selection still works. -->
+    <div id="galleryJump" class="gallery-jump" aria-hidden="true">
+      <button id="jumpTopBtn" class="jump-btn" onclick="jumpGallery('top')" title="맨 위로 (최신)">▲</button>
+      <button id="jumpBottomBtn" class="jump-btn" onclick="jumpGallery('bottom')" title="맨 아래로 (오래된 것)">▼</button>
+    </div>
   </main>
 </div>
 

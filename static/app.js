@@ -2344,17 +2344,54 @@ function updateGalleryJump() {
     ?.classList.toggle("at-edge", grid.scrollTop >= overflow - JUMP_EDGE_SLACK);
 }
 
-// Deliberately a plain assignment — no scrollTo({behavior:"smooth"}), no rAF
-// tween. Both of those depend on the frame loop, and a window that is not
-// actively painting (minimised, backgrounded, or an embedded host that
-// throttles rAF) stops delivering frames: the animation silently never runs
-// and the button does nothing. Assigning scrollTop always lands. A jump button
-// wants to be AT the end anyway — the same contract as Home/End.
+// Eased glide, not a teleport. Hand-rolled rather than
+// scrollTo({behavior:"smooth"}) because that gives no control over duration —
+// the browser picks it, and over a huge gallery it crawls well past 2s.
+//
+// Duration scales with distance so a one-screen hop stays snappy and a
+// thousand-image run still feels like travel, but it is hard-capped at
+// JUMP_MAX_MS. Only scrollTop is touched per frame (no layout writes), so it
+// stays cheap no matter how many cards exist.
+const JUMP_MAX_MS = 1800;      // 무조건 2초 안에 도착
+const JUMP_MIN_MS = 240;       // 짧은 거리도 뚝 끊기지 않게
+let _jumpAnim = 0;
+
 function jumpGallery(where) {
   const grid = document.getElementById("galleryGrid");
   if (!grid) return;
-  grid.scrollTop = where === "top" ? 0 : Math.max(0, grid.scrollHeight - grid.clientHeight);
-  updateGalleryJump();
+  const from = grid.scrollTop;
+  const to = where === "top" ? 0 : Math.max(0, grid.scrollHeight - grid.clientHeight);
+  const dist = Math.abs(to - from);
+  const token = ++_jumpAnim;               // 재클릭/사용자 스크롤이 이전 것을 무효화
+  if (dist < 2) { updateGalleryJump(); return; }
+
+  const dur = Math.min(JUMP_MAX_MS, JUMP_MIN_MS + dist * 0.09);
+  const start = performance.now();
+  // easeInOutCubic — 부드럽게 출발해서 부드럽게 멈춤 ("슈웅~")
+  const ease = t => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+
+  let frames = 0;
+  const step = (now) => {
+    if (token !== _jumpAnim) return;        // 취소됨
+    frames++;
+    const t = Math.min(1, (now - start) / dur);
+    grid.scrollTop = from + (to - from) * ease(t);
+    if (t < 1) requestAnimationFrame(step);
+    else { grid.scrollTop = to; updateGalleryJump(); }
+  };
+  requestAnimationFrame(step);
+
+  // Frame-loop guard. A window that isn't painting never runs rAF (verified
+  // live in a non-compositing host: rAF callbacks and smooth scrollTo were
+  // both silent no-ops). Without this the button would simply do nothing
+  // there. If no frame arrived, invalidate the tween and land immediately.
+  setTimeout(() => {
+    if (token === _jumpAnim && frames === 0) {
+      _jumpAnim++;                          // 뒤늦게 오는 프레임이 되돌리지 못하게
+      grid.scrollTop = to;
+      updateGalleryJump();
+    }
+  }, 150);
 }
 
 (function setupGalleryJump() {
@@ -2370,6 +2407,13 @@ function jumpGallery(where) {
     clearTimeout(trail);
     trail = setTimeout(updateGalleryJump, 140);
   }, { passive: true });
+
+  // The user always wins. Touching the wheel / dragging mid-glide cancels it
+  // instead of fighting the animation for scrollTop — that tug-of-war is
+  // exactly what reads as "laggy". These fire on the grid, not on the jump
+  // buttons (they aren't descendants), so pressing a button can't self-cancel.
+  ["wheel", "touchstart", "pointerdown"].forEach(ev =>
+    grid.addEventListener(ev, () => { _jumpAnim++; }, { passive: true }));
   window.addEventListener("resize", updateGalleryJump);
   // Cards load lazily and change the grid height after render.
   if (typeof ResizeObserver !== "undefined") {

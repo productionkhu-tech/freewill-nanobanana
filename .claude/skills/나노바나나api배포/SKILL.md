@@ -135,11 +135,12 @@ E2E 시작 전 **다른 NanoBanana가 떠 있으면 안 된다.** 포트 5656이
 **남의 앱(사용자 실행본)의 /api/version을 측정**한다. 그 앱이 마침 자동 업데이트되면
 "버전은 올라갔는데 sha256 불일치" 라는 가짜 FAIL이 뜬다.
 
-``**그리고 /api/events 를 보는 창이 하나도 없어야 한다.** 브라우저 패널·다른 탭이 같은 포트를 열어두면
-이벤트 큐(pop 방식)를 가로채 앱 창이 update_status 를 못 받고, 자동 업데이트가 조용히 안 일어난다
-(2026-08-05 실제로 당함 — 가짜 FAIL). 테스트 전에 그 창을 다른 주소로 옮길 것.
+**그리고 `/api/events` 를 보는 창이 하나도 없어야 한다.** 브라우저 패널·다른 탭이 같은 포트를
+열어두면 이벤트 큐(pop 방식)를 가로채 앱 창이 `update_status` 를 못 받고, 자동 업데이트가
+조용히 일어나지 않는다 (2026-08-05 실제로 당함 — 가짜 FAIL. CLAUDE.md §2에 적어둔 함정을
+테스트 도구가 그대로 밟은 것). 테스트 전에 그 창을 다른 주소로 옮길 것.
 
-`powershell
+```powershell
 Get-Process NanoBanana -ErrorAction SilentlyContinue | Select-Object Id, Path   # 0건이어야 함
 (Test-NetConnection 127.0.0.1 -Port 5656 -WarningAction SilentlyContinue).TcpTestSucceeded  # False여야 함
 ```

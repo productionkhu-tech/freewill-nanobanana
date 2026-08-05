@@ -104,6 +104,10 @@
           <select id="resolutionSelect">
             <option>512px</option><option>1K</option><option>2K</option><option selected>4K</option>
           </select>
+          <!-- Custom(직접 픽셀) 사용 중에는 해상도 등급이 의미가 없다. 예전에는
+               드롭다운을 회색 처리만 해서 낡은 "1K"가 남아 저화질에 갇힌 것처럼
+               보였다 — 그 자리에 상태를 글로 표시한다. -->
+          <div id="resolutionCustomNote" class="res-custom-note" style="display:none">Custom 크기 사용 중</div>
         </div>
         <div>
           <label class="field-label">Count</label>

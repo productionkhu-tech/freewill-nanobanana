@@ -650,16 +650,32 @@ function applyModelSpec(model, preserved) {
   updateReveRefBudget(_lastRefs);
 }
 
+// "1K/2K/4K"는 모델마다 실제 픽셀이 다른 라벨이므로(GPT 4K=8.29M, Seedream 4.5 4K=4096²,
+// Gemini는 또 다름) 이전 모델의 값을 그대로 물고 오면 안 된다. 그렇다고 모델의
+// defaultResolution 으로 되돌리면 4K를 지원하는 모델인데도 2K(GPT는 1K)에서 시작해
+// "4K 되는 곳에 갔는데 하위 화질에 갇힌다"는 문제가 생긴다. 두 제보를 모두 만족시키는
+// 규칙은 하나뿐이다 — **새 모델이 낼 수 있는 최고 화질로 맞춘다.**
+const _RES_RANK = { "512px": 0, "1K": 1, "2K": 2, "4K": 3 };
+function bestResolution(spec) {
+  const list = (spec && spec.resolutions) || [];
+  if (!list.length) return undefined;
+  // 알려진 등급끼리는 순위로 비교하고, 목록에 없는 값(예: Reve의 "auto")은
+  // 배열 순서를 신뢰해 마지막 항목으로 떨어진다.
+  let best = null, bestRank = -1;
+  for (const r of list) {
+    const rank = _RES_RANK[r];
+    if (rank === undefined) continue;
+    if (rank > bestRank) { bestRank = rank; best = r; }
+  }
+  return best || list[list.length - 1];
+}
+
 function onModelChange() {
   const model = document.getElementById("modelSelect").value;
-  // 해상도는 새 모델의 기본값으로 되돌린다. "1K/2K/4K"는 모델마다 실제 픽셀이 다른
-  // 라벨이라(GPT 4K=8.29M, Seedream 4.5 4K=4096², Gemini는 또 다름) 이전 모델의 값을
-  // 물고 오면 의도와 다른 결과가 나온다 — Gemini에서 1K로 작업하다 Seedream 5.0 Pro로
-  // 오면 권장 2K가 아니라 1K에 묶여 저화질로 생성되던 사용자 제보가 이 경우다.
-  // 종횡비는 모델과 무관한 '모양'이므로 그대로 유지한다(새 모델이 못 받는 값일 때만
-  // repopulateSelect가 기본값으로 떨어뜨린다).
   const spec = getModelSpec(model);
-  applyModelSpec(model, { resolution: spec.defaultResolution });
+  // 종횡비는 모델과 무관한 '모양'이므로 유지한다(새 모델이 못 받는 값일 때만
+  // repopulateSelect가 기본값으로 떨어뜨린다).
+  applyModelSpec(model, { resolution: bestResolution(spec) });
   saveSettings();
 }
 
@@ -812,12 +828,19 @@ function toggleCustomWrap() {
   const active = customSizeActive();
   if (wrap) wrap.style.display = active ? "" : "none";
   // Resolution is meaningless in custom mode (pixels ARE the resolution).
+  // Swap the dropdown for a plain "Custom 크기 사용 중" note rather than leaving
+  // a greyed-out stale tier on screen: a dimmed "1K" reads as "quality is
+  // capped at 1K", which is exactly how this was reported. The select keeps
+  // its real value (saveSettings still sends a valid tier); it is only hidden.
   const resSel = document.getElementById("resolutionSelect");
+  const resNote = document.getElementById("resolutionCustomNote");
   if (resSel) {
     resSel.disabled = active;
+    resSel.style.display = active ? "none" : "";
     const box = resSel.closest("div");
-    if (box) box.style.opacity = active ? "0.4" : "";
+    if (box) box.style.opacity = "";
   }
+  if (resNote) resNote.style.display = active ? "" : "none";
   if (active) updateCustomPreview();
 }
 

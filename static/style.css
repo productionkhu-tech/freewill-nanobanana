@@ -951,7 +951,14 @@ textarea.prompt-box { min-height: 82px; }
 .ref-cell .ref-remove:hover { background: var(--error); color: #fff; }
 
 /* Change button — wider below image */
+/* A <label for="refSlotInput">, not a <button> — WebView2 blocks a programmatic
+   .click() on a file input, and a label activation is a genuine user gesture.
+   These rules give it the button look it had. */
 .ref-cell .ref-change {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
   border: none;
   border-radius: 6px;
   height: 26px;

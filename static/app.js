@@ -2089,12 +2089,18 @@ function _renderEmptyRefSlot(cell, i) {
   cell.appendChild(lbl);
 
   // Sits in the same row as a filled cell's Change button -> equal height.
-  const fillBtn = document.createElement("button");
+  // A <label for> rather than a <button>: WebView2 refuses a programmatic
+  // .click() on a file input, but a label's own activation is a real user
+  // gesture, so the picker opens on both Windows and macOS.
+  const fillBtn = document.createElement("label");
   fillBtn.className = "ref-change";
   fillBtn.textContent = "채우기";
-  fillBtn.addEventListener("click", (e) => { e.stopPropagation(); replaceRef(i); });
+  fillBtn.setAttribute("for", "refSlotInput");
+  fillBtn.addEventListener("pointerdown", (e) => { e.stopPropagation(); _refSlotTarget = i; });
+  fillBtn.addEventListener("click", (e) => e.stopPropagation());
   cell.appendChild(fillBtn);
 
+  // Clicking anywhere else in the empty cell does the same thing.
   cell.addEventListener("click", () => replaceRef(i));
   const clearHover = () => {
     cell.classList.remove("reorder-over");
@@ -2420,10 +2426,13 @@ async function refreshRefs() {
 
     // Change button — doubles as an explicit drop-to-replace target so the
     // user can disambiguate ADD vs REPLACE without needing empty real estate.
-    const chgBtn = document.createElement("button");
+    // <label for> not <button>: see the empty-slot cell — a label activation is
+    // a real user gesture, which the file picker requires in WebView2.
+    const chgBtn = document.createElement("label");
     chgBtn.className = "ref-change";
     chgBtn.textContent = "Change";
-    chgBtn.addEventListener("click", () => replaceRef(i));
+    chgBtn.setAttribute("for", "refSlotInput");
+    chgBtn.addEventListener("pointerdown", () => { _refSlotTarget = i; });
     // Counter pattern — child-less button so this is mostly defensive, but
     // matches the refArea dragDepth style.
     let _chgDragDepth = 0;
@@ -2471,8 +2480,12 @@ async function onRefFilesChosen(inputEl) {
     if (d?.ok && d.added > 0) {
       refreshRefs();
       showToast(`Added ${d.added}/${appended} image(s)`, "success");
+      if (d.skipped?.length) showToast(d.skipped[0], "warn");
     } else if (d?.ok && d.added === 0) {
-      showToast(`Sent ${appended}, 0 added (full or duplicates?)`, "warn");
+      // Say WHY. "0 added" alone sent people hunting for a bug when the real
+      // answer was an unsupported format (HEIC, mostly) or a duplicate.
+      showToast(d.skipped?.length ? d.skipped[0]
+                                  : `${appended}장 중 0장 추가됨 (이미 있거나 슬롯이 가득 찼습니다)`, "warn");
     } else {
       showToast(d?.error || "Upload failed", "error");
     }
@@ -2490,9 +2503,42 @@ async function browseRefImages() {
   const inp = document.getElementById("refFileInput");
   if (inp) inp.click();
 }
-async function replaceRef(idx) {
-  const d = await api("/api/browse-replace-ref", { method: "POST", body: { index: idx } });
-  if (d.ok) { refreshRefs(); showToast("Reference replaced", "success"); }
+// Clicking an empty slot (or a filled slot's Change button) opens the BROWSER's
+// file picker, not the server-side tkinter dialog. On macOS that dialog can
+// never work — Tk has to own the main thread and every Flask request runs on a
+// worker thread — so adding a reference by clicking just failed. This posts to
+// the same endpoint as dropping a file onto the slot, which was already proven.
+let _refSlotTarget = -1;
+function replaceRef(idx) {
+  const inp = document.getElementById("refSlotInput");
+  if (!inp) {   // very old markup — fall back to the legacy server dialog
+    api("/api/browse-replace-ref", { method: "POST", body: { index: idx } })
+      .then(d => { if (d.ok) { refreshRefs(); showToast("Reference replaced", "success"); } });
+    return;
+  }
+  _refSlotTarget = idx;
+  // Called straight from a click handler, so user activation is still live and
+  // Chromium/WebView2 allows this. The Change / 채우기 controls are <label for>
+  // elements that do not need it at all.
+  inp.click();
+}
+
+async function onRefSlotFileChosen(inputEl) {
+  const idx = _refSlotTarget;
+  _refSlotTarget = -1;
+  const f = inputEl.files && inputEl.files[0];
+  inputEl.value = "";            // same file twice in a row must still fire
+  if (!f || idx < 0) return;
+  const ext = (f.name || "").split(".").pop().toLowerCase();
+  if (!["png", "jpg", "jpeg", "webp", "bmp"].includes(ext)) {
+    showToast("지원하지 않는 형식입니다 (png · jpg · webp · bmp)", "warn");
+    return;
+  }
+  const form = new FormData();
+  form.append("file", f);
+  const r = await api(`/api/refs/replace/${idx}`, { method: "POST", body: form });
+  if (r.ok) { await refreshRefs(); showToast("Reference set", "success"); }
+  else showToast(r.error || "Failed", "error");
 }
 async function removeRef(idx) {
   // Delete = empty slot `idx` on the server. refreshRefs() then re-syncs the

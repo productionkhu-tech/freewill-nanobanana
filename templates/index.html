@@ -90,6 +90,15 @@
                multiple
                style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0"
                onchange="onRefFilesChosen(this)">
+        <!-- Single-slot picker (clicking an empty slot / the Change button).
+             That used to call the server's tkinter dialog, which cannot work on
+             macOS: Tk must own the main thread and every Flask request runs on a
+             worker thread, so the dialog raised and the user just saw a failure
+             toast. Same endpoint as dropping a file onto the slot. -->
+        <input type="file" id="refSlotInput"
+               accept="image/png,image/jpeg,image/webp,image/bmp"
+               style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0"
+               onchange="onRefSlotFileChosen(this)">
         <button class="btn-sm" onclick="clearRefs()">Clear All</button>
       </div>
       <p class="hint" id="refLimitHint">3rd-gen models support up to 14 reference images.</p>

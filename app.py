@@ -1271,9 +1271,50 @@ class AppState:
         # they can clean it manually if it ever grows too large.
         self.temp_ref_paths.discard(filepath)
 
+    def _paste_clipboard_ref_mac(self):
+        """Write the macOS pasteboard image straight to a PNG via AppleScript.
+
+        `the clipboard as PNGf` raises when the pasteboard holds no image, which
+        osascript reports as a non-zero exit — that is the "nothing to paste"
+        case, not a crash."""
+        os.makedirs(self.temp_ref_dir, exist_ok=True)
+        fn = f"clipboard_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+        fp = os.path.join(self.temp_ref_dir, fn)
+        script = (
+            'set _f to (POSIX file "%s")\n'
+            'set _d to (the clipboard as «class PNGf»)\n'
+            'set _h to open for access _f with write permission\n'
+            'set eof _h to 0\n'
+            'write _d to _h\n'
+            'close access _h\n'
+        ) % fp.replace('"', '\\"')
+        import subprocess
+        try:
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=30)
+        except Exception as e:
+            return False, f"Clipboard read failed: {str(e)[:60]}"
+        if r.returncode != 0 or not os.path.isfile(fp) or os.path.getsize(fp) == 0:
+            try:
+                if os.path.isfile(fp):
+                    os.remove(fp)
+            except Exception:
+                pass
+            return False, "No image in clipboard"
+        self.temp_ref_paths.add(fp)
+        if self.add_ref_image(fp):
+            return True, "Pasted image as reference"
+        return False, "Could not add the pasted image"
+
     def paste_clipboard_ref(self):
+        # The page's own paste handler covers Cmd/Ctrl+V; this server route is
+        # the fallback. ImageGrab.grabclipboard() needs a Windows clipboard, so
+        # macOS reads the pasteboard through AppleScript instead of answering
+        # "Windows only" the way it used to.
+        if sys.platform == "darwin":
+            return self._paste_clipboard_ref_mac()
         if sys.platform != "win32":
-            return False, "Clipboard paste only on Windows"
+            return False, "Clipboard paste is only available on Windows and macOS"
         try:
             clip = ImageGrab.grabclipboard()
         except Exception:
@@ -3278,11 +3319,18 @@ def upload_refs():
         files = request.files.getlist("files")
         added = 0
         received = len(files)
+        skipped = []
         os.makedirs(state.temp_ref_dir, exist_ok=True)
         for f in files:
             fname = f.filename or ""
             ext = os.path.splitext(fname)[1].lower()
             if ext not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+                # HEIC is what an iPhone/Mac photo library hands over by
+                # default, and "skipped" alone left people guessing.
+                if ext in {".heic", ".heif"}:
+                    skipped.append(f"{fname} (HEIC은 지원하지 않아요 — PNG나 JPG로 저장해 주세요)")
+                else:
+                    skipped.append(f"{fname} ({ext or '확장자 없음'})")
                 state.log(f"upload: skipped non-image '{fname}'")
                 continue
 
@@ -3306,7 +3354,8 @@ def upload_refs():
             if state.add_ref_image(fp):
                 added += 1
         state.log(f"upload: received {received}, added {added}")
-        return jsonify({"ok": True, "added": added, "received": received})
+        return jsonify({"ok": True, "added": added, "received": received,
+                        "skipped": skipped})
     except Exception as e:
         import traceback
         state.log(f"upload_refs CRASH: {str(e)[:200]}")
@@ -3444,16 +3493,20 @@ def browse_replace_ref():
     if not in_range:
         return jsonify({"ok": False, "error": "Invalid index"})
     try:
-        from tkinter import filedialog
-        root = _make_dialog_root()
         initial = state.output_dir if os.path.isdir(state.output_dir) else os.path.expanduser("~")
-        fp = filedialog.askopenfilename(
-            parent=root,
-            title=f"Replace Reference Image {idx + 1}",
-            filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.webp;*.bmp"), ("All Files", "*.*")],
-            initialdir=initial,
-        )
-        root.destroy()
+        if sys.platform == "darwin":
+            fp = _mac_pick_file(f"레퍼런스 {idx + 1} 교체", initial,
+                                ["public.png", "public.jpeg", "org.webmproject.webp", "com.microsoft.bmp"])
+        else:
+            from tkinter import filedialog
+            root = _make_dialog_root()
+            fp = filedialog.askopenfilename(
+                parent=root,
+                title=f"Replace Reference Image {idx + 1}",
+                filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.webp;*.bmp"), ("All Files", "*.*")],
+                initialdir=initial,
+            )
+            root.destroy()
         if not fp:
             return jsonify({"ok": False})
         # Delegate to the locked state method — avoids a second unlocked
@@ -4929,6 +4982,63 @@ def upload_project():
 
 
 # --- File dialog helper: force to foreground on Windows ---
+def _osascript(script):
+    """Run an AppleScript and return its stdout, "" if the user cancelled.
+
+    macOS cannot use the tkinter dialogs below: Tk must own the process's main
+    thread, and on the Mac build every request runs on a Flask worker thread, so
+    tk.Tk() there raises (or takes the process down). osascript is a subprocess,
+    so it works from any thread and gives the user a real native dialog.
+    A cancelled dialog exits non-zero — that is not an error."""
+    import subprocess
+    try:
+        r = subprocess.run(["osascript", "-e", script],
+                           capture_output=True, text=True, timeout=600)
+    except Exception:
+        return ""
+    if r.returncode != 0:
+        return ""
+    return r.stdout.strip()
+
+
+def _mac_pick_folder(title, initial):
+    loc = f'default location POSIX file "{initial}" ' if initial and os.path.isdir(initial) else ""
+    return _osascript(
+        f'POSIX path of (choose folder with prompt "{title}" {loc})')
+
+
+def _mac_pick_file(title, initial, of_type=None):
+    loc = f'default location POSIX file "{initial}" ' if initial and os.path.isdir(initial) else ""
+    types = ""
+    if of_type:
+        joined = ", ".join(f'"{t}"' for t in of_type)
+        types = f'of type {{{joined}}} '
+    return _osascript(
+        f'POSIX path of (choose file with prompt "{title}" {types}{loc})')
+
+
+def _mac_pick_files(title, initial, of_type=None):
+    loc = f'default location POSIX file "{initial}" ' if initial and os.path.isdir(initial) else ""
+    types = ""
+    if of_type:
+        joined = ", ".join(f'"{t}"' for t in of_type)
+        types = f'of type {{{joined}}} '
+    out = _osascript(
+        'set _out to ""\n'
+        f'repeat with f in (choose file with prompt "{title}" {types}{loc}with multiple selections allowed)\n'
+        '  set _out to _out & POSIX path of f & linefeed\n'
+        'end repeat\n'
+        'return _out')
+    return [ln for ln in out.splitlines() if ln.strip()]
+
+
+def _mac_save_file(title, initial, default_name):
+    loc = f'default location POSIX file "{initial}" ' if initial and os.path.isdir(initial) else ""
+    return _osascript(
+        f'POSIX path of (choose file name with prompt "{title}" '
+        f'default name "{default_name}" {loc})')
+
+
 def _make_dialog_root():
     """Create a tkinter root that forces the file dialog to appear on top of Chrome."""
     import tkinter as tk
@@ -4952,11 +5062,14 @@ def _make_dialog_root():
 @app.route("/api/browse-folder", methods=["POST"])
 def browse_folder():
     try:
-        from tkinter import filedialog
-        root = _make_dialog_root()
         initial = state.output_dir if os.path.isdir(state.output_dir) else os.path.expanduser("~")
-        folder = filedialog.askdirectory(parent=root, title="Select Output Folder", initialdir=initial)
-        root.destroy()
+        if sys.platform == "darwin":
+            folder = _mac_pick_folder("저장 폴더 선택", initial)
+        else:
+            from tkinter import filedialog
+            root = _make_dialog_root()
+            folder = filedialog.askdirectory(parent=root, title="Select Output Folder", initialdir=initial)
+            root.destroy()
         if folder:
             state.output_dir = folder
             state.project_dirty = True
@@ -4969,16 +5082,20 @@ def browse_folder():
 @app.route("/api/browse-files", methods=["POST"])
 def browse_files():
     try:
-        from tkinter import filedialog
-        root = _make_dialog_root()
         initial = state.output_dir if os.path.isdir(state.output_dir) else os.path.expanduser("~")
-        paths = filedialog.askopenfilenames(
-            parent=root,
-            title="Select Reference Images",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp")],
-            initialdir=initial,
-        )
-        root.destroy()
+        if sys.platform == "darwin":
+            paths = _mac_pick_files("레퍼런스 이미지 선택", initial,
+                                    ["public.png", "public.jpeg", "org.webmproject.webp", "com.microsoft.bmp"])
+        else:
+            from tkinter import filedialog
+            root = _make_dialog_root()
+            paths = filedialog.askopenfilenames(
+                parent=root,
+                title="Select Reference Images",
+                filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp")],
+                initialdir=initial,
+            )
+            root.destroy()
         added = 0
         for p in paths:
             if state.add_ref_image(p):
@@ -4991,21 +5108,24 @@ def browse_files():
 @app.route("/api/browse-project", methods=["POST"])
 def browse_project():
     try:
-        from tkinter import filedialog
-        root = _make_dialog_root()
         # Default to NanoBanana JSON project folder
         project_dir = state.get_project_save_dir()
         if not os.path.isdir(project_dir):
             project_dir = os.path.expanduser("~/Documents")
         if not os.path.isdir(project_dir):
             project_dir = state.output_dir
-        fp = filedialog.askopenfilename(
-            parent=root,
-            title="Load Project",
-            filetypes=[("JSON Project", "*.json"), ("All Files", "*.*")],
-            initialdir=project_dir,
-        )
-        root.destroy()
+        if sys.platform == "darwin":
+            fp = _mac_pick_file("프로젝트 열기", project_dir, ["public.json"])
+        else:
+            from tkinter import filedialog
+            root = _make_dialog_root()
+            fp = filedialog.askopenfilename(
+                parent=root,
+                title="Load Project",
+                filetypes=[("JSON Project", "*.json"), ("All Files", "*.*")],
+                initialdir=project_dir,
+            )
+            root.destroy()
         # Only PICK the file — do NOT load it into the current project. With
         # tabs, opening a project must never overwrite whatever the user has
         # in front of them; the client passes this path to
@@ -5020,18 +5140,24 @@ def browse_project():
 @app.route("/api/save-project-as", methods=["POST"])
 def save_project_as():
     try:
-        from tkinter import filedialog
-        root = _make_dialog_root()
         initial_dir = state.get_project_save_dir()
-        fp = filedialog.asksaveasfilename(
-            parent=root,
-            title="Save Project",
-            defaultextension=".json",
-            initialdir=initial_dir,
-            initialfile=state.default_project_filename(),
-            filetypes=[("JSON Project", "*.json")],
-        )
-        root.destroy()
+        if sys.platform == "darwin":
+            fp = _mac_save_file("다른 이름으로 저장", initial_dir,
+                                state.default_project_filename())
+            if fp and not fp.lower().endswith(".json"):
+                fp += ".json"
+        else:
+            from tkinter import filedialog
+            root = _make_dialog_root()
+            fp = filedialog.asksaveasfilename(
+                parent=root,
+                title="Save Project",
+                defaultextension=".json",
+                initialdir=initial_dir,
+                initialfile=state.default_project_filename(),
+                filetypes=[("JSON Project", "*.json")],
+            )
+            root.destroy()
         if fp:
             state.save_project(fp)
             state.log(f"Project saved: {os.path.basename(fp)}")

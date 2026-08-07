@@ -259,13 +259,19 @@ header .hint {
   transition: opacity .25s;
 }
 #toast.show { opacity: 1; }
+/* FIXED height on purpose. When this box grew and shrank with the prompt
+   text, every navigation changed #stage's height, the ResizeObserver refitted
+   the canvas, and the image visibly jumped 2-3 times per step. A constant
+   footer means the stage never resizes, so the picture holds still — long
+   prompts scroll inside instead. */
 footer {
-  min-height: 48px;
-  max-height: 160px;
+  height: 96px;
   background: #0F1013;
   padding: 10px 14px;
   flex-shrink: 0;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 .label {
   font-size: 10px;
@@ -274,11 +280,16 @@ footer {
   margin-bottom: 4px;
 }
 #prompt {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;      /* 긴 프롬프트는 이 안에서만 스크롤 (푸터 높이는 불변) */
   font-size: 10px;
   color: #A1A1A6;
   white-space: pre-wrap;
   word-break: break-word;
   line-height: 1.5;
+  scrollbar-width: thin;
+  scrollbar-color: #2D2F36 transparent;
 }
 .empty { color: #636366; }
 </style>
@@ -349,6 +360,12 @@ let state = { img: null, scale: 1, fitScale: 1, offsetX: 0, offsetY: 0,
               dragging: false, lastX: 0, lastY: 0 };
 
 let currentPath = new URLSearchParams(location.search).get("path") || "";
+// The project this viewer belongs to. Without it the viewer would follow
+// whatever tab is active in the main window: its image list would suddenly be
+// another project's, the current file would look "deleted", and it would jump
+// to an unrelated image mid-review.
+const VIEWER_PID = new URLSearchParams(location.search).get("pid") || "";
+const PIDQ = VIEWER_PID ? ("?pid=" + encodeURIComponent(VIEWER_PID)) : "";
 let galleryPaths = [];
 // Split-compare mode: left pane = currentPath, right pane = cmp.path, BOTH
 // drawn at the SAME scale (fit of the higher-res image) with synced zoom/pan.
@@ -607,10 +624,16 @@ const selSet = new Set();
 let currentFav = false;
 
 function post(url, body) {
+  // Every write this window makes carries the project it belongs to. The
+  // server attributes it to THAT project instead of whatever tab is active,
+  // which is what stopped favourites and selections landing in the wrong
+  // gallery when the user switched tabs with the preview open.
+  const payload = Object.assign({}, body || {});
+  if (VIEWER_PID && payload.pid === undefined) payload.pid = VIEWER_PID;
   return fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-NB-Token": CSRF },
-    body: JSON.stringify(body || {}),
+    body: JSON.stringify(payload),
   }).then(r => r.json());
 }
 
@@ -670,9 +693,7 @@ function _applyGalleryData(items) {
     _curKnown = true;
     _lastIdx = galleryPaths.indexOf(currentPath);
     currentFav = !!meta.favorite;
-    const box = document.getElementById("prompt");
-    box.textContent = meta.prompt || "—";
-    box.classList.toggle("empty", !meta.prompt);
+    applyPromptFor(currentPath);
   }
   updateTitleAndCounter();
   updateActButtons();
@@ -701,10 +722,31 @@ function _applyGalleryData(items) {
   }
 }
 
+// Prompt text for a path, taken from the snapshot we already hold. Writing it
+// synchronously is what removes the flicker: the box used to be blanked to "—"
+// and only refilled when a fresh /api/gallery round-trip came back, so every
+// step of the wheel flashed the footer empty and back.
+function applyPromptFor(fp) {
+  const box = document.getElementById("prompt");
+  const meta = galleryMeta[fp];
+  const txt = (meta && meta.prompt) ? meta.prompt : "";
+  box.textContent = txt || "—";
+  box.classList.toggle("empty", !txt);
+}
+
 function loadImage(filepath) {
   const seq = ++_loadSeq;
   currentPath = filepath;
-  _curKnown = false;   // re-established by the next gallery snapshot
+  // Trust the cached snapshot when we have one. Previously this was forced to
+  // false and only the network reply could restore it, which also meant the
+  // ★/선택 buttons flickered through a wrong state on every navigation.
+  const cached = galleryMeta[filepath];
+  _curKnown = !!cached;
+  if (cached) {
+    _lastIdx = galleryPaths.indexOf(filepath);
+    currentFav = !!cached.favorite;
+  }
+  applyPromptFor(filepath);
   updateTitleAndCounter();
   updateActButtons();
   // Tell the main window what is on screen — its gallery scrolls to and
@@ -730,13 +772,16 @@ function loadImage(filepath) {
   };
   img.src = `/api/gallery/image?path=${encodeURIComponent(filepath)}`;
 
-  const box = document.getElementById("prompt");
-  box.textContent = "—";
-  box.classList.add("empty");
-  fetch("/api/gallery").then(r => r.json()).then(d => {
-    if (seq !== _loadSeq) return;   // stale response for an older image
-    _applyGalleryData(d.items || []);
-  }).catch(() => {});
+  // Only fetch the list when we do not have one yet (first open, or the
+  // snapshot does not know this path). Re-downloading the whole gallery for
+  // every arrow press was pure overhead — the 1.2s rev poll below already
+  // keeps the list, counter and ★ states current.
+  if (!galleryPaths.length || !cached) {
+    fetch("/api/gallery" + PIDQ).then(r => r.json()).then(d => {
+      if (seq !== _loadSeq) return;   // stale response for an older image
+      _applyGalleryData(d.items || []);
+    }).catch(() => {});
+  }
 }
 
 // Live sync with the main window: cheap rev poll -> full refetch on change.
@@ -745,10 +790,10 @@ function loadImage(filepath) {
 let _galleryRev = null;
 setInterval(async () => {
   try {
-    const d = await (await fetch("/api/gallery/rev")).json();
+    const d = await (await fetch("/api/gallery/rev" + PIDQ)).json();
     if (typeof d.rev !== "number" || d.rev === _galleryRev) return;
     _galleryRev = d.rev;
-    const g = await (await fetch("/api/gallery")).json();
+    const g = await (await fetch("/api/gallery" + PIDQ)).json();
     _applyGalleryData(g.items || []);
   } catch (_) {}
 }, 1200);

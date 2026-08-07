@@ -559,6 +559,15 @@ class JsApi:
             import urllib.parse
             encoded = urllib.parse.quote(filepath, safe="")
             viewer_url = f"{APP_URL}/viewer?path={encoded}"
+            # Pin the viewer to the project that opened it. Without this it
+            # reads whichever tab is active, so switching tabs in the main
+            # window would swap the viewer's image list mid-review.
+            try:
+                from app import shared as _shared
+                if _shared.active_pid:
+                    viewer_url += "&pid=" + urllib.parse.quote(_shared.active_pid, safe="")
+            except Exception:
+                pass
             title = os.path.basename(filepath) or "Image Viewer"
             if cmp:
                 viewer_url += "&cmp=" + urllib.parse.quote(cmp, safe="")

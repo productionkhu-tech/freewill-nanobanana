@@ -122,6 +122,208 @@ header {
 /* ═══════════════════════════════════════════
    MAIN LAYOUT
    ═══════════════════════════════════════════ */
+/* 프로젝트 열기 목록의 맨 위/맨 아래 버튼 — 갤러리 것과 같은 스타일을 쓰되
+   대화상자 안쪽 오른쪽 아래에 붙는다. 대화상자에 position 기준이 필요하다. */
+.projects-dialog { position: relative; }
+.gallery-jump.projects-jump {
+  right: 26px;
+  bottom: 76px;   /* 하단 버튼 줄(다른 파일 찾기/취소) 위 */
+}
+
+/* 프로젝트 열기 대화상자: 검색 + 개수 */
+.projects-search {
+  width: 100%;
+  height: 32px;
+  margin-top: 10px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg);
+  color: var(--text);
+  font-size: 12px;
+  font-family: inherit;
+}
+.projects-search:focus { outline: none; border-color: var(--accent); }
+.projects-count { display: block; margin-top: 6px; font-size: 10px; color: var(--text3); }
+.projects-empty { padding: 40px 0; text-align: center; color: var(--text3); font-size: 12px; }
+
+/* ===== Project tab bar =====
+   One window, many isolated projects. The bar scrolls horizontally rather than
+   shrinking tabs to unreadable slivers when many are open. */
+.project-bar {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  height: 36px;
+  padding: 0 10px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.project-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.project-tabs::-webkit-scrollbar { height: 4px; }
+.project-tabs::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+.proj-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  max-width: 210px;
+  height: 28px;
+  align-self: center;
+  padding: 0 8px 0 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface2);
+  color: var(--text2);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .12s, color .12s, border-color .12s;
+}
+.proj-tab:hover { background: var(--border); color: var(--text); }
+.proj-tab.active {
+  background: var(--surface);
+  color: var(--text);
+  border-color: var(--accent);
+}
+.proj-tab .pt-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 130px;
+}
+/* Unsaved marker — same language as the window title's trailing asterisk. */
+.proj-tab .pt-dirty {
+  color: var(--accent);
+  font-weight: bold;
+  font-size: 13px;
+  line-height: 1;
+}
+/* Live batch in a tab you may not be looking at. */
+.proj-tab .pt-gen {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: ptPulse 1s ease-in-out infinite;
+  flex-shrink: 0;
+}
+@keyframes ptPulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+/* Images that landed while this tab was in the background. */
+.proj-tab .pt-badge {
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 9px;
+  font-weight: bold;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+/* 드래그로 순서 변경 */
+.proj-tab.pt-dragging { opacity: .45; }
+/* Drop marker. box-shadow only — it must not take up layout space, or the tabs
+   would shift under the cursor and the marker would oscillate. */
+.proj-tab.pt-over { box-shadow: -3px 0 0 var(--accent); }
+.proj-tab.pt-over-end { box-shadow: 3px 0 0 var(--accent); }
+
+/* 탭 우클릭 메뉴 */
+.tab-menu {
+  position: fixed;
+  z-index: 9500;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+  min-width: 168px;
+}
+.tab-menu .tm-colors {
+  display: flex;
+  gap: 6px;
+  padding: 2px 2px 8px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 6px;
+}
+.tab-menu .tm-swatch {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, .18);
+  cursor: pointer;
+  padding: 0;
+}
+.tab-menu .tm-swatch.none {
+  background: transparent;
+  position: relative;
+}
+.tab-menu .tm-swatch.none::after {
+  content: "";
+  position: absolute;
+  left: 1px; right: 1px; top: 6px;
+  height: 1px;
+  background: var(--text3);
+  transform: rotate(-45deg);
+}
+.tab-menu .tm-swatch.on { outline: 2px solid var(--text); outline-offset: 1px; }
+.tab-menu .tm-item {
+  display: block;
+  width: 100%;
+  border: none;
+  background: none;
+  color: var(--text);
+  font-size: 11px;
+  font-family: inherit;
+  text-align: left;
+  padding: 7px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tab-menu .tm-item:hover { background: var(--border); }
+
+.proj-tab .pt-close {
+  border: none;
+  background: none;
+  color: var(--text3);
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.proj-tab .pt-close:hover { background: var(--error); color: #fff; }
+.tab-new, .tab-open {
+  flex: 0 0 auto;
+  align-self: center;
+  height: 28px;
+  min-width: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface2);
+  color: var(--text2);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.tab-new:hover, .tab-open:hover { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+
 #main {
   display: flex;
   flex: 1;
@@ -162,6 +364,24 @@ header {
   text-transform: uppercase;
   letter-spacing: .3px;
 }
+/* Log header carries the "all tabs" switch on its right. */
+.section-title.log-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.log-all {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 9px;
+  font-weight: normal;
+  color: var(--text3);
+  text-transform: none;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+.log-all input { margin: 0; cursor: pointer; }
 .field-label {
   font-size: 10px;
   font-weight: bold;

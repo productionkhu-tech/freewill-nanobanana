@@ -18,6 +18,9 @@ let refSlotCount = 0;             // total slot count (highest [Image N])
 let refFilledSlots = new Set();   // 1-based slot numbers that hold an image
 let allGalleryPaths = [];
 let isGenerating = false;
+// Any tab busy, including ones off screen. Kept apart from isGenerating (which
+// is only about the visible tab) because the two answer different questions.
+let _anyGenerating = false;
 let searchDebounce = null;
 let settingsDebounce = null;
 
@@ -25,6 +28,7 @@ let settingsDebounce = null;
 // Init
 // ==========================================
 document.addEventListener("DOMContentLoaded", async () => {
+  await refreshProjects();     // 탭 먼저 — 이후 로드는 활성 프로젝트 기준
   await loadSettings();
   loadVersion();
   refreshRefs();
@@ -34,7 +38,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupClipboardPaste();
   setupFixedPromptMention();
   await checkReleaseNotes();   // show "What's new" popup if first launch after update
-  checkRecentProjects();
+  // The "최근 프로젝트를 여시겠어요?" prompt is gone from startup: the server
+  // already restores the tabs that were open (or opens the most recent one),
+  // so asking just duplicated what is already on the tab bar — and answering
+  // it left a spare empty tab behind. The picker still exists behind Load.
   initAlwaysOnTopButton();
   wireProjectNameInputs();
   try {
@@ -172,12 +179,14 @@ function setupKeyboardShortcuts() {
     }
     if (e.ctrlKey && (e.key === "s" || e.key === "S")) {
       e.preventDefault();
-      saveProject();
+      // Ctrl+Shift+S = 다른 이름으로 저장, Ctrl+S = 현재 파일에 덮어쓰기
+      // (Shift가 눌리면 e.key 가 대문자 "S" 로 오므로 위 조건이 둘 다 받는다)
+      if (e.shiftKey) saveProjectAs(); else saveProject();
       return;
     }
     if (e.ctrlKey && (e.key === "n" || e.key === "N")) {
       e.preventDefault();
-      newProject();
+      newProjectTab();      // 새 탭으로 (기존 작업을 덮지 않음)
       return;
     }
     if (e.ctrlKey && (e.key === "o" || e.key === "O")) {
@@ -185,9 +194,31 @@ function setupKeyboardShortcuts() {
       loadProject();
       return;
     }
+    // Ctrl+Tab / Ctrl+Shift+Tab — walk the project tabs. Placed BEFORE the
+    // text-field guard on purpose: switching projects has to work while the
+    // caret sits in a prompt box, which is where you usually are.
+    if (e.ctrlKey && e.key === "Tab") {
+      e.preventDefault();
+      cycleProject(e.shiftKey ? -1 : 1);
+      return;
+    }
+    // Ctrl+W — close the current project. Unsaved work asks first; an
+    // already-saved project just closes.
+    if (e.ctrlKey && (e.key === "w" || e.key === "W")) {
+      e.preventDefault();
+      if (activePid) closeProjectTab(activePid);
+      return;
+    }
 
     const tag = document.activeElement?.tagName;
     const isText = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+
+    if (e.key === "F2" && !isText) {
+      e.preventDefault();
+      const cur = projectTabs.find(t => t.pid === activePid);
+      renameProjectPrompt(activePid, cur ? cur.name : "");
+      return;
+    }
 
     if (e.ctrlKey && (e.key === "c" || e.key === "C") && !isText) {
       if (selectedPaths.length === 1) { copyToClipboard(selectedPaths[0]); e.preventDefault(); }
@@ -357,6 +388,464 @@ function hideUpdateOverlay() {
 }
 
 // ==========================================
+// Project tabs
+// ==========================================
+// One window, many fully isolated projects. The server owns each project's
+// state; the page just renders whichever one is active, so switching is
+// "re-read everything from the server" rather than "remember it in JS" — that
+// is what makes cross-contamination structurally impossible.
+let projectTabs = [];
+let activePid = null;
+// Fixed palette (mirrors _TAB_COLORS on the server). A free colour picker
+// would let the user choose something invisible on the tab background.
+const TAB_COLOR_HEX = {
+  red: "#E05A5A", orange: "#D4A574", yellow: "#D8C24A", green: "#5AA46B",
+  blue: "#5B8FD4", purple: "#9A7BD1", pink: "#D46FA5",
+};
+const TAB_COLOR_LABEL = {
+  "": "없음", red: "빨강", orange: "주황", yellow: "노랑",
+  green: "초록", blue: "파랑", purple: "보라", pink: "분홍",
+};
+
+// Right-click a tab: colour label, rename, close.
+let _tabMenuEl = null;
+function hideTabMenu() {
+  if (_tabMenuEl) { _tabMenuEl.remove(); _tabMenuEl = null; }
+}
+function showTabMenu(x, y, p) {
+  hideTabMenu();
+  const m = document.createElement("div");
+  m.className = "tab-menu";
+  const swatches = document.createElement("div");
+  swatches.className = "tm-colors";
+  ["", "red", "orange", "yellow", "green", "blue", "purple", "pink"].forEach(name => {
+    const b = document.createElement("button");
+    b.className = "tm-swatch" + (p.color === name ? " on" : "") + (name === "" ? " none" : "");
+    b.title = TAB_COLOR_LABEL[name];
+    if (name) b.style.background = TAB_COLOR_HEX[name];
+    b.addEventListener("click", async () => {
+      hideTabMenu();
+      const r = await api("/api/projects/color", { method: "POST", body: { pid: p.pid, color: name } });
+      if (!r.ok) { showToast(r.error || "색 변경 실패", "error"); return; }
+      await refreshProjects();
+    });
+    swatches.appendChild(b);
+  });
+  m.appendChild(swatches);
+  const mk = (label, fn) => {
+    const b = document.createElement("button");
+    b.className = "tm-item";
+    b.textContent = label;
+    b.addEventListener("click", () => { hideTabMenu(); fn(); });
+    m.appendChild(b);
+  };
+  mk("이름 변경 (F2)", () => renameProjectPrompt(p.pid, p.name));
+  // The Stop button only reaches the visible tab; without this a background
+  // batch could only be stopped by switching to it first.
+  if (p.generating) {
+    mk(`생성 중지 (${p.done}/${p.total})`, async () => {
+      await api("/api/stop", { method: "POST", body: { pid: p.pid } });
+      showToast(`${p.name} 생성을 중지합니다`, "warn");
+      await refreshProjects();
+    });
+  }
+  mk("닫기 (Ctrl+W)", () => closeProjectTab(p.pid));
+  document.body.appendChild(m);
+  const w = m.offsetWidth, h = m.offsetHeight;
+  m.style.left = Math.min(x, window.innerWidth - w - 8) + "px";
+  m.style.top = Math.min(y, window.innerHeight - h - 8) + "px";
+  _tabMenuEl = m;
+}
+document.addEventListener("mousedown", (e) => {
+  if (_tabMenuEl && !_tabMenuEl.contains(e.target)) hideTabMenu();
+});
+window.addEventListener("blur", hideTabMenu);
+
+// The tab strip scrolls horizontally, but a vertical wheel does nothing over
+// it by default — you had to grab and drag. Map wheel to horizontal scroll,
+// and only swallow the event when there is actually something to scroll so a
+// short tab bar never eats the page's wheel.
+(function setupTabWheel() {
+  const bar = document.getElementById("projectTabs");
+  if (!bar) return;
+  bar.addEventListener("wheel", (e) => {
+    const delta = e.deltaY || e.deltaX;
+    if (!delta) return;
+    if (bar.scrollWidth <= bar.clientWidth) return;
+    e.preventDefault();
+    bar.scrollLeft += delta;
+  }, { passive: false });
+})();
+
+async function refreshProjects() {
+  const d = await api("/api/projects");
+  if (!d.projects) return;
+  projectTabs = d.projects;
+  activePid = d.active;
+  renderProjectTabs();
+}
+
+// Tab DOM is REUSED across renders, keyed by pid. This used to wipe the strip
+// with innerHTML="" on every render — and every finished image triggers a
+// render — so the whole bar blinked, hover states dropped, and a drag in
+// flight lost the node it was carrying. Now a render only touches what changed.
+const _tabEls = new Map();
+const TAB_DND = "application/x-nb-tab";
+let _tabDragPid = null;        // pid being dragged, or null
+let _tabRenderPending = false; // a render arrived mid-drag and was deferred
+let _tabScrolledPid = null;
+
+function renderProjectTabs() {
+  const bar = document.getElementById("projectTabs");
+  if (!bar) return;
+  // Never rebuild under a live drag — moving the source node cancels it.
+  if (_tabDragPid) { _tabRenderPending = true; return; }
+
+  const live = new Set(projectTabs.map(p => p.pid));
+  for (const [pid, el] of [..._tabEls]) {
+    if (!live.has(pid)) { el.remove(); _tabEls.delete(pid); }
+  }
+
+  let prev = null;
+  projectTabs.forEach(p => {
+    let tab = _tabEls.get(p.pid);
+    if (!tab) { tab = _makeProjectTab(p.pid); _tabEls.set(p.pid, tab); }
+    _updateProjectTab(tab, p);
+    // Put it in position without recreating anything (insertBefore MOVES).
+    const want = prev ? prev.nextSibling : bar.firstChild;
+    if (tab !== want) bar.insertBefore(tab, want);
+    prev = tab;
+  });
+
+  // Scroll to the active tab only when it actually changed, so this never
+  // yanks the strip back while the user is scrolling through their tabs.
+  if (activePid !== _tabScrolledPid) {
+    _tabScrolledPid = activePid;
+    const el = _tabEls.get(activePid);
+    if (el) setTimeout(() => el.scrollIntoView({ block: "nearest", inline: "nearest" }), 0);
+  }
+}
+
+function _makeProjectTab(pid) {
+  const tab = document.createElement("div");
+  tab.className = "proj-tab";
+  tab.dataset.pid = pid;
+  tab.draggable = true;
+
+  const dot = document.createElement("span"); dot.className = "pt-gen";
+  const nm = document.createElement("span"); nm.className = "pt-name";
+  const dt = document.createElement("span"); dt.className = "pt-dirty";
+  dt.textContent = "*"; dt.title = "저장하지 않은 변경사항";
+  const bd = document.createElement("span"); bd.className = "pt-badge";
+  const x = document.createElement("button"); x.className = "pt-close";
+  x.textContent = "×"; x.title = "프로젝트 닫기";
+  tab.append(dot, nm, dt, bd, x);
+
+  // Handlers read tab._p, refreshed on every update — capturing the project
+  // object here would go stale as soon as its name or dirty flag changed.
+  tab.addEventListener("click", (e) => {
+    if (e.target.closest(".pt-close")) return;
+    switchProject(pid);
+  });
+  // Double-click renames — renames the actual file, so it does not fork the
+  // project the way "save as" does.
+  tab.addEventListener("dblclick", (e) => {
+    if (e.target.closest(".pt-close")) return;
+    e.preventDefault();
+    renameProjectPrompt(pid, tab._p ? tab._p.name : "");
+  });
+  x.addEventListener("click", (e) => { e.stopPropagation(); closeProjectTab(pid); });
+  tab.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    if (tab._p) showTabMenu(e.clientX, e.clientY, tab._p);
+  });
+
+  tab.addEventListener("dragstart", (e) => {
+    e.dataTransfer.setData(TAB_DND, pid);
+    e.dataTransfer.effectAllowed = "move";
+    _tabDragPid = pid;
+    // Applied a frame late: Chromium snapshots the drag ghost during
+    // dragstart, and a faded source would make the ghost faded too.
+    requestAnimationFrame(() => tab.classList.add("pt-dragging"));
+  });
+  tab.addEventListener("dragend", () => {
+    _tabDragPid = null;
+    tab.classList.remove("pt-dragging");
+    _paintTabDrop(-1);
+    if (_tabRenderPending) { _tabRenderPending = false; renderProjectTabs(); }
+  });
+  return tab;
+}
+
+function _updateProjectTab(tab, p) {
+  tab._p = p;
+  tab.classList.toggle("active", p.pid === activePid);
+  const title = (p.path || p.name) + (p.dirty ? "  (저장 안 됨)" : "");
+  if (tab.title !== title) tab.title = title;
+
+  const dot = tab.querySelector(".pt-gen");
+  dot.style.display = p.generating ? "" : "none";
+  if (p.generating) dot.title = `생성 중 (${p.done}/${p.total})`;
+
+  const nm = tab.querySelector(".pt-name");
+  if (nm.textContent !== p.name) nm.textContent = p.name;
+
+  tab.querySelector(".pt-dirty").style.display = p.dirty ? "" : "none";
+
+  const bd = tab.querySelector(".pt-badge");
+  const showBadge = p.unseen_done > 0 && p.pid !== activePid;
+  bd.style.display = showBadge ? "" : "none";
+  if (showBadge) {
+    const txt = p.unseen_done > 99 ? "99+" : String(p.unseen_done);
+    if (bd.textContent !== txt) bd.textContent = txt;
+    bd.title = `이 탭에서 ${p.unseen_done}장 완성됨`;
+  }
+
+  const hex = (p.color && TAB_COLOR_HEX[p.color]) || "";
+  const border = hex ? "4px solid " + hex : "";
+  if (tab.style.borderLeft !== border) {
+    tab.style.borderLeft = border;
+    tab.style.paddingLeft = hex ? "8px" : "";
+  }
+}
+
+// ---- Reorder by drag -------------------------------------------------------
+// One drop zone for the whole strip instead of per-tab dragenter/dragleave.
+// Per-tab listeners fired a `dragleave` every time the pointer crossed into a
+// child span (name, ×, badge), so the marker blinked constantly — and because
+// a drop always inserted BEFORE the target tab, the last position was
+// unreachable. The strip has `flex:1`, so the empty space to the right of the
+// tabs is part of it and means "put it at the end".
+let _tabDropIdx = -1;
+
+function _tabDropIndexFromX(x) {
+  const tabs = [...document.querySelectorAll("#projectTabs .proj-tab")];
+  for (let i = 0; i < tabs.length; i++) {
+    const r = tabs[i].getBoundingClientRect();
+    if (x < r.left + r.width / 2) return i;
+  }
+  return tabs.length;   // past the midpoint of the last tab => the end
+}
+
+function _paintTabDrop(idx) {
+  if (idx === _tabDropIdx) return;   // idempotent: no repaint, no blink
+  _tabDropIdx = idx;
+  const tabs = [...document.querySelectorAll("#projectTabs .proj-tab")];
+  tabs.forEach(t => t.classList.remove("pt-over", "pt-over-end"));
+  if (idx < 0 || !tabs.length) return;
+  if (idx < tabs.length) tabs[idx].classList.add("pt-over");
+  else tabs[tabs.length - 1].classList.add("pt-over-end");
+}
+
+async function _applyTabDrop(from, idx) {
+  const order = projectTabs.map(t => t.pid);
+  const cur = order.indexOf(from);
+  if (cur < 0 || idx < 0) return;
+  if (idx === cur || idx === cur + 1) return;   // dropped where it already sits
+  order.splice(cur, 1);
+  order.splice(idx > cur ? idx - 1 : idx, 0, from);
+  const r = await api("/api/projects/reorder", { method: "POST", body: { order } });
+  if (!r.ok) { showToast(r.error || "순서 변경 실패", "error"); return; }
+  await refreshProjects();
+}
+
+(function setupTabDrag() {
+  const bar = document.getElementById("projectTabs");
+  if (!bar) return;
+  const isTab = (e) => e.dataTransfer && [...e.dataTransfer.types].includes(TAB_DND);
+  bar.addEventListener("dragover", (e) => {
+    if (!isTab(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    _paintTabDrop(_tabDropIndexFromX(e.clientX));
+    // Auto-scroll near the edges — the wheel is not usable mid-drag.
+    const r = bar.getBoundingClientRect();
+    if (bar.scrollWidth > bar.clientWidth) {
+      if (e.clientX - r.left < 44) bar.scrollLeft -= 14;
+      else if (r.right - e.clientX < 44) bar.scrollLeft += 14;
+    }
+  });
+  bar.addEventListener("dragleave", (e) => {
+    if (e.relatedTarget && bar.contains(e.relatedTarget)) return;  // still inside
+    _paintTabDrop(-1);
+  });
+  bar.addEventListener("drop", async (e) => {
+    if (!isTab(e)) return;
+    e.preventDefault();
+    const from = e.dataTransfer.getData(TAB_DND);
+    const idx = _tabDropIndexFromX(e.clientX);
+    _paintTabDrop(-1);
+    if (from) await _applyTabDrop(from, idx);
+  });
+})();
+
+// Rename (F2 or double-click the tab). Renames the file itself for a saved
+// project; for one that was never saved it just sets the working title.
+let _renamePid = null;
+function renameProjectPrompt(pid, currentName) {
+  _renamePid = pid || activePid;
+  const input = document.getElementById("renameProjectName");
+  input.value = currentName || "";
+  document.getElementById("renameModal").classList.remove("hidden");
+  setTimeout(() => { input.focus(); input.select(); }, 50);
+}
+
+function closeRenameModal() {
+  document.getElementById("renameModal").classList.add("hidden");
+  _renamePid = null;
+}
+
+async function confirmRenameProject() {
+  const name = document.getElementById("renameProjectName").value.trim();
+  const pid = _renamePid;
+  if (!name || !pid) { closeRenameModal(); return; }
+  const r = await api("/api/projects/rename", { method: "POST", body: { pid, name } });
+  if (!r.ok) { showToast(r.error || "이름 변경 실패", "error"); return; }
+  closeRenameModal();
+  await refreshProjects();
+  if (pid === activePid) await refreshApiStatus();   // 창 제목도 갱신
+  showToast(r.unchanged ? "이름이 같습니다" : `이름 변경: ${r.name}`, "success");
+}
+
+// Re-read EVERY project-scoped surface from the server. Anything not reloaded
+// here would be the thing that leaks between projects.
+async function reloadActiveProject() {
+  await loadSettings();      // model/aspect/resolution/prompts/naming/output dir
+  await refreshRefs();       // reference slots
+  await refreshGallery();    // gallery + selection base
+  selectedPaths = [];
+  selectionAnchor = null;
+  _previewPath = null;
+  updateSelectionUI();
+  await pollLogs();
+}
+
+async function switchProject(pid) {
+  if (pid === activePid) return;
+  await flushPendingSettings();   // 지금 탭의 미저장 입력을 먼저 확정
+  const r = await api("/api/projects/switch", { method: "POST", body: { pid } });
+  if (!r.ok) { showToast(r.error || "전환 실패", "error"); return; }
+  activePid = r.active;
+  await reloadActiveProject();
+  await refreshProjects();
+}
+
+// Ctrl+Tab / Ctrl+Shift+Tab. Wraps around, and is a no-op with a single tab.
+async function cycleProject(dir) {
+  if (projectTabs.length < 2) return;
+  const i = projectTabs.findIndex(t => t.pid === activePid);
+  const next = projectTabs[((i < 0 ? 0 : i) + dir + projectTabs.length) % projectTabs.length];
+  if (next) await switchProject(next.pid);
+}
+
+async function newProjectTab() {
+  await flushPendingSettings();
+  const r = await api("/api/projects/new", { method: "POST", body: {} });
+  if (!r.ok) { showToast(r.error || "새 프로젝트 실패", "error"); return; }
+  activePid = r.pid;
+  await reloadActiveProject();
+  await refreshProjects();
+  showToast("새 프로젝트", "success");
+}
+
+async function openProjectInTab(filepath) {
+  await flushPendingSettings();
+  const r = await api("/api/projects/open", { method: "POST", body: { filepath } });
+  if (!r.ok) { showToast(r.error || "열기 실패", "error"); return false; }
+  activePid = r.pid;
+  await reloadActiveProject();
+  await refreshProjects();
+  showToast(r.already_open ? "이미 열려 있는 프로젝트로 이동" : "프로젝트 열기 완료", "success");
+  return true;
+}
+
+// Closing asks about saving FIRST, then tells the server to drop the tab.
+// A tab that is still generating is refused server-side rather than silently
+// killing a batch the user is paying for.
+async function closeProjectTab(pid) {
+  await flushPendingSettings();   // 닫기 전에 이 탭의 입력을 확정 (다른 탭으로 새지 않게)
+  await refreshProjects();        // dirty 여부를 최신값으로 판단
+  const p = projectTabs.find(t => t.pid === pid);
+  if (!p) return;
+  if (p.generating) {
+    showToast("생성 중입니다. Stop 후 닫아주세요.", "warn");
+    return;
+  }
+  const worthSaving = (p.images > 0 || p.dirty) && (p.dirty || !p.saved);
+  if (worthSaving) {
+    const choice = await askSaveBeforeClose(p.name);
+    if (choice === "cancel") return;
+    if (choice === "save") {
+      if (activePid !== pid) {
+        await api("/api/projects/switch", { method: "POST", body: { pid } });
+        activePid = pid;
+      }
+      const saved = await saveActiveProjectQuiet();
+      if (!saved) return;   // 저장 실패 -> 닫지 않음
+    }
+  }
+  const r = await api("/api/projects/close", { method: "POST", body: { pid } });
+  if (!r.ok) { showToast(r.error || "닫기 실패", "error"); return; }
+  activePid = r.active;
+  await reloadActiveProject();
+  await refreshProjects();
+}
+
+// Small 3-way prompt reused by tab close and by the app-close walk.
+let _saveAskResolver = null;
+function askSaveBeforeClose(name) {
+  return new Promise((resolve) => {
+    document.getElementById("tabCloseName").textContent = name || "";
+    document.getElementById("tabCloseModal").classList.remove("hidden");
+    _saveAskResolver = resolve;
+  });
+}
+// Generic yes/no in the app's own DOM. Native confirm() blocks the WebView2
+// message loop, which stalls the polling loops behind the dialog.
+let _confirmResolver = null;
+function askConfirm(title, desc, yesLabel, noLabel) {
+  return new Promise((resolve) => {
+    document.getElementById("confirmTitle").textContent = title || "";
+    document.getElementById("confirmDesc").textContent = desc || "";
+    document.getElementById("confirmYesBtn").textContent = yesLabel || "확인";
+    document.getElementById("confirmNoBtn").textContent = noLabel || "취소";
+    document.getElementById("confirmModal").classList.remove("hidden");
+    _confirmResolver = resolve;
+  });
+}
+function answerConfirm(yes) {
+  document.getElementById("confirmModal").classList.add("hidden");
+  const r = _confirmResolver;
+  _confirmResolver = null;
+  if (r) r(!!yes);
+}
+
+function answerSaveBeforeClose(choice) {
+  document.getElementById("tabCloseModal").classList.add("hidden");
+  const r = _saveAskResolver;
+  _saveAskResolver = null;
+  if (r) r(choice);
+}
+
+// Save the active project without any dialog when it already has a file.
+// Returns true when the project is on disk afterwards.
+async function saveActiveProjectQuiet() {
+  await saveSettings();
+  const info = await api("/api/close-info");
+  if (info.current_project) {
+    const d = await api("/api/project/save", { method: "POST", body: {} });
+    if (d.ok) { showToast(`저장됨: ${d.name || ""}`, "success"); await refreshProjects(); return true; }
+    showToast(d.error || "저장 실패", "error");
+    return false;
+  }
+  // Never saved before — needs a name.
+  return await new Promise((resolve) => {
+    _pendingSaveResolve = resolve;
+    openSaveModal(info);
+  });
+}
+
+// ==========================================
 // Settings
 // ==========================================
 async function loadSettings() {
@@ -403,16 +892,45 @@ async function loadSettings() {
   refreshApiStatus();
 }
 
+// The debounced save is bound to the project that was active when it was
+// SCHEDULED, not when it fires. Typing in project B and switching within the
+// 500ms window used to land B's prompt in project A — the timer fired after
+// the switch and wrote into whatever tab was current by then.
+let _pendingSavePid = null;
 function scheduleSettingsSave() {
   if (settingsDebounce) clearTimeout(settingsDebounce);
-  settingsDebounce = setTimeout(() => saveSettings(), 500);
+  _pendingSavePid = activePid;
+  const pid = activePid;
+  settingsDebounce = setTimeout(() => {
+    settingsDebounce = null;
+    _pendingSavePid = null;
+    saveSettings({ pid });
+  }, 500);
 }
 
-async function saveSettings() {
+// Write a pending edit out NOW, to the project it belongs to. Called before
+// anything that changes which project is on screen, so no keystroke is lost
+// and none of it leaks into the next project.
+async function flushPendingSettings() {
+  if (!settingsDebounce) return;
+  clearTimeout(settingsDebounce);
+  settingsDebounce = null;
+  const pid = _pendingSavePid;
+  _pendingSavePid = null;
+  await saveSettings({ pid });
+}
+
+// opts.auto = the app is normalising its own state (not a user edit), so the
+// project must NOT become "unsaved" because of it.
+async function saveSettings(opts) {
   const sections = [];
   document.querySelectorAll(".prompt-section-box").forEach(el => sections.push(el.value));
   const qs = document.getElementById("qualitySelect");
   const r = await api("/api/settings", { method: "POST", body: {
+    auto: !!(opts && opts.auto),
+    // Address the project explicitly. A late-firing debounce must not be
+    // applied to whichever tab happens to be active when it lands.
+    pid: (opts && opts.pid) || activePid || "",
     model: document.getElementById("modelSelect").value,
     aspect: document.getElementById("aspectSelect").value,
     resolution: document.getElementById("resolutionSelect").value,
@@ -1270,7 +1788,10 @@ function onPromptKeydown(e, textarea) {
   // before the default single-char delete fires.
   if (!mentionMenu && _atomicMentionEdit(e, textarea)) return;
 
-  if (e.key === "Tab" && !mentionMenu) {
+  // Plain Tab moves between prompt boxes. Ctrl+Tab must fall through to the
+  // document handler, which switches PROJECT — otherwise the shortcut would
+  // die whenever the caret is in a prompt box (i.e. almost always).
+  if (e.key === "Tab" && !mentionMenu && !e.ctrlKey) {
     e.preventDefault();
     const boxes = [...document.querySelectorAll(".prompt-section-box")];
     const fp = document.getElementById("fixedPrompt");
@@ -1750,7 +2271,11 @@ async function refreshRefs() {
   // mention NUMBER never changes — the prompt is the anchor.
   if (syncMentionsToRefSlots()) {
     closeMentionMenu();
-    scheduleSettingsSave();
+    // App-initiated normalisation, not a user edit: opening a project whose
+    // reference file has gone missing rewrites "[Image 1]" to "@image1", and
+    // that alone used to mark the project unsaved — so closing it right after
+    // opening asked to save something the user never changed.
+    saveSettings({ auto: true });
   }
   const grid = document.getElementById("refGrid");
   const empty = document.getElementById("refEmpty");
@@ -2110,6 +2635,97 @@ function _extractImageUrlFromDrag(dt) {
 // ==========================================
 // Gallery
 // ==========================================
+
+// Skeletons are placeholders for images the project on screen still owes us.
+// They used to be fire-and-forget DOM: added once at Generate time, removed one
+// per event. Switching tabs mid-batch wiped them and coming back never brought
+// them back, so a tab that was still working looked idle. Their count is now
+// DERIVED from that project's outstanding queue, which every relevant response
+// carries — so it is right no matter which tab you are looking at.
+const SKELETON_HTML =
+  '<div class="skel-img"></div><div class="skel-line"></div><div class="skel-line"></div>' +
+  '<div class="skel-chips"><div class="skel-chip" style="width:56px"></div>' +
+  '<div class="skel-chip" style="width:88px"></div></div>';
+
+function syncSkeletons(n) {
+  const grid = document.getElementById("galleryGrid");
+  if (!grid) return;
+  n = Math.max(0, Math.min(Math.floor(n) || 0, 100));
+  const have = [...grid.querySelectorAll(".skeleton")];
+  if (have.length === n) return;          // no DOM churn => the shimmer never restarts
+  for (let i = n; i < have.length; i++) have[i].remove();
+  for (let i = have.length; i < n; i++) {
+    const s = document.createElement("div");
+    s.className = "skeleton";
+    s.innerHTML = SKELETON_HTML;
+    grid.insertBefore(s, grid.firstChild);
+  }
+  if (n > 0) {
+    const empty = document.getElementById("emptyState");
+    if (empty) empty.style.display = "none";
+  }
+}
+
+// Progress bar + labels for the project on screen. Without this, switching to a
+// tab left the previous project's "Generating… 3/8" sitting there.
+function applyProjectProgress(d) {
+  const fill = document.getElementById("progressFill");
+  const label = document.getElementById("progressLabel");
+  const status = document.getElementById("statusLabel");
+  if (!fill || !label || !status) return;
+  const done = d.done || 0, failed = d.failed || 0, total = d.total || 0;
+  if (d.generating) {
+    updateGenUI(true, d.outstanding || 0);
+    updateProgress(done + failed, total, d.outstanding || 0);
+    return;
+  }
+  updateGenUI(false, 0);
+  if (total > 0) {
+    label.textContent = `Done  ok ${done}  fail ${failed}`;
+    fill.style.width = done > 0 ? "100%" : "0%";
+    status.textContent = `Completed  ${done} image(s) saved`;
+  } else {
+    label.textContent = "Idle";
+    fill.style.width = "0%";
+    status.textContent = "Ready";
+  }
+}
+
+// Card DOM reused across refreshes, keyed by file path.
+const _cardEls = new Map();
+let _cardThumbSize = -1;
+
+// Cards sit after the skeletons, in list order. Only moves a card when it is
+// actually in the wrong place — a needless insertBefore restarts CSS
+// transitions and forces layout.
+function _placeCard(grid, card, prevCard) {
+  const cur = card.previousElementSibling;
+  if (card.parentNode === grid) {
+    if (prevCard ? cur === prevCard
+                 : (cur === null || cur.classList.contains("skeleton"))) return;
+  }
+  if (prevCard) {
+    grid.insertBefore(card, prevCard.nextSibling);
+    return;
+  }
+  const skels = grid.querySelectorAll(".skeleton");
+  const after = skels.length ? skels[skels.length - 1].nextSibling : grid.firstChild;
+  grid.insertBefore(card, after);
+}
+
+// Only the parts of a card that can change while it stays on screen.
+function _updateGalleryCard(card, item) {
+  card._item = item;
+  card.classList.toggle("selected", selectedPaths.includes(item.filepath));
+  card.classList.toggle("previewing", item.filepath === _previewPath);
+  const fav = card._favBtn;
+  if (fav) {
+    const label = item.favorite ? "Favorited" : "Favorite";
+    if (fav.textContent !== label) fav.textContent = label;
+    fav.classList.toggle("active", !!item.favorite);
+  }
+}
+
 async function refreshGallery() {
   const d = await api("/api/gallery");
   if (!d.items) return;
@@ -2117,9 +2733,10 @@ async function refreshGallery() {
   const empty = document.getElementById("emptyState");
   const search = document.getElementById("gallerySearch").value.toLowerCase();
 
-  // Remove existing cards but keep skeletons if generating
-  grid.querySelectorAll(".card").forEach(c => c.remove());
-  if (!isGenerating) grid.querySelectorAll(".skeleton").forEach(s => s.remove());
+  // Placeholders belong to the project this gallery came from — not to
+  // whatever the global isGenerating flag last saw.
+  syncSkeletons(d.generating ? (d.outstanding || 0) : 0);
+  applyProjectProgress(d);
 
   let items = d.items;
   if (favoritesOnly) items = items.filter(it => it.favorite);
@@ -2140,9 +2757,34 @@ async function refreshGallery() {
     + (selectedPaths.length > 1 ? ` (${selectedPaths.length} selected)` : "");
 
   const thumbSize = getThumbSize();
+  // Thumbnails are addressed by size; changing it invalidates every <img>.
+  if (thumbSize !== _cardThumbSize) {
+    _cardThumbSize = thumbSize;
+    _cardEls.forEach(c => c.remove());
+    _cardEls.clear();
+  }
+  // Drop cards for images that are gone (deleted, filtered out, other project).
+  const livePaths = new Set(items.map(it => it.filepath));
+  for (const [fpath, el] of [..._cardEls]) {
+    if (!livePaths.has(fpath)) { el.remove(); _cardEls.delete(fpath); }
+  }
 
+  let prevCard = null;
   items.forEach(item => {
-    const card = document.createElement("div");
+    // Reuse the existing card. Rebuilding all of them on every refresh — and a
+    // refresh fires on every finished image — made the whole grid blink and
+    // re-fetch each thumbnail, which is the stutter you see when a new image
+    // lands. Only what changed gets touched now.
+    let card = _cardEls.get(item.filepath);
+    if (card) {
+      _updateGalleryCard(card, item);
+      _placeCard(grid, card, prevCard);
+      prevCard = card;
+      return;
+    }
+    card = document.createElement("div");
+    _cardEls.set(item.filepath, card);
+    card._item = item;
     card.className = "card" + (selectedPaths.includes(item.filepath) ? " selected" : "")
       + (item.filepath === _previewPath ? " previewing" : "");
     card.dataset.path = item.filepath;
@@ -2300,6 +2942,7 @@ async function refreshGallery() {
     topRow.className = "card-actions-top";
     const favBtn = mk(item.favorite ? "Favorited" : "Favorite", "fav" + (item.favorite ? " active" : ""),
       () => toggleFav(item.filepath, favBtn));
+    card._favBtn = favBtn;   // reconciler updates its label in place
     topRow.appendChild(favBtn);
     topRow.appendChild(mk("Explorer", "explorer", () => openInExplorer(item.filepath)));
     topRow.appendChild(mk("Delete", "del", () => deleteImage(item.filepath)));
@@ -2330,7 +2973,8 @@ async function refreshGallery() {
       copyToClipboard(item.filepath);
     });
 
-    grid.appendChild(card);
+    _placeCard(grid, card, prevCard);
+    prevCard = card;
   });
 
   // Card count just changed, so the scrollable height did too. The grid's own
@@ -2699,15 +3343,12 @@ async function generate() {
   const verb = d.queued ? "Queued" : "Generating";
   showToast(`${verb} ${d.count} image(s) (outstanding ${d.outstanding || d.count}/100)`, "success");
   updateGenUI(true, d.outstanding || d.count);
-  const grid = document.getElementById("galleryGrid");
   const empty = document.getElementById("emptyState");
   if (empty) empty.style.display = "none";
-  for (let i = 0; i < d.count; i++) {
-    const s = document.createElement("div");
-    s.className = "skeleton";
-    s.innerHTML = `<div class="skel-img"></div><div class="skel-line"></div><div class="skel-line"></div><div class="skel-chips"><div class="skel-chip" style="width:56px"></div><div class="skel-chip" style="width:88px"></div></div>`;
-    grid.insertBefore(s, grid.firstChild);
-  }
+  // The server's outstanding count already includes this batch, so this is the
+  // exact number of placeholders — and it stays right if a batch was queued on
+  // top of one already running.
+  syncSkeletons(d.outstanding || d.count);
 }
 
 async function stopGenerate() {
@@ -2776,9 +3417,17 @@ function scheduleGalleryRefresh() {
 async function pollEvents() {
   const d = await api("/api/events");
   if (!d.events?.length) return;
-  let anyDone = false, anyFailed = false;
+  let anyDone = false, anyFailed = false, anyOther = false;
   let lastDone = 0, lastFailed = 0, lastTotal = 0, lastOutstanding;
   for (const ev of d.events) {
+    // Events carry the project that produced them. Anything from a background
+    // tab must NOT touch this screen — it only bumps that tab's badge, which
+    // refreshProjects() picks up. Without this, a batch finishing in project B
+    // would repaint project A's gallery and progress bar.
+    if (ev.pid && activePid && ev.pid !== activePid) {
+      if (ev.type === "image_done" || ev.type === "image_failed" || ev.type === "done") anyOther = true;
+      continue;
+    }
     if (ev.type === "image_done") {
       anyDone = true;
       lastDone = ev.done;
@@ -2819,7 +3468,9 @@ async function pollEvents() {
       // restart alone is enough to update. Otherwise fall back to the in-page
       // confirm dialog (frontend-owned, no Python MessageBox).
       if (ev.has_update) {
-        if (ev.auto && !isGenerating) {
+        // _anyGenerating, not isGenerating: a batch running in a tab you are
+        // not looking at is still work the restart would destroy.
+        if (ev.auto && !isGenerating && !_anyGenerating) {
           startAutoUpdate(ev.current, ev.remote);
         } else {
           showUpdateConfirmModal(ev.current, ev.remote);
@@ -2874,6 +3525,9 @@ async function pollEvents() {
     updateProgress(lastDone + lastFailed, lastTotal, lastOutstanding);
     if (typeof lastOutstanding === "number") updateGenUI(true, lastOutstanding);
   }
+  // Progress happened somewhere else — repaint the tab strip (badge/spinner)
+  // without disturbing the project on screen.
+  if (anyDone || anyFailed || anyOther) refreshProjects();
 }
 
 function updateProgress(cur, tot, outstanding) {
@@ -2886,11 +3540,18 @@ function updateProgress(cur, tot, outstanding) {
 }
 
 async function pollLogs() {
-  const d = await api("/api/logs");
+  // Default to this tab's own lines; "전체 탭" shows every project's.
+  const all = document.getElementById("logAllChk")?.checked ? "?all=1" : "";
+  const d = await api("/api/logs" + all);
   if (!d.logs) return;
   const box = document.getElementById("logBox");
-  box.textContent = d.logs.join("\n");
-  box.scrollTop = box.scrollHeight;
+  const text = d.logs.join("\n");
+  if (box.textContent === text) return;      // no repaint => no scroll jitter
+  // Only pin to the bottom when the user was already there — otherwise reading
+  // back through the log fought the 2s poll.
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+  box.textContent = text;
+  if (atBottom) box.scrollTop = box.scrollHeight;
 }
 
 async function refreshApiStatus() {
@@ -2906,8 +3567,14 @@ async function refreshApiStatus() {
   if (reveDot) reveDot.className = "dot " + (d.reve || "disconnected");
   _reveOn = (d.reve === "connected");
   document.body.classList.toggle("reve-off", !_reveOn);
-  if (d.is_generating) updateGenUI(true, d.outstanding || 0);
-  if (!d.is_generating && isGenerating) { updateGenUI(false, 0); refreshGallery(); }
+  _anyGenerating = !!d.any_generating;
+  // Status is always the ACTIVE project's, so the placeholder count follows the
+  // tab on screen: a background batch never steals or clears them.
+  if (d.is_generating) {
+    updateGenUI(true, d.outstanding || 0);
+    syncSkeletons(d.outstanding || 0);
+  }
+  if (!d.is_generating && isGenerating) { updateGenUI(false, 0); syncSkeletons(0); refreshGallery(); }
   if (d.close_requested) showCloseDialog();
   // Keep window title in sync with project dirty state
   const projName = d.current_project
@@ -2993,25 +3660,43 @@ function updateTitleDirty(dirty, projectName) {
   document.title = base;
 }
 
+// Ctrl+S — overwrite the current project file, no dialog. It only asks for a
+// name the very first time, when there is nothing to overwrite yet.
+// Previously Ctrl+S ALWAYS opened the name box with the field cleared, so
+// saving an already-saved project looked like it wanted to create a new one.
 async function saveProject() {
-  // Open the "Save project" modal so the user can type a name
+  await saveActiveProjectQuiet();
+}
+
+// Ctrl+Shift+S — always ask for a name (save a copy under a new name).
+async function saveProjectAs() {
   await saveSettings();
   const info = await api("/api/close-info");
+  openSaveModal(info, true);
+}
+
+let _pendingSaveResolve = null;
+function openSaveModal(info, isSaveAs) {
   const cur = document.getElementById("saveCurrentProject");
   if (info.current_project_name) {
     cur.style.display = "block";
-    cur.textContent = `Current: ${info.current_project_name} (saving without a name will overwrite this)`;
+    cur.textContent = isSaveAs
+      ? `현재: ${info.current_project_name} → 새 이름으로 저장합니다`
+      : `현재: ${info.current_project_name} (이름을 비우면 덮어씁니다)`;
   } else {
     cur.style.display = "none";
   }
-  document.getElementById("saveSavePath").textContent = `Save location: ${info.save_dir || ""}`;
-  document.getElementById("saveProjectName").value = "";
+  document.getElementById("saveSavePath").textContent = `저장 위치: ${info.save_dir || ""}`;
+  const input = document.getElementById("saveProjectName");
+  const base = (info.current_project_name || "").replace(/\.json$/i, "");
+  input.value = isSaveAs && base ? base + "_2" : "";
   document.getElementById("saveModal").classList.remove("hidden");
-  setTimeout(() => document.getElementById("saveProjectName").focus(), 50);
+  setTimeout(() => { input.focus(); input.select(); }, 50);
 }
 
 function closeSaveModal() {
   document.getElementById("saveModal").classList.add("hidden");
+  if (_pendingSaveResolve) { const r = _pendingSaveResolve; _pendingSaveResolve = null; r(false); }
 }
 
 // Pending save name while the conflict modal is open (so the user's choice
@@ -3021,12 +3706,26 @@ let _pendingSuggestedName = "";
 
 async function confirmSaveProject() {
   const name = document.getElementById("saveProjectName").value.trim();
-  closeSaveModal();
-  const d = await api("/api/project/save", { method: "POST", body: { name } });
-  if (d.ok) {
-    showToast(`Saved: ${d.name || "project"}`, "success");
+  // A blank name only means "overwrite" when there IS a named file to
+  // overwrite — the hint line is what tells the user so. Without it, a blank
+  // name would land on a machine-generated filename nobody chose.
+  if (!name && document.getElementById("saveCurrentProject").style.display === "none") {
+    showToast("이름을 입력해 주세요", "error");
+    document.getElementById("saveProjectName").focus();
     return;
   }
+  // Take the resolver before closeSaveModal() can settle it as "cancelled".
+  const resolve = _pendingSaveResolve;
+  _pendingSaveResolve = null;
+  document.getElementById("saveModal").classList.add("hidden");
+  const d = await api("/api/project/save", { method: "POST", body: { name } });
+  if (d.ok) {
+    showToast(`저장됨: ${d.name || "project"}`, "success");
+    await refreshProjects();
+    if (resolve) resolve(true);
+    return;
+  }
+  if (resolve) _pendingSaveResolve = resolve;   // 충돌 대화상자로 이어짐
   if (d.conflict) {
     // Server found an existing file with the same name (not the currently
     // loaded project). Ask the user what to do instead of silently clobbering.
@@ -3046,18 +3745,28 @@ function closeSaveConflict() {
   document.getElementById("saveConflictModal").classList.add("hidden");
   _pendingSaveName = "";
   _pendingSuggestedName = "";
+  // MUST settle the pending save promise. The tab-close and app-close flows
+  // `await` it; cancelling here without resolving left them waiting forever —
+  // the app would simply refuse to close with no visible reason.
+  if (_pendingSaveResolve) { const r = _pendingSaveResolve; _pendingSaveResolve = null; r(false); }
 }
 
 async function confirmSaveConflict(strategy) {
   const name = _pendingSaveName;
-  closeSaveConflict();
-  if (!name) return;
+  const resolve = _pendingSaveResolve;
+  _pendingSaveResolve = null;
+  document.getElementById("saveConflictModal").classList.add("hidden");
+  _pendingSaveName = "";
+  _pendingSuggestedName = "";
+  if (!name) { if (resolve) resolve(false); return; }
   const d = await api("/api/project/save", { method: "POST", body: { name, strategy } });
   if (d.ok) {
-    showToast(`Saved: ${d.name || "project"}`, "success");
+    showToast(`저장됨: ${d.name || "project"}`, "success");
+    await refreshProjects();
   } else {
-    showToast(d.error || "Save failed", "error");
+    showToast(d.error || "저장 실패", "error");
   }
+  if (resolve) resolve(!!d.ok);
 }
 
 async function loadProject() {
@@ -3071,12 +3780,7 @@ async function loadProject() {
   } catch (e) {}
   if (projects.length === 0) {
     const d = await api("/api/browse-project", { method: "POST" });
-    if (d.ok) {
-      await loadSettings();
-      refreshGallery();
-      refreshRefs();
-      showToast("Project loaded", "success");
-    }
+    if (d.ok && d.filepath) await openProjectInTab(d.filepath);
     return;
   }
   document.getElementById("projectsModalTitle").textContent = "프로젝트 열기";
@@ -3102,8 +3806,67 @@ async function checkRecentProjects() {
   }
 }
 
+// Name/prompt filter over the (now complete) project list. With ~100 saved
+// projects, scrolling alone is not a way to find one.
+let _projectsAll = [];
+function filterProjectList() {
+  const q = (document.getElementById("projectsSearch")?.value || "").trim().toLowerCase();
+  const shown = !q ? _projectsAll : _projectsAll.filter(p =>
+    (p.name || "").toLowerCase().includes(q) || (p.prompt || "").toLowerCase().includes(q));
+  renderProjectList(shown);
+  const badge = document.getElementById("projectsCount");
+  if (badge) badge.textContent = q ? `${shown.length} / ${_projectsAll.length}개` : `${_projectsAll.length}개`;
+}
+
+// Same jump controls as the gallery, for the (now ~100 row) project picker.
+function updateProjectsJump() {
+  const list = document.getElementById("projectsList");
+  const wrap = document.getElementById("projectsJump");
+  if (!list || !wrap) return;
+  const overflow = list.scrollHeight - list.clientHeight;
+  if (overflow < 240) {          // 갤러리보다 낮은 문턱: 목록 행이 훨씬 큼
+    wrap.classList.remove("show");
+    wrap.setAttribute("aria-hidden", "true");
+    return;
+  }
+  wrap.classList.add("show");
+  wrap.setAttribute("aria-hidden", "false");
+  const btns = wrap.querySelectorAll(".jump-btn");
+  btns[0]?.classList.toggle("at-edge", list.scrollTop <= 40);
+  btns[1]?.classList.toggle("at-edge", list.scrollTop >= overflow - 40);
+}
+
+function jumpProjectList(where) {
+  const list = document.getElementById("projectsList");
+  if (!list) return;
+  list.scrollTop = where === "top" ? 0 : Math.max(0, list.scrollHeight - list.clientHeight);
+  updateProjectsJump();
+}
+
+(function setupProjectsJump() {
+  const list = document.getElementById("projectsList");
+  if (!list) return;
+  let last = 0, trail = null;
+  list.addEventListener("scroll", () => {
+    const now = Date.now();
+    if (now - last >= 100) { last = now; updateProjectsJump(); }
+    clearTimeout(trail);
+    trail = setTimeout(updateProjectsJump, 140);
+  }, { passive: true });
+  window.addEventListener("resize", updateProjectsJump);
+})();
+
 function showProjectsModal(projects) {
   const modal = document.getElementById("projectsModal");
+  _projectsAll = projects || [];
+  const search = document.getElementById("projectsSearch");
+  if (search) search.value = "";
+  filterProjectList();
+  modal.classList.remove("hidden");
+  if (search) setTimeout(() => search.focus(), 60);
+}
+
+function renderProjectList(projects) {
   const list = document.getElementById("projectsList");
   list.innerHTML = "";
   projects.forEach(p => {
@@ -3115,6 +3878,9 @@ function showProjectsModal(projects) {
     prev.className = "project-preview";
     if (p.preview_path) {
       const i = document.createElement("img");
+      // Lazy: the list can now be ~100 rows long and we don't want 100
+      // thumbnail requests firing the moment the dialog opens.
+      i.loading = "lazy";
       i.src = `/api/gallery/thumb?path=${encodeURIComponent(p.preview_path)}&size=128`;
       prev.appendChild(i);
     } else {
@@ -3133,7 +3899,7 @@ function showProjectsModal(projects) {
     info.appendChild(nm);
     const mt = document.createElement("div");
     mt.className = "project-meta";
-    mt.textContent = `${formatRelativeTime(p.modified_at)} \u2022 ${p.image_count} image(s)`;
+    mt.textContent = `${formatDateTime(p.modified_at)} (${formatRelativeTime(p.modified_at)}) \u2022 ${p.image_count}\uc7a5`;
     info.appendChild(mt);
     const pr = document.createElement("div");
     pr.className = "project-prompt";
@@ -3143,19 +3909,25 @@ function showProjectsModal(projects) {
     card.appendChild(info);
     list.appendChild(card);
   });
-  modal.classList.remove("hidden");
+  if (!projects.length) {
+    const empty = document.createElement("div");
+    empty.className = "projects-empty";
+    empty.textContent = "검색 결과가 없습니다";
+    list.appendChild(empty);
+  }
+  // 행 수가 바뀌면 스크롤 가능 여부도 바뀐다 (검색 필터 포함)
+  list.scrollTop = 0;
+  updateProjectsJump();
+  setTimeout(updateProjectsJump, 250);   // 썸네일 로드 후 높이 확정
 }
 
 function closeProjectsModal() { document.getElementById("projectsModal").classList.add("hidden"); }
 
+// Opening a saved project gets its OWN tab — it never replaces whatever the
+// user currently has open (that was the old behaviour and it silently threw
+// away unsaved work).
 async function loadProjectByPath(fp) {
-  const d = await api("/api/project/load", { method: "POST", body: { filepath: fp } });
-  if (d.ok) {
-    await loadSettings();
-    refreshGallery();
-    refreshRefs();
-    showToast("Project loaded", "success");
-  }
+  await openProjectInTab(fp);
 }
 
 async function loadProjectFromBrowser() {
@@ -3163,14 +3935,20 @@ async function loadProjectFromBrowser() {
   // loadProject(), which re-runs the recent-projects check and — if
   // recents exist (which they always do when this button is visible) —
   // just pops the same modal back up. Button looked completely dead.
+  // The dialog now only PICKS a path; the file is opened in its own tab so
+  // the project currently on screen is never replaced.
   closeProjectsModal();
   const d = await api("/api/browse-project", { method: "POST" });
-  if (d.ok) {
-    await loadSettings();
-    refreshGallery();
-    refreshRefs();
-    showToast("Project loaded", "success");
-  }
+  if (d.ok && d.filepath) await openProjectInTab(d.filepath);
+}
+
+// Absolute date first — "2일 전" alone made it impossible to tell two old
+// projects apart, which is the main thing you need when picking one.
+function formatDateTime(ts) {
+  if (!ts) return "날짜 없음";
+  const d = new Date(ts * 1000);
+  const p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 function formatRelativeTime(ts) {
@@ -3445,9 +4223,54 @@ initCustomSize();
 // Close Save Prompt (called from pywebview launcher.py on window close)
 // ==========================================
 let _closeDialogOpen = false;
+// Closing the app walks EVERY unsaved project one at a time (the user asked
+// for exactly this: already-saved tabs pass through silently, unsaved ones get
+// pointed out individually). Cancelling any one of them aborts the close.
 async function showCloseDialog() {
   if (_closeDialogOpen) return;
-  // Check if there's anything worth saving
+  _closeDialogOpen = true;
+  try {
+    // A batch running in ANY tab dies with the process. Before tabs this could
+    // not happen unnoticed — the one project you were looking at was the one
+    // generating — so say it out loud now.
+    let busy = [];
+    try { busy = (await api("/api/projects/generating")).projects || []; } catch (e) {}
+    if (busy.length) {
+      const names = busy.map(p => p.name).join(", ");
+      const go = await askConfirm(
+        "생성 중인 프로젝트가 있습니다",
+        `${names} 에서 아직 이미지를 만들고 있습니다.\n지금 종료하면 진행 중인 이미지는 사라집니다. 종료할까요?`,
+        "종료", "취소");
+      if (!go) { _closeDialogOpen = false; return; }
+    }
+    let pending = [];
+    try { pending = (await api("/api/projects/unsaved")).projects || []; }
+    catch (e) { forceClose(); return; }
+    for (const p of pending) {
+      // Show the user what they are deciding about.
+      if (p.pid !== activePid) {
+        await api("/api/projects/switch", { method: "POST", body: { pid: p.pid } });
+        activePid = p.pid;
+        await reloadActiveProject();
+        await refreshProjects();
+      }
+      const choice = await askSaveBeforeClose(p.name);
+      if (choice === "cancel") { _closeDialogOpen = false; return; }
+      if (choice === "save") {
+        const ok = await saveActiveProjectQuiet();
+        if (!ok) { _closeDialogOpen = false; return; }   // 저장 실패/취소 -> 종료 중단
+      }
+    }
+    forceClose();
+  } finally {
+    _closeDialogOpen = false;
+  }
+}
+
+// Kept for the single-project legacy path (not reachable from the close flow
+// anymore, but the modal and its buttons still exist in the DOM).
+async function showLegacyCloseDialog() {
+  if (_closeDialogOpen) return;
   let info;
   try { info = await api("/api/close-info"); }
   catch (e) { forceClose(); return; }

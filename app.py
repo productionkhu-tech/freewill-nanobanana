@@ -460,9 +460,15 @@ class RateLimiter:
 
 
 # ==========================================
-# Application State (singleton)
+# Shared (app-wide) state — NOT per project
 # ==========================================
-class AppState:
+# Everything here must exist exactly once no matter how many project tabs are
+# open. Most important: the API clients and their rate limiters. Quota is per
+# ACCOUNT, so giving every tab its own limiter would multiply our real request
+# rate and earn 429s the moment two projects generate at the same time.
+# The event queue is also single: there is one window, and it routes each event
+# to the right tab by the `pid` stamped on it.
+class _Shared:
     def __init__(self):
         self.client_vertex = None
         self.client_studio = None
@@ -480,6 +486,73 @@ class AppState:
         self.seedream_rate_limiter = RateLimiter(interval=0.3)
         # Reve v2 is synchronous (40-80s/image); a light interval is fine.
         self.reve_rate_limiter = RateLimiter(interval=0.3)
+
+        # API status
+        self.vertex_status = "disconnected"
+        self.studio_status = "disconnected"
+        self.openai_status = "disconnected"
+        self.seedream_status = "disconnected"
+        self.reve_status = "disconnected"
+        self.vertex_credentials_path = None
+        self.vertex_session_disabled = False
+
+        # One log pane for the whole app (generation lines carry their project
+        # name when more than one tab is open).
+        self.logs = []
+        self.log_lock = threading.Lock()
+
+        # Single event queue, consumed by the one window. Each event carries a
+        # `pid` so the frontend can update an inactive tab's badge instead of
+        # the visible UI.
+        self.progress_events = []
+        self.progress_lock = threading.Lock()
+
+        # User-level preferences (persisted), not project data
+        self.skip_delete_confirm = False
+        self.prompt_history = []
+        self.max_prompt_history = 50
+
+        # Window-level flags
+        self.always_on_top = False
+        self.close_requested = False
+
+        # Ref cache + default save dir are shared on purpose: the same pasted
+        # image reused in two projects must resolve to the same cached file.
+        self.temp_ref_dir = os.path.join(
+            os.path.expanduser("~/Pictures"), "Screenshots", "NanoBanana Clipboard")
+        self.temp_ref_paths = set()
+        self.project_default_save_dir = os.path.join(
+            os.path.expanduser("~/Documents"), "NanoBanana JSON")
+
+        # --- Open projects (tabs) ---
+        self.projects = {}        # pid -> AppState
+        self.project_order = []   # left-to-right tab order
+        self.active_pid = None
+        self.projects_lock = threading.RLock()
+        self._pid_seq = 0
+
+    def next_pid(self):
+        with self.projects_lock:
+            self._pid_seq += 1
+            return "p%d" % self._pid_seq
+
+
+shared = _Shared()
+
+# Guards filename reservation across EVERY project — see reserve_filepath.
+_FILENAME_RESERVE_LOCK = threading.Lock()
+
+
+# ==========================================
+# Project state — one instance per open tab
+# ==========================================
+# Attributes that belong to the APP rather than a project are exposed here as
+# properties forwarding to `shared`, so the routes can keep saying `state.x`
+# for both kinds without caring which is which.
+class AppState:
+    def __init__(self, pid=None, title=None):
+        self.pid = pid or shared.next_pid()
+        self.title = title or "제목 없음"
         self.is_generating = False
         self.cancel_flag = False
         self.done_count = 0
@@ -491,13 +564,6 @@ class AppState:
         self.pending_jobs = []
         self.pending_jobs_lock = threading.Lock()
         self.active_job_count = 0
-        # Persisted across restarts (loaded below from .nanobanana/prefs.json)
-        self.skip_delete_confirm = False
-        # Always-on-top window state. Actual enforcement is done via Win32
-        # SetWindowPos on the NanoBanana HWND by the toggle endpoint; this
-        # flag just remembers the user's choice so we can reapply after a
-        # page reload or a minimize/restore cycle.
-        self.always_on_top = False
         self.output_dir = os.path.join(os.path.expanduser("~"), "Desktop", "NanoBanana_Output")
         self.file_counter = 0
         self.file_counter_lock = threading.Lock()   # parallel-worker safe naming
@@ -505,10 +571,6 @@ class AppState:
         self.ref_lock = threading.RLock()
         # Protect gallery_items mutations vs HTTP thread iteration
         self.gallery_lock = threading.RLock()
-        # Prompt history (last N entries, persisted)
-        self.prompt_history = []
-        self.max_prompt_history = 50
-
         # Reference images
         self.ref_images = []       # PIL.Image list
         self.ref_path_list = []    # file paths
@@ -544,51 +606,59 @@ class AppState:
         # Project
         self.current_project_path = None
         self.project_dirty = False
-        self.project_default_save_dir = os.path.join(
-            os.path.expanduser("~/Documents"),
-            "NanoBanana JSON",
-        )
-
-        # Logs
-        self.logs = []
-        self.log_lock = threading.Lock()
-
-        # Temp refs
-        self.temp_ref_dir = os.path.join(
-            os.path.expanduser("~/Pictures"),
-            "Screenshots",
-            "NanoBanana Clipboard",
-        )
-        self.temp_ref_paths = set()
-
-        # API status
-        self.vertex_status = "disconnected"
-        self.studio_status = "disconnected"
-        self.openai_status = "disconnected"
-        self.seedream_status = "disconnected"
-        self.reve_status = "disconnected"
-        self.vertex_credentials_path = None
-        self.vertex_session_disabled = False
-
-        # Generation progress events
-        self.progress_events = []
-        self.progress_lock = threading.Lock()
-
-        # Close-requested flag (set by launcher when user clicks X)
-        self.close_requested = False
 
         # Throttle for incremental project auto-save during long batches
         self._last_autosave_ts = 0.0
+        # Images that finished while this tab was NOT the visible one — the
+        # tab badge clears when the user comes back to it.
+        self.unseen_done = 0
+        # Tab colour label ("" = none). Saved into the project file so it
+        # travels with the project rather than living only in this session.
+        self.tab_color = ""
+        # True while the only file backing this project is an AUTOSAVE the app
+        # made on its own. The user has not named anything yet, so the tab must
+        # keep showing the working title instead of suddenly displaying a
+        # machine-generated "20260807_141031_p1_image_session".
+        self.autosaved_only = False
+        # Refs a deferred session restore recorded but has not decoded yet.
+        self._pending_refs = []
+
+    # ---- identity -------------------------------------------------------
+    def display_name(self):
+        """Tab label: the name the USER gave this project. An autosave file
+        does not count as a name — generating one image used to rename the tab
+        to a timestamp the user never chose. Never the full path (tabs are
+        narrow)."""
+        if self.current_project_path and not self.autosaved_only:
+            base = os.path.basename(self.current_project_path)
+            return re.sub(r"\.json$", "", base, flags=re.IGNORECASE)
+        return self.title or "제목 없음"
 
     def log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
-        entry = f"[{ts}] {msg}"
+        # With more than one tab open, an unlabelled "[3/10] Saved ..." line is
+        # ambiguous — say which project produced it.
+        try:
+            multi = len(shared.projects) > 1
+        except Exception:
+            multi = False
+        prefix = f"({self.display_name()}) " if multi else ""
+        entry = f"[{ts}] {prefix}{msg}"
         with self.log_lock:
-            self.logs.append(entry)
+            # Kept as (pid, text) so the pane can show just the project you are
+            # looking at. Two tabs generating at once interleave their lines,
+            # and reading someone else's [3/10] in your own log is confusing.
+            self.logs.append((self.pid, entry))
             if len(self.logs) > 2000:
                 self.logs = self.logs[-1000:]
 
     def push_event(self, event):
+        # Stamp the origin project so the single window can route the event to
+        # the right tab instead of assuming it belongs to whatever is visible.
+        try:
+            event.setdefault("pid", self.pid)
+        except Exception:
+            pass
         with self.progress_lock:
             self.progress_events.append(event)
 
@@ -840,11 +910,20 @@ class AppState:
             if not client:
                 continue
             limiter = self.get_provider_limiter(provider)
+            _wait_t = time.time()
             if limiter and not limiter.acquire(should_cancel=lambda: self.cancel_flag):
                 raise RuntimeError("Cancelled")
+            # Every image in a batch is dispatched at once, but the shared
+            # per-provider limiter releases them one at a time (Gemini: 8/min).
+            # Saying so makes the very different per-image times on the cards
+            # make sense — most of the gap is this wait, not the model.
+            waited = time.time() - _wait_t
             label = self.get_provider_label(provider)
             try:
-                self.log(f"{label} requesting...")
+                if waited >= 1.0:
+                    self.log(f"{label} requesting... (rate-limit wait {waited:.0f}s)")
+                else:
+                    self.log(f"{label} requesting...")
                 t = time.time()
                 resp = client.models.generate_content(model=model, contents=contents, config=config)
                 self.log(f"{label} OK ({time.time()-t:.1f}s)")
@@ -960,6 +1039,7 @@ class AppState:
                 self.ref_pinned.pop()
 
     def get_effective_ref_images(self, model=None):
+        self.ensure_refs_loaded()
         # Slot list with None holes preserved — position is the slot number,
         # which build_user_parts indexes by. Truncated so at most `limit`
         # FILLED slots are included (matters only after switching to a
@@ -1243,6 +1323,29 @@ class AppState:
             "padding": max(1, min(5, self.naming_padding)),
         }
 
+    def reserve_filepath(self, directory, filename):
+        """Turn a proposed name into one that is free ON DISK, app-wide.
+
+        Per-project counters are not enough: two tabs pointed at the SAME
+        output folder with the SAME prefix each count from their own 1, so both
+        would produce `S010_I001.png` and the second would silently overwrite
+        the first. The global lock plus an existence check makes that
+        impossible no matter how the user configures the tabs."""
+        base, ext = os.path.splitext(filename)
+        with _FILENAME_RESERVE_LOCK:
+            fp = os.path.join(directory, filename)
+            n = 2
+            while os.path.exists(fp) and n < 10000:
+                fp = os.path.join(directory, f"{base}_{n}{ext}")
+                n += 1
+            try:
+                # Claim it immediately so a concurrent worker in another
+                # project can't pick the same name before we write the PNG.
+                open(fp, "ab").close()
+            except Exception:
+                pass
+            return fp
+
     def make_filename(self, seed, naming=None, model=None):
         s = naming or self.get_naming_settings()
         if s["enabled"]:
@@ -1449,9 +1552,16 @@ class AppState:
         return self.project_default_save_dir
 
     def default_project_filename(self):
-        return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_image_session.json"
+        # The pid is part of the name on purpose: two unsaved tabs autosaving
+        # inside the same second would otherwise pick the SAME filename and
+        # silently overwrite each other — exactly the "다른 프로젝트를 덮어쓴다"
+        # failure this build has to make impossible.
+        return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self.pid}_image_session.json"
 
     def collect_project_state(self):
+        # A deferred load has the ref list recorded but not decoded; realise it
+        # first or the save would write an empty ref list and lose them.
+        self.ensure_refs_loaded()
         # Slot-indexed: keep None for empty slots (and for refs whose file
         # vanished) so reload restores the exact slot layout, holes included.
         current_ref_paths = [
@@ -1474,9 +1584,10 @@ class AppState:
                     key=lambda x: (x[1].get("order", 0), x[0]),
                 )
             ]
-        # Snapshot logs under its lock
+        # Snapshot logs under its lock. A project file keeps only ITS OWN
+        # lines — the pane is shared, the saved history should not be.
         with self.log_lock:
-            logs_str = "\n".join(self.logs)
+            logs_str = "\n".join(t for pid, t in self.logs if pid == self.pid)
         return {
             "project_version": 1,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
@@ -1499,6 +1610,7 @@ class AppState:
                 "favorites_only": False,
                 "search_query": "",
                 "gallery_columns": self.gallery_columns,
+                "tab_color": self.tab_color,
             },
             "logs": logs_str,
             "gallery_items": items,
@@ -1519,7 +1631,7 @@ class AppState:
             "generation_settings": dict(item.get("generation_settings", {})),
         }
 
-    def save_project(self, filepath):
+    def save_project(self, filepath, autosave=False):
         """Atomic save: write to .tmp then os.replace so a disk-full or
         crash mid-write cannot corrupt the target file."""
         data = self.collect_project_state()
@@ -1533,11 +1645,32 @@ class AppState:
             except OSError:
                 pass
         os.replace(tmp, filepath)
+        had_path = bool(self.current_project_path)
         self.current_project_path = filepath
         self.project_dirty = False
+        # An explicit save is the user naming the project; an autosave is not.
+        # Once named, it stays named even though autosave keeps writing to it.
+        if not autosave:
+            self.autosaved_only = False
+        elif not had_path:
+            self.autosaved_only = True
         return True
 
-    def load_project(self, filepath):
+    def ensure_refs_loaded(self):
+        """Decode refs that a deferred load only recorded. Cheap no-op once
+        done; safe to call from any path that is about to read ref pixels."""
+        pending = getattr(self, "_pending_refs", None)
+        if not pending:
+            return
+        self._pending_refs = []
+        was_dirty = self.project_dirty
+        for slot, rp, pin in pending:
+            if rp and os.path.exists(rp):
+                self.add_ref_image(rp, pinned=pin, slot=slot)
+        # Loading what the file already said is not a user edit.
+        self.project_dirty = was_dirty
+
+    def load_project(self, filepath, defer_refs=False):
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -1581,6 +1714,7 @@ class AppState:
             self.gallery_columns = max(1, min(8, int(ui.get("gallery_columns", 2))))
         except (TypeError, ValueError):
             self.gallery_columns = 2
+        self.tab_color = str(ui.get("tab_color", "") or "")[:16]
 
         # Clear and restore refs. ref_paths is slot-indexed and may contain
         # null entries (empty slots) — place each ref at its exact slot so the
@@ -1588,9 +1722,20 @@ class AppState:
         self.clear_refs()
         ref_paths = ui.get("ref_paths") or []
         pinned = set(p for p in (ui.get("pinned_ref_paths") or []) if p)
-        for slot, rp in enumerate(ref_paths):
-            if rp and os.path.exists(rp):
-                self.add_ref_image(rp, pinned=rp in pinned, slot=slot)
+        if defer_refs:
+            # Session restore opens every remembered tab at once. Decoding all
+            # their refs up front cost ~16MB of RAM per 2048px image (measured
+            # ~64MB per tab with 4 of them) and slowed the boot, for pixels the
+            # user cannot see until they switch to that tab. Remember what to
+            # load and do it on first use — ensure_refs_loaded() runs before
+            # anything that actually reads pixels.
+            self._pending_refs = [(slot, rp, rp in pinned)
+                                  for slot, rp in enumerate(ref_paths) if rp]
+        else:
+            self._pending_refs = []
+            for slot, rp in enumerate(ref_paths):
+                if rp and os.path.exists(rp):
+                    self.add_ref_image(rp, pinned=rp in pinned, slot=slot)
 
         # Clear and restore gallery (under the lock so /api/gallery polls
         # don't see half-cleared state)
@@ -1634,18 +1779,23 @@ class AppState:
                 self.generated_paths.append(fp)
             restored += 1
 
-        # Restore logs
+        # Restore logs. The pane is app-wide, so a loaded project's history is
+        # merged in tagged with THIS project rather than replacing everything —
+        # loading a file in one tab used to wipe the other tabs' lines.
         saved_logs = data.get("logs", "")
         if saved_logs:
+            restored_lines = [(self.pid, ln) for ln in saved_logs.strip().split("\n") if ln]
             with self.log_lock:
-                self.logs = saved_logs.strip().split("\n")
+                keep = [e for e in self.logs if e[0] != self.pid]
+                merged = keep + restored_lines
+                self.logs[:] = merged[-2000:]
 
         self.current_project_path = filepath
         self.project_dirty = False
         self.log(f"Loaded project: {restored} images, {missing} missing")
         return True, f"Loaded {restored} images"
 
-    def get_recent_projects(self, limit=6):
+    def get_recent_projects(self, limit=100):
         # Scan both the current save dir and the legacy Desktop location
         search_dirs = [
             self.get_project_save_dir(),
@@ -2117,18 +2267,22 @@ class AppState:
         self.log(f"[{idx+1}/{total}] Queued on {self.get_provider_label(preferred)} (seed {seed})")
 
         contents = [types.Content(role="user", parts=self.build_user_parts(prompt, ref_payloads))]
-        cfg_kw = dict(
-            temperature=1.0,
-            seed=seed,
-            response_modalities=modalities,
-            # H3: empty img_cfg (e.g. Gemini 2.5 on Auto) -> omit image_config
-            # entirely rather than sending an empty ImageConfig.
-            image_config=types.ImageConfig(**img_cfg) if img_cfg else None,
-        )
-        tc = self.get_default_thinking_config(model)
-        if tc:
-            cfg_kw["thinking_config"] = tc
-        config = types.GenerateContentConfig(**cfg_kw)
+
+        def _build_config(_seed):
+            cfg_kw = dict(
+                temperature=1.0,
+                seed=_seed,
+                response_modalities=modalities,
+                # H3: empty img_cfg (e.g. Gemini 2.5 on Auto) -> omit image_config
+                # entirely rather than sending an empty ImageConfig.
+                image_config=types.ImageConfig(**img_cfg) if img_cfg else None,
+            )
+            tc = self.get_default_thinking_config(model)
+            if tc:
+                cfg_kw["thinking_config"] = tc
+            return types.GenerateContentConfig(**cfg_kw)
+
+        config = _build_config(seed)
 
         start = time.time()
         max_retries = 5
@@ -2169,6 +2323,12 @@ class AppState:
 
                 self.log(f"[{idx+1}] No image (attempt {attempt+1})")
                 if attempt < max_retries - 1:
+                    # Re-roll the seed. Retrying the identical prompt+seed on the
+                    # same model tends to reproduce the same imageless answer,
+                    # so the retries were mostly wasted quota; a new seed is a
+                    # genuinely different draw.
+                    seed = random.randint(0, 2147483646)
+                    config = _build_config(seed)
                     if not self.sleep_with_cancel(3):
                         return {"status": "cancelled", "index": idx, "seed": seed}
                     continue
@@ -2205,7 +2365,7 @@ class AppState:
             save_dir = self.get_project_save_dir()
             os.makedirs(save_dir, exist_ok=True)
             fp = self.current_project_path or os.path.join(save_dir, self.default_project_filename())
-            self.save_project(fp)
+            self.save_project(fp, autosave=True)
             self._last_autosave_ts = now
         except Exception:
             # Don't let autosave failures break the generation loop
@@ -2337,7 +2497,8 @@ class AppState:
                         api_used = result["api_used"]
                         seed = result["seed"]
                         fn = self.make_filename(seed, naming, model)
-                        fp = os.path.join(job["output_dir"], fn)
+                        fp = self.reserve_filepath(job["output_dir"], fn)
+                        fn = os.path.basename(fp)
                         self.save_generated_image(pil, fp, prompt, model)
                         self.done_count += 1
 
@@ -2380,6 +2541,12 @@ class AppState:
                                               aspect=aspect, resolution=resolution,
                                               generated_at=gen_at,
                                               generation_settings=gen_settings)
+                        # Finished in a tab the user isn't looking at -> count
+                        # it for that tab's badge (cleared when they switch to
+                        # it). Keeps background work visible without stealing
+                        # the screen away from what they're doing now.
+                        if self.pid != shared.active_pid:
+                            self.unseen_done += 1
                         self.push_event({
                             "type": "image_done",
                             "filepath": fp,
@@ -2433,10 +2600,10 @@ class AppState:
             save_dir = self.get_project_save_dir()
             os.makedirs(save_dir, exist_ok=True)
             if self.current_project_path:
-                self.save_project(self.current_project_path)
+                self.save_project(self.current_project_path, autosave=True)
             else:
                 fp = os.path.join(save_dir, self.default_project_filename())
-                self.save_project(fp)
+                self.save_project(fp, autosave=True)
         except Exception:
             pass
 
@@ -2460,7 +2627,100 @@ app = Flask(
 # client's r.json() fails with "Unexpected token '<'..." (the user's actual
 # multi-attach symptom — diagnosed in the prototype branch).
 app.config["MAX_CONTENT_LENGTH"] = 300 * 1024 * 1024
-state = AppState()
+# ---- app-wide attributes, delegated from every project to `shared` --------
+# Declared as a list rather than 20 hand-written property blocks: the list IS
+# the specification of "what is NOT per-project", so it can be read at a glance
+# and a mistake here is visible instead of buried.
+_SHARED_ATTRS = (
+    "client_vertex", "client_studio", "client_openai", "client_seedream",
+    "reve_api_key",
+    "vertex_rate_limiter", "studio_rate_limiter", "openai_rate_limiter",
+    "seedream_rate_limiter", "reve_rate_limiter",
+    "vertex_status", "studio_status", "openai_status", "seedream_status",
+    "reve_status", "vertex_credentials_path", "vertex_session_disabled",
+    "logs", "log_lock", "progress_events", "progress_lock",
+    "skip_delete_confirm", "prompt_history", "max_prompt_history",
+    "always_on_top", "close_requested",
+    "temp_ref_dir", "temp_ref_paths", "project_default_save_dir",
+)
+
+
+def _make_shared_property(_name):
+    def _get(self):
+        return getattr(shared, _name)
+    def _set(self, value):
+        setattr(shared, _name, value)
+    return property(_get, _set)
+
+
+for _attr in _SHARED_ATTRS:
+    setattr(AppState, _attr, _make_shared_property(_attr))
+
+
+# ---- project registry ------------------------------------------------------
+def any_project_generating():
+    """True while ANY tab has a batch in flight.
+
+    Anything that would kill the process or lose in-flight work has to ask
+    this, not `state.is_generating` — that only speaks for the tab on screen.
+    A background batch was invisible to the auto-updater, which happily
+    restarted the app and threw the images away."""
+    with shared.projects_lock:
+        return any(p.is_generating for p in shared.projects.values())
+
+
+def generating_project_names():
+    with shared.projects_lock:
+        return [p.display_name() for p in shared.projects.values() if p.is_generating]
+
+
+def _register_project_locked(proj, index=None):
+    shared.projects[proj.pid] = proj
+    if index is None:
+        shared.project_order.append(proj.pid)
+    else:
+        shared.project_order.insert(index, proj.pid)
+    return proj
+
+
+def create_project(title=None, activate=True, index=None):
+    with shared.projects_lock:
+        proj = AppState(title=title)
+        _register_project_locked(proj, index)
+        if activate or shared.active_pid is None:
+            shared.active_pid = proj.pid
+        return proj
+
+
+def get_project(pid):
+    with shared.projects_lock:
+        return shared.projects.get(pid)
+
+
+def current_project():
+    """The project the current HTTP request is about. Auto-creates the first
+    one so a fresh boot behaves exactly like the old single-project app."""
+    with shared.projects_lock:
+        proj = shared.projects.get(shared.active_pid)
+        if proj is None:
+            proj = create_project()
+        return proj
+
+
+class _ActiveProjectProxy:
+    """`state` still means "the project this request is about", which is why
+    the 60+ existing routes did not have to be rewritten. Background work never
+    resolves through here: gen_worker is a bound method on its OWN project, so
+    a batch keeps writing into the tab that started it even after the user
+    switches away."""
+    def __getattr__(self, name):
+        return getattr(current_project(), name)
+
+    def __setattr__(self, name, value):
+        setattr(current_project(), name, value)
+
+
+state = _ActiveProjectProxy()
 
 
 # --- JSON error responses for /api/* ---
@@ -2563,6 +2823,16 @@ _BUILD_ID = str(int(time.time()))
 
 # --- Release-notes-on-first-launch-after-update ---
 def _user_data_dir():
+    # NANOBANANA_DATA_DIR redirects prefs/session/update-state somewhere else.
+    # Harness-only: a test run once wrote its throwaway tabs into the real
+    # session.json and replaced the user's open tabs on the next launch.
+    override = os.environ.get("NANOBANANA_DATA_DIR", "").strip()
+    if override:
+        try:
+            os.makedirs(override, exist_ok=True)
+            return override
+        except Exception:
+            pass
     d = os.path.join(os.path.expanduser("~"), ".nanobanana")
     try:
         os.makedirs(d, exist_ok=True)
@@ -2728,15 +2998,35 @@ def api_apply_update():
       4. frontend overlay watches update_progress + update_swap events
       5. app disappears, new app launches, release-notes popup shows
     """
+    # Installing means os._exit(0) — any batch still running dies with it, in
+    # any tab, not just the visible one. Refuse rather than throw away images
+    # the user is paying for; the check runs again on the next launch.
+    if any_project_generating():
+        names = ", ".join(generating_project_names()[:3])
+        return jsonify({"ok": False, "generating": True,
+                        "error": f"생성 중입니다 ({names}). 끝난 뒤에 업데이트해 주세요."})
     with _apply_update_lock:
         if _apply_update_running[0]:
             return jsonify({"ok": False, "error": "Update already in progress"})
         _apply_update_running[0] = True
 
     def _worker():
+        # Imported in its own try: when this failed, `except UpdateNotReady`
+        # below raised UnboundLocalError instead of catching anything, the
+        # thread died without clearing _apply_update_running, and every later
+        # update attempt in the session answered "already in progress" —
+        # closing the manual escape hatch too.
         try:
             from updater import (check_for_update, apply_update_and_relaunch,
                                  UpdateNotReady)
+        except Exception as e:
+            state.log(f"updater import failed: {str(e)[:120]}")
+            state.push_event({"type": "update_swap", "phase": "failed",
+                              "message": f"업데이트 모듈을 불러오지 못했습니다: {str(e)[:80]}"})
+            _apply_update_running[0] = False
+            return
+        remote = ""
+        try:
             has_update, current, remote = check_for_update()
             if not has_update:
                 state.push_event({"type": "update_swap", "phase": "noop",
@@ -2781,6 +3071,9 @@ def api_apply_update():
             state.log(f"apply-update failed: {str(e)[:120]}")
             state.push_event({"type": "update_swap", "phase": "failed",
                               "message": f"업데이트 실패: {str(e)[:120]}"})
+        finally:
+            # Success never reaches here (os._exit). Any other exit must clear
+            # the flag or the button is dead for the rest of the session.
             _apply_update_running[0] = False
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -2800,13 +3093,18 @@ def api_status():
         "seedream": state.seedream_status,
         "reve": state.reve_status,
         "is_generating": state.is_generating,
+        # Whether ANY tab is busy — the auto-updater and the close flow must
+        # look at this, not at the visible tab alone.
+        "any_generating": any_project_generating(),
         "done": state.done_count,
         "failed": state.fail_count,
         "total": state.queue_count,
         "outstanding": outstanding,
         "max_queue": state.max_queued_images,
         "project_dirty": state.project_dirty,
-        "current_project": state.current_project_path or "",
+        # Autosave files are machine-named; the title bar keeps showing the tab
+        # name until the user actually names the project.
+        "current_project": "" if state.autosaved_only else (state.current_project_path or ""),
         "close_requested": close_req,
     })
 
@@ -2835,6 +3133,18 @@ def get_settings():
     })
 
 
+def _settings_fingerprint(proj):
+    """Everything /api/settings can change, in one comparable value. Used to
+    tell a genuine edit from the page simply re-sending what it already had."""
+    return (
+        proj.model, proj.aspect, proj.resolution, proj.quality,
+        proj.custom_w, proj.custom_h, proj.reve_bg_remove, proj.count,
+        proj.output_dir, proj.fixed_prompt, tuple(proj.prompt_sections or []),
+        proj.naming_enabled, proj.naming_prefix, proj.naming_delimiter,
+        proj.naming_index_prefix, proj.naming_padding, proj.gallery_columns,
+    )
+
+
 def _safe_int(value, default, lo=None, hi=None):
     try:
         n = int(str(value).strip())
@@ -2847,7 +3157,18 @@ def _safe_int(value, default, lo=None, hi=None):
 
 @app.route("/api/settings", methods=["POST"])
 def update_settings():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
+    # Apply to the project the CLIENT names, not merely the active one. The
+    # page debounces edits by 500ms, so a save can land after the user already
+    # switched tabs — that is how a prompt typed in one project ended up in
+    # another. The pid pins it to where it was typed.
+    state = _project_from_body(d)      # shadows the module proxy on purpose
+    # Snapshot first: a POST that changes nothing must not mark the project
+    # dirty. The page re-sends the whole settings block after opening a project
+    # (the mention re-sync fires when a reference file has gone missing), and
+    # that made a freshly opened project ask to be saved on close even though
+    # the user had touched nothing.
+    _before = _settings_fingerprint(state)
     for k in ("model", "aspect", "resolution", "quality", "fixed_prompt",
               "naming_prefix", "naming_delimiter", "naming_index_prefix"):
         if k in d and d[k] is not None:
@@ -2877,14 +3198,27 @@ def update_settings():
             state.prompt_sections = [str(x) for x in ps]
     if "gallery_columns" in d:
         state.gallery_columns = _safe_int(d.get("gallery_columns"), state.gallery_columns, lo=1, hi=8)
-    state.project_dirty = True
+    # Only a REAL user change makes the project unsaved. `auto` marks a save
+    # the app triggered on its own (mention normalisation after a load).
+    if not d.get("auto") and _settings_fingerprint(state) != _before:
+        state.project_dirty = True
     return jsonify({"ok": True, "ref_limit": state.get_ref_limit()})
 
 
 @app.route("/api/logs")
 def get_logs():
+    """This project's lines by default; ?all=1 for every tab's.
+
+    The log list is app-wide (one pane), but each entry remembers which project
+    wrote it. Showing everything meant two tabs generating at once interleaved
+    their [3/10] lines into an unreadable mix."""
+    show_all = request.args.get("all", "") in ("1", "true", "yes")
+    proj = _project_for_request()
     with state.log_lock:
-        return jsonify({"logs": list(state.logs)})
+        entries = list(state.logs)
+    if show_all:
+        return jsonify({"logs": [t for _pid, t in entries], "all": True})
+    return jsonify({"logs": [t for pid, t in entries if pid == proj.pid], "all": False})
 
 
 @app.route("/api/events")
@@ -2899,6 +3233,7 @@ def get_refs():
     # is reported as {index, empty: true} so the grid can render a hole
     # placeholder there. `count` is the number of FILLED slots; `slot_count`
     # is the total number of slots (highest [Image N] number in play).
+    state.ensure_refs_loaded()
     with state.ref_lock:
         images = list(state.ref_images)
         paths = list(state.ref_path_list)
@@ -3001,7 +3336,7 @@ def download_ref_url():
     import urllib.request
     import urllib.error
 
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     url = (d.get("url") or "").strip()
     if not url:
         return jsonify({"ok": False, "error": "No URL"})
@@ -3102,7 +3437,7 @@ def download_ref_url():
 
 @app.route("/api/browse-replace-ref", methods=["POST"])
 def browse_replace_ref():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     idx = d.get("index", -1)
     with state.ref_lock:
         in_range = 0 <= idx < len(state.ref_images)
@@ -3134,7 +3469,7 @@ def browse_replace_ref():
 
 @app.route("/api/refs/add-path", methods=["POST"])
 def add_ref_path():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     fp = d.get("filepath", "")
     if not fp or not os.path.exists(fp):
         return jsonify({"ok": False, "error": "File not found"})
@@ -3150,14 +3485,14 @@ def remove_ref(idx):
 
 @app.route("/api/refs/clear", methods=["POST"])
 def clear_refs():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     state.clear_refs(preserve_pinned=d.get("preserve_pinned", False))
     return jsonify({"ok": True})
 
 
 @app.route("/api/refs/reorder", methods=["POST"])
 def reorder_refs():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     order = d.get("order")
     if not isinstance(order, list):
         return jsonify({"ok": False, "error": "order must be a list"})
@@ -3263,8 +3598,22 @@ def ref_thumb(idx):
 
 
 # --- Gallery ---
+def _project_for_request():
+    """Resolve which project a read is about. The preview window pins itself to
+    the project it was opened from via ?pid=, so switching tabs in the main
+    window no longer yanks the gallery out from under it (the viewer would
+    treat the vanished list as 'image deleted' and jump elsewhere)."""
+    pid = request.args.get("pid", "")
+    if pid:
+        p = get_project(pid)
+        if p is not None:
+            return p
+    return current_project()
+
+
 @app.route("/api/gallery")
 def get_gallery():
+    state = _project_for_request()          # shadows the module proxy on purpose
     state.prune_missing_files()
     items = []
     for fp, item in sorted(state.gallery_items.items(), key=lambda x: (x[1].get("order", 0), x[0])):
@@ -3281,7 +3630,19 @@ def get_gallery():
             "generated_at": item.get("generated_at", ""),
             "favorite": fp in state.favorites,
         })
-    return jsonify({"items": items, "count": len(items)})
+    # The gallery carries THIS project's queue state so the frontend can draw
+    # the right number of skeletons for whichever tab it is showing. Reading it
+    # from the global /api/status instead made a background project's placeholders
+    # vanish the moment you switched tabs.
+    return jsonify({
+        "items": items,
+        "count": len(items),
+        "generating": state.is_generating,
+        "outstanding": state.get_queue_outstanding(),
+        "done": state.done_count,
+        "failed": state.fail_count,
+        "total": state.queue_count,
+    })
 
 
 # --- Reve layout edit window (Phase 2) ---
@@ -3378,13 +3739,18 @@ def _is_path_allowed(fp):
         return False
 
     # Check allowed parent directories first — cheap, covers the common case.
+    # Every OPEN project's output dir counts, not just the visible one: each
+    # tab can point somewhere different, and a background batch finishing in
+    # another tab still has to be able to show its thumbnail.
+    with shared.projects_lock:
+        out_dirs = [p.output_dir for p in shared.projects.values()]
     allowed_dirs = []
     for getter in (
-        lambda: state.output_dir,
+        [lambda d=d: d for d in out_dirs] + [
         lambda: state.temp_ref_dir,
         lambda: state.get_project_save_dir(),
         lambda: os.path.join(os.path.expanduser("~/Desktop"), "NanoBanana_Output", "NanoBanana JSON"),
-    ):
+    ]):
         try:
             d = os.path.realpath(getter())
             if d:
@@ -3403,10 +3769,15 @@ def _is_path_allowed(fp):
     # refs, moved output folder). Snapshot under locks, then do the cheap
     # string compare WITHOUT calling realpath on every item (the original
     # code did n realpaths per request — perf cliff at ~500 items).
-    with state.gallery_lock:
-        gallery_paths = list(state.gallery_items.keys())
-    with state.ref_lock:
-        ref_paths = list(state.ref_path_list)
+    # Same reasoning as the directory list above — union across open tabs.
+    gallery_paths, ref_paths = [], []
+    with shared.projects_lock:
+        projs = list(shared.projects.values())
+    for p in projs:
+        with p.gallery_lock:
+            gallery_paths.extend(p.gallery_items.keys())
+        with p.ref_lock:
+            ref_paths.extend(p.ref_path_list)
     # Normcase for case-insensitive match on Windows; no realpath needed
     # because the incoming `real` already resolved symlinks.
     real_lower = os.path.normcase(real)
@@ -3423,8 +3794,10 @@ def _is_path_allowed(fp):
 def gallery_rev():
     """Cheap change counter — the preview window polls this to keep its
     image list, counter and OK컷 states live (delete / new generation /
-    favorite toggles in the main window)."""
-    return jsonify({"rev": getattr(state, "gallery_rev", 0)})
+    favorite toggles in the main window). Honours ?pid= so the viewer tracks
+    the project it belongs to, not whichever tab happens to be in front."""
+    proj = _project_for_request()
+    return jsonify({"rev": getattr(proj, "gallery_rev", 0)})
 
 
 @app.route("/api/gallery/image")
@@ -3441,28 +3814,43 @@ def serve_gallery_image():
 # same event queue: which image is on screen (gallery follows + highlights),
 # selection toggles, and "refresh your cards" after a favorite change.
 
+def _project_from_body(d):
+    """The preview window is pinned to the project that opened it, so anything
+    it reports must be attributed to THAT project — not to whichever tab the
+    main window happens to be showing. Without this, pressing F in the viewer
+    while another tab was active marked the image in the WRONG project, and
+    the selection appeared in a gallery the image does not even belong to."""
+    pid = (d or {}).get("pid", "")
+    if pid:
+        p = get_project(pid)
+        if p is not None:
+            return p
+    return current_project()
+
+
 @app.route("/api/viewer/state", methods=["POST"])
 def viewer_report_state():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     fp = d.get("filepath", "")
     if fp:
-        state.push_event({"type": "viewer_state", "path": fp})
+        _project_from_body(d).push_event({"type": "viewer_state", "path": fp})
     return jsonify({"ok": True})
 
 
 @app.route("/api/viewer/select", methods=["POST"])
 def viewer_report_select():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     fp = d.get("filepath", "")
     if fp:
-        state.push_event({"type": "viewer_select", "path": fp,
-                          "selected": bool(d.get("selected"))})
+        _project_from_body(d).push_event({"type": "viewer_select", "path": fp,
+                                          "selected": bool(d.get("selected"))})
     return jsonify({"ok": True})
 
 
 @app.route("/api/viewer/refresh", methods=["POST"])
 def viewer_request_refresh():
-    state.push_event({"type": "gallery_dirty"})
+    d = request.get_json(silent=True) or {}
+    _project_from_body(d).push_event({"type": "gallery_dirty"})
     return jsonify({"ok": True})
 
 
@@ -3473,7 +3861,7 @@ def viewer_request_refresh():
 
 @app.route("/api/viewer/drag", methods=["POST"])
 def viewer_drag_start():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     fp = d.get("filepath", "")
     state.viewer_drag = {"path": fp, "ts": time.time(), "drop": None, "consumed": False}
     return jsonify({"ok": True})
@@ -3481,7 +3869,7 @@ def viewer_drag_start():
 
 @app.route("/api/viewer/drag_end", methods=["POST"])
 def viewer_drag_end():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     vd = getattr(state, "viewer_drag", None)
     if vd and vd.get("path") and vd.get("path") == d.get("filepath"):
         try:
@@ -3535,7 +3923,7 @@ def serve_gallery_thumb():
 
 @app.route("/api/gallery/delete", methods=["POST"])
 def delete_gallery():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     paths = d.get("paths", [])
     deleted = 0
     errors = []
@@ -3558,15 +3946,28 @@ def delete_gallery():
 
 @app.route("/api/gallery/favorite", methods=["POST"])
 def toggle_fav():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     fp = d.get("filepath", "")
-    is_fav = state.toggle_favorite(fp)
+    # Honour the caller's project (the viewer sends its own pid). Marking an
+    # image had been applied to the ACTIVE tab, so a viewer pinned to project A
+    # wrote the flag into project B — B's favourites gained a path it does not
+    # own and A never got marked at all.
+    proj = _project_from_body(d)
+    if fp and fp not in proj.gallery_items:
+        # Fall back to whichever open project actually owns this image rather
+        # than polluting the caller's favourites with a foreign path.
+        with shared.projects_lock:
+            for p in shared.projects.values():
+                if fp in p.gallery_items:
+                    proj = p
+                    break
+    is_fav = proj.toggle_favorite(fp)
     return jsonify({"ok": True, "favorite": is_fav})
 
 
 @app.route("/api/gallery/open-explorer", methods=["POST"])
 def open_explorer():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     fp = d.get("filepath", "")
     if not fp or not os.path.exists(fp):
         return jsonify({"ok": False})
@@ -3605,7 +4006,7 @@ def open_explorer():
 
 @app.route("/api/gallery/use-as-ref", methods=["POST"])
 def use_as_ref():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     fp = d.get("filepath", "")
     if not fp or not os.path.exists(fp):
         return jsonify({"ok": False, "error": "File not found"})
@@ -3630,7 +4031,7 @@ def use_as_ref():
 def replace_ref_from_path(idx):
     """Replace the ref at `idx` with an image referenced by filepath (e.g.
     a gallery item dragged onto the cell). JSON body: {filepath}."""
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     fp = d.get("filepath", "")
     if not fp or not os.path.exists(fp):
         return jsonify({"ok": False, "error": "File not found"})
@@ -3650,7 +4051,7 @@ def replace_ref_from_path(idx):
 
 @app.route("/api/gallery/load-setup", methods=["POST"])
 def load_setup():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     fp = d.get("filepath", "")
     item = state.gallery_items.get(fp)
     if not item:
@@ -3996,17 +4397,347 @@ def start_generate():
 
 @app.route("/api/stop", methods=["POST"])
 def stop_generate():
-    if state.is_generating:
-        state.cancel_flag = True
-        state.log("Stop requested")
+    # Optional pid: the Stop button only reaches the visible tab, so a batch
+    # left running in a background tab had no way to be stopped without
+    # switching to it first. The tab menu passes the pid.
+    d = request.get_json(silent=True) or {}
+    proj = get_project(d.get("pid", "")) or current_project()
+    if proj.is_generating:
+        proj.cancel_flag = True
+        proj.log("Stop requested")
     return jsonify({"ok": True})
+
+
+# --- Projects (tabs) -------------------------------------------------------
+# One window, many isolated projects. Every route above operates on the ACTIVE
+# one through the `state` proxy; these routes are the only ones that address a
+# project explicitly.
+
+def _session_file():
+    return os.path.join(_user_data_dir(), "session.json")
+
+
+def _save_session():
+    """Remember which tabs were open so a restart can bring them back.
+    Only paths are stored — the content already lives in those JSON files
+    (unsaved tabs get an autosave path, see _maybe_autosave)."""
+    try:
+        with shared.projects_lock:
+            tabs = []
+            for pid in shared.project_order:
+                p = shared.projects.get(pid)
+                if not p:
+                    continue
+                tabs.append({"path": p.current_project_path or "",
+                             "title": p.display_name(),
+                             # Remember that the file behind this tab is only
+                             # an autosave. Without it a restart re-opened the
+                             # tab "by filename" and the machine-generated name
+                             # appeared as the tab title again.
+                             "autosaved_only": bool(p.autosaved_only),
+                             "active": pid == shared.active_pid})
+        tmp = _session_file() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"tabs": tabs}, f, ensure_ascii=False)
+        os.replace(tmp, _session_file())
+    except Exception:
+        pass
+
+
+def _find_project_by_path(fp):
+    """The open tab holding this file, if any. Used by BOTH the open route and
+    session restore — restore used to add tabs blindly, so a project the user
+    opened while restore was still running (it runs on a background thread and
+    a big project takes a moment) ended up on the bar twice."""
+    if not fp:
+        return None
+    try:
+        real = os.path.normcase(os.path.realpath(fp))
+    except Exception:
+        return None
+    with shared.projects_lock:
+        for p in shared.projects.values():
+            if not p.current_project_path:
+                continue
+            try:
+                if os.path.normcase(os.path.realpath(p.current_project_path)) == real:
+                    return p
+            except Exception:
+                continue
+    return None
+
+
+def _project_summary(p):
+    with p.gallery_lock:
+        images = len(p.gallery_items)
+    return {
+        "pid": p.pid,
+        "name": p.display_name(),
+        "path": p.current_project_path or "",
+        "dirty": bool(p.project_dirty),
+        "generating": bool(p.is_generating),
+        "outstanding": p.get_queue_outstanding(),
+        "done": p.done_count,
+        "failed": p.fail_count,
+        "total": p.queue_count,
+        "images": images,
+        "unseen_done": p.unseen_done,
+        # "saved" means the USER saved it under a name. An autosave file is a
+        # crash net, not a save the user made — closing such a tab should still
+        # offer to save it properly.
+        "saved": bool(p.current_project_path) and not p.autosaved_only,
+        "color": p.tab_color or "",
+    }
+
+
+@app.route("/api/projects")
+def api_projects():
+    with shared.projects_lock:
+        if not shared.projects:
+            create_project()
+        order = list(shared.project_order)
+        items = [_project_summary(shared.projects[pid]) for pid in order if pid in shared.projects]
+        active = shared.active_pid
+    return jsonify({"projects": items, "active": active})
+
+
+@app.route("/api/projects/new", methods=["POST"])
+def api_projects_new():
+    d = request.get_json(silent=True) or {}
+    proj = create_project(title=(d.get("title") or None), activate=True)
+    _save_session()
+    return jsonify({"ok": True, "pid": proj.pid, "active": shared.active_pid})
+
+
+@app.route("/api/projects/switch", methods=["POST"])
+def api_projects_switch():
+    d = request.get_json(silent=True) or {}
+    pid = d.get("pid", "")
+    with shared.projects_lock:
+        if pid not in shared.projects:
+            return jsonify({"ok": False, "error": "No such project"})
+        shared.active_pid = pid
+        proj = shared.projects[pid]
+        proj.unseen_done = 0   # 뱃지 초기화
+    # Realise a deferred restore now that this tab is going on screen — the
+    # frontend asks for /api/refs immediately after switching.
+    proj.ensure_refs_loaded()
+    _save_session()
+    return jsonify({"ok": True, "active": pid})
+
+
+@app.route("/api/projects/close", methods=["POST"])
+def api_projects_close():
+    """Close a tab. Refuses while that project is still generating — killing a
+    running batch silently would lose images the user is paying for. The
+    frontend asks about saving BEFORE calling this."""
+    d = request.get_json(silent=True) or {}
+    pid = d.get("pid", "")
+    with shared.projects_lock:
+        proj = shared.projects.get(pid)
+        if not proj:
+            return jsonify({"ok": False, "error": "No such project"})
+        if proj.is_generating:
+            return jsonify({"ok": False, "error": "생성 중인 프로젝트입니다. 먼저 Stop을 눌러주세요.",
+                            "generating": True})
+        # Release the PIL handles this tab was holding.
+        try:
+            with proj.ref_lock:
+                for img in proj.ref_images:
+                    if img is not None:
+                        try: img.close()
+                        except Exception: pass
+                proj.ref_images.clear()
+                proj.ref_path_list.clear()
+                proj.ref_pinned.clear()
+        except Exception:
+            pass
+        idx = shared.project_order.index(pid) if pid in shared.project_order else 0
+        shared.projects.pop(pid, None)
+        if pid in shared.project_order:
+            shared.project_order.remove(pid)
+        if not shared.project_order:
+            newp = create_project()             # 최소 한 탭은 유지
+            active = newp.pid
+        else:
+            if shared.active_pid == pid:
+                active = shared.project_order[min(idx, len(shared.project_order) - 1)]
+                shared.active_pid = active
+                shared.projects[active].unseen_done = 0
+            else:
+                active = shared.active_pid
+    _save_session()
+    return jsonify({"ok": True, "active": active})
+
+
+@app.route("/api/projects/open", methods=["POST"])
+def api_projects_open():
+    """Open a saved project file in a NEW tab (or focus it if already open)."""
+    d = request.get_json(silent=True) or {}
+    fp = d.get("filepath", "")
+    if not fp or not os.path.isfile(fp):
+        return jsonify({"ok": False, "error": "File not found"})
+    exist = _find_project_by_path(fp)
+    if exist is not None:
+        with shared.projects_lock:
+            shared.active_pid = exist.pid
+            exist.unseen_done = 0
+        _save_session()
+        return jsonify({"ok": True, "pid": exist.pid, "already_open": True})
+    proj = create_project(activate=True)
+    ok, msg = proj.load_project(fp)
+    if not ok:
+        # Loading failed — don't strand an empty tab the user didn't ask for.
+        with shared.projects_lock:
+            shared.projects.pop(proj.pid, None)
+            if proj.pid in shared.project_order:
+                shared.project_order.remove(proj.pid)
+            shared.active_pid = shared.project_order[-1] if shared.project_order else None
+        return jsonify({"ok": False, "error": msg})
+    _save_session()
+    return jsonify({"ok": True, "pid": proj.pid, "message": msg})
+
+
+@app.route("/api/projects/reorder", methods=["POST"])
+def api_projects_reorder():
+    """Drag-to-reorder the tab strip. Accepts the full pid list; anything the
+    client omitted keeps its relative position at the end, so a stale client
+    view can never make a tab disappear from the bar."""
+    d = request.get_json(silent=True) or {}
+    order = d.get("order")
+    if not isinstance(order, list):
+        return jsonify({"ok": False, "error": "order must be a list"})
+    with shared.projects_lock:
+        seen, new_order = set(), []
+        for pid in order:
+            if pid in shared.projects and pid not in seen:
+                seen.add(pid)
+                new_order.append(pid)
+        for pid in shared.project_order:          # 클라이언트가 빠뜨린 탭 보존
+            if pid not in seen:
+                new_order.append(pid)
+        shared.project_order = new_order
+    _save_session()
+    return jsonify({"ok": True, "order": new_order})
+
+
+# Fixed palette: free-form colours would let the user pick something invisible
+# against the tab background.
+_TAB_COLORS = {
+    "": "", "red": "#E05A5A", "orange": "#D4A574", "yellow": "#D8C24A",
+    "green": "#5AA46B", "blue": "#5B8FD4", "purple": "#9A7BD1", "pink": "#D46FA5",
+}
+
+
+@app.route("/api/projects/color", methods=["POST"])
+def api_projects_color():
+    d = request.get_json(silent=True) or {}
+    pid = d.get("pid") or shared.active_pid
+    name = str(d.get("color", "") or "")
+    if name not in _TAB_COLORS:
+        return jsonify({"ok": False, "error": "unknown color"})
+    proj = get_project(pid)
+    if not proj:
+        return jsonify({"ok": False, "error": "No such project"})
+    if proj.tab_color != name:
+        proj.tab_color = name
+        proj.project_dirty = True     # 색은 프로젝트 파일에 저장되는 정보
+    return jsonify({"ok": True, "color": name, "hex": _TAB_COLORS[name]})
+
+
+@app.route("/api/projects/colors")
+def api_projects_colors():
+    return jsonify({"colors": [{"name": k, "hex": v} for k, v in _TAB_COLORS.items()]})
+
+
+@app.route("/api/projects/rename", methods=["POST"])
+def api_projects_rename():
+    """Rename a project in place.
+
+    Until now the only way to change a name was 'save as', which left the old
+    file behind and forked the project in two. This renames the actual file on
+    disk (or just the working title for a project that was never saved), so the
+    tab, the window title and the file stay one thing."""
+    d = request.get_json(silent=True) or {}
+    pid = d.get("pid") or shared.active_pid
+    name = _sanitize_project_name(d.get("name", ""))
+    if not name:
+        return jsonify({"ok": False, "error": "이름을 입력해주세요"})
+    proj = get_project(pid)
+    if not proj:
+        return jsonify({"ok": False, "error": "No such project"})
+
+    old = proj.current_project_path
+    if not old or not os.path.isfile(old):
+        # Never saved — the name is just a label until the first save.
+        proj.title = name
+        proj.project_dirty = True
+        _save_session()
+        return jsonify({"ok": True, "name": proj.display_name(), "saved": False})
+
+    target = os.path.join(os.path.dirname(old), name + ".json")
+    if os.path.normcase(os.path.realpath(target)) == os.path.normcase(os.path.realpath(old)):
+        return jsonify({"ok": True, "name": proj.display_name(), "unchanged": True})
+    if os.path.exists(target):
+        return jsonify({"ok": False, "error": f'"{name}.json" 이(가) 이미 있습니다'})
+    # Refuse to steal a file another open tab is using.
+    with shared.projects_lock:
+        for p in shared.projects.values():
+            if p is proj or not p.current_project_path:
+                continue
+            if os.path.normcase(os.path.realpath(p.current_project_path)) == os.path.normcase(os.path.realpath(target)):
+                return jsonify({"ok": False, "error": "다른 탭이 그 이름을 쓰고 있습니다"})
+    try:
+        os.replace(old, target)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"이름 변경 실패: {str(e)[:80]}"})
+    proj.current_project_path = target
+    proj.title = name
+    _save_session()
+    state.log(f"Project renamed: {os.path.basename(old)} -> {name}.json")
+    return jsonify({"ok": True, "name": proj.display_name(), "saved": True})
+
+
+@app.route("/api/projects/generating")
+def api_projects_generating():
+    """Tabs with a batch in flight. The exit flow asks before killing them."""
+    with shared.projects_lock:
+        out = [{"pid": p.pid, "name": p.display_name(),
+                "done": p.done_count, "total": p.queue_count}
+               for p in shared.projects.values() if p.is_generating]
+    return jsonify({"projects": out})
+
+
+@app.route("/api/projects/unsaved")
+def api_projects_unsaved():
+    """Tabs that would lose work if the app closed now — the close flow walks
+    this list one by one."""
+    out = []
+    with shared.projects_lock:
+        for pid in shared.project_order:
+            p = shared.projects.get(pid)
+            if not p:
+                continue
+            # _pending_refs covers a tab restored but never opened — its refs
+            # are recorded, not yet decoded, so ref_path_list is still empty.
+            has_content = (bool(p.gallery_items) or bool(p.ref_path_list)
+                           or bool(getattr(p, "_pending_refs", None))
+                           or bool(p.compose_prompt().strip()))
+            named = bool(p.current_project_path) and not p.autosaved_only
+            if has_content and (p.project_dirty or not named):
+                out.append(_project_summary(p))
+    return jsonify({"projects": out})
 
 
 # --- Project ---
 @app.route("/api/project/recent")
 def recent_projects():
-    entries = state.get_recent_projects()
-    return jsonify({"projects": entries})
+    # The picker used to show only the 6 newest, which quietly hid everything
+    # older — with ~95 saved projects most of them were simply unreachable
+    # from the UI. Cap high instead, and let the caller ask for fewer.
+    limit = _safe_int(request.args.get("limit"), 100, lo=1, hi=500)
+    entries = state.get_recent_projects(limit=limit)
+    return jsonify({"projects": entries, "count": len(entries)})
 
 
 def _sanitize_project_name(name):
@@ -4094,7 +4825,7 @@ def save_project():
     and re-sends with strategy="overwrite" or strategy="suffix". Previously
     the server silently overwrote any matching filename.
     """
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     fp = d.get("filepath", "")
     name = _sanitize_project_name(d.get("name", ""))
     strategy = (d.get("strategy") or "").lower()  # "", "overwrite", "suffix"
@@ -4123,13 +4854,34 @@ def save_project():
                 name = _suggest_unique_name(name, save_dir)
                 target = os.path.join(save_dir, f"{name}.json")
             fp = target
-        elif state.current_project_path and os.path.basename(state.current_project_path):
-            # Overwrite existing named project (user hit Save without a name)
+        elif (state.current_project_path and os.path.basename(state.current_project_path)
+              and not state.autosaved_only):
+            # Overwrite existing named project (user hit Save without a name).
+            # An autosave file is NOT a name the user picked, so it never
+            # becomes the silent overwrite target here.
             fp = state.current_project_path
         else:
             fp = os.path.join(save_dir, state.default_project_filename())
     try:
-        state.save_project(fp)
+        # Naming an autosave-only project MOVES it rather than leaving the
+        # machine-named timestamp file behind as an orphan copy.
+        stale_autosave = ""
+        if state.autosaved_only and state.current_project_path:
+            try:
+                if os.path.normcase(os.path.realpath(state.current_project_path)) != os.path.normcase(os.path.realpath(fp)):
+                    stale_autosave = state.current_project_path
+            except Exception:
+                stale_autosave = ""
+        # Only a name the user actually supplied promotes the project out of
+        # "제목 없음". A blank save keeps writing, but the tab does not suddenly
+        # sprout a machine-generated filename.
+        state.save_project(fp, autosave=not (name or d.get("filepath")))
+        if stale_autosave and os.path.isfile(stale_autosave):
+            try:
+                os.remove(stale_autosave)
+            except Exception:
+                pass
+        _save_session()
         state.log(f"Project saved: {os.path.basename(fp)}")
         return jsonify({"ok": True, "filepath": fp, "name": os.path.basename(fp)})
     except Exception as e:
@@ -4138,7 +4890,7 @@ def save_project():
 
 @app.route("/api/project/load", methods=["POST"])
 def load_project():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     fp = d.get("filepath", "")
     if not fp:
         return jsonify({"ok": False, "error": "No filepath"})
@@ -4154,12 +4906,26 @@ def upload_project():
     os.makedirs(state.temp_ref_dir, exist_ok=True)
     tmp = os.path.join(state.temp_ref_dir, f"_proj_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
     f.save(tmp)
-    ok, msg = state.load_project(tmp)
+    # Uploaded project goes into its OWN tab, same rule as opening a file.
+    proj = create_project(activate=True)
+    ok, msg = proj.load_project(tmp)
+    if not ok:
+        with shared.projects_lock:
+            shared.projects.pop(proj.pid, None)
+            if proj.pid in shared.project_order:
+                shared.project_order.remove(proj.pid)
+            shared.active_pid = shared.project_order[-1] if shared.project_order else None
+    else:
+        # The temp file is about to be deleted — don't leave the tab pointing
+        # at a path that will not exist (it would look "saved" but be gone).
+        proj.current_project_path = None
+        proj.project_dirty = True
+        _save_session()
     try:
         os.remove(tmp)
     except Exception:
         pass
-    return jsonify({"ok": ok, "message": msg})
+    return jsonify({"ok": ok, "message": msg, "pid": proj.pid if ok else None})
 
 
 # --- File dialog helper: force to foreground on Windows ---
@@ -4240,9 +5006,12 @@ def browse_project():
             initialdir=project_dir,
         )
         root.destroy()
+        # Only PICK the file — do NOT load it into the current project. With
+        # tabs, opening a project must never overwrite whatever the user has
+        # in front of them; the client passes this path to
+        # /api/projects/open, which gives it its own tab.
         if fp:
-            ok, msg = state.load_project(fp)
-            return jsonify({"ok": ok, "message": msg, "filepath": fp})
+            return jsonify({"ok": True, "filepath": fp})
         return jsonify({"ok": False})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)[:80]})
@@ -4289,7 +5058,7 @@ def delete_confirm_state():
 
 @app.route("/api/delete-confirm-state", methods=["POST"])
 def set_delete_confirm_state():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     state.skip_delete_confirm = bool(d.get("skip", False))
     state.save_prefs()
     return jsonify({"ok": True, "skip": state.skip_delete_confirm})
@@ -4314,11 +5083,16 @@ def close_info():
         or bool(state.ref_path_list)
         or bool(state.compose_prompt().strip())
     )
+    # An autosave-only project is reported as UNNAMED: Ctrl+S should ask for a
+    # name the first time rather than silently overwriting a timestamp file the
+    # user never chose.
+    named = bool(state.current_project_path) and not state.autosaved_only
     return jsonify({
         "has_content": has_content,
         "project_dirty": state.project_dirty,
-        "current_project": state.current_project_path or "",
-        "current_project_name": os.path.basename(state.current_project_path) if state.current_project_path else "",
+        "current_project": state.current_project_path if named else "",
+        "current_project_name": os.path.basename(state.current_project_path) if named else "",
+        "autosave_path": state.current_project_path or "",
         "save_dir": state.get_project_save_dir(),
     })
 
@@ -4327,17 +5101,24 @@ def close_info():
 def close_save():
     """Save project (to current path or default location) before closing."""
     try:
-        d = request.json or {}
+        d = request.get_json(silent=True) or {}
         name = _sanitize_project_name(d.get("name", ""))
         save_dir = state.get_project_save_dir()
         os.makedirs(save_dir, exist_ok=True)
+        stale_autosave = state.current_project_path if state.autosaved_only else ""
         if name:
             fp = os.path.join(save_dir, f"{name}.json")
-        elif state.current_project_path:
+        elif state.current_project_path and not state.autosaved_only:
             fp = state.current_project_path
         else:
             fp = os.path.join(save_dir, state.default_project_filename())
-        state.save_project(fp)
+        state.save_project(fp, autosave=not name)
+        if stale_autosave and os.path.isfile(stale_autosave):
+            try:
+                if os.path.normcase(os.path.realpath(stale_autosave)) != os.path.normcase(os.path.realpath(fp)):
+                    os.remove(stale_autosave)
+            except Exception:
+                pass
         return jsonify({"ok": True, "filepath": fp})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)[:120]})
@@ -4452,7 +5233,7 @@ def get_always_on_top():
 
 @app.route("/api/always-on-top", methods=["POST"])
 def set_always_on_top():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     enabled = bool(d.get("enabled"))
     if sys.platform != "win32":
         return jsonify({"ok": False, "error": "Windows only"})
@@ -4468,7 +5249,7 @@ def set_always_on_top():
 # --- UI-driven log line (for Prompt clipboard copy etc.) ---
 @app.route("/api/log-message", methods=["POST"])
 def log_message():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     msg = str(d.get("message", "")).strip()
     if not msg:
         return jsonify({"ok": False})
@@ -4488,7 +5269,7 @@ def log_message():
 # --- Clipboard copy ---
 @app.route("/api/copy-to-clipboard", methods=["POST"])
 def copy_to_clipboard():
-    d = request.json or {}
+    d = request.get_json(silent=True) or {}
     fp = d.get("filepath", "")
     if not fp or not os.path.exists(fp):
         return jsonify({"ok": False, "error": "File not found"})
@@ -4559,8 +5340,105 @@ def copy_to_clipboard():
 # ==========================================
 # Startup
 # ==========================================
+def _restore_session():
+    """Reopen the tabs that were open last time. Missing files are skipped
+    silently (the user may have moved or deleted a project between runs) and a
+    blank tab is created if nothing could be restored, so the app always comes
+    up with at least one project."""
+    try:
+        with open(_session_file(), "r", encoding="utf-8") as f:
+            tabs = (json.load(f) or {}).get("tabs", [])
+    except Exception:
+        tabs = []
+    restored, active_pid = 0, None
+    for t in tabs:
+        fp = (t or {}).get("path") or ""
+        if not fp or not os.path.isfile(fp):
+            continue
+        already = _find_project_by_path(fp)
+        if already is not None:
+            # Duplicate line in session.json, or the user opened this file
+            # while restore was still working through the list.
+            restored += 1
+            if t.get("active"):
+                active_pid = already.pid
+            continue
+        proj = create_project(activate=False)
+        # Only the tab that will actually be on screen decodes its refs now;
+        # the rest load theirs the moment you switch to them.
+        ok, _msg = proj.load_project(fp, defer_refs=True)
+        if not ok:
+            with shared.projects_lock:
+                shared.projects.pop(proj.pid, None)
+                if proj.pid in shared.project_order:
+                    shared.project_order.remove(proj.pid)
+            continue
+        if t.get("autosaved_only"):
+            # Came back from an autosave, not from a file the user named.
+            proj.autosaved_only = True
+            proj.title = t.get("title") or proj.title
+        restored += 1
+        if t.get("active"):
+            active_pid = proj.pid
+    if not restored:
+        # No session to restore (first run, or every remembered file is gone).
+        # Don't ask — just open the most recent project. Asking was redundant
+        # once tabs existed: the answer was always "the one I was working on",
+        # and picking from the dialog left an extra empty tab behind.
+        try:
+            recents = AppState().get_recent_projects(limit=1)
+        except Exception:
+            recents = []
+        if recents:
+            proj = create_project(activate=False)
+            ok, _msg = proj.load_project(recents[0]["filepath"])
+            if ok:
+                restored = 1
+                active_pid = proj.pid
+            else:
+                with shared.projects_lock:
+                    shared.projects.pop(proj.pid, None)
+                    if proj.pid in shared.project_order:
+                        shared.project_order.remove(proj.pid)
+    with shared.projects_lock:
+        # A blank starter tab exists before restore runs (the first HTTP hit
+        # auto-creates one). Once real tabs came back it is just clutter the
+        # user has to close on every launch — drop it, but only while it is
+        # genuinely untouched.
+        if restored:
+            for pid in list(shared.project_order):
+                p = shared.projects.get(pid)
+                if p is None or p.current_project_path or p.project_dirty:
+                    continue
+                if (p.gallery_items or p.ref_path_list
+                        or getattr(p, "_pending_refs", None)
+                        or p.compose_prompt().strip() or p.is_generating):
+                    continue
+                shared.projects.pop(pid, None)
+                shared.project_order.remove(pid)
+                if shared.active_pid == pid:
+                    shared.active_pid = None
+        if not shared.project_order:
+            create_project()
+        shared.active_pid = active_pid or shared.project_order[0]
+        first = shared.projects.get(shared.active_pid)
+    # The tab that comes up on screen needs its refs right away; the others
+    # stay deferred until switched to.
+    if first is not None:
+        try:
+            first.ensure_refs_loaded()
+        except Exception as e:
+            state.log(f"ref restore failed: {str(e)[:80]}")
+    if restored:
+        state.log(f"Opened {restored} project(s) at startup")
+
+
 def init_app():
     state.init_api()
+    try:
+        _restore_session()
+    except Exception as e:
+        state.log(f"session restore failed: {str(e)[:80]}")
 
 
 def cleanup():

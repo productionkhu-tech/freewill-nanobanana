@@ -281,11 +281,22 @@ async function api(url, opts = {}) {
 // ==========================================
 // Version
 // ==========================================
+// "win32" | "darwin" | … — the Mac build runs from source in a browser, so a
+// few Windows-only controls have nothing to act on there.
+let NB_PLATFORM = "win32";
+const isWindows = () => NB_PLATFORM === "win32";
+
 async function loadVersion() {
   try {
     const d = await api("/api/version");
+    NB_PLATFORM = d.platform || "win32";
     const ver = (d.version || "unknown").replace(/^v/, "").replace(/-/g, ".");
     document.getElementById("versionLabel").textContent = ver;
+    if (!isWindows()) {
+      // No app window to pin — the page lives in the user's own browser.
+      const pin = document.getElementById("alwaysOnTopBtn");
+      if (pin) pin.style.display = "none";
+    }
   } catch (e) { document.getElementById("versionLabel").textContent = "offline"; }
 }
 
@@ -4125,12 +4136,18 @@ function openViewerWindow(filepath, cmp) {
       console.error("pywebview.api.open_viewer failed:", e);
     }
   }
-  if (cmp) {
-    window.open(`/viewer?path=${encodeURIComponent(filepath)}&cmp=${encodeURIComponent(cmp)}`, "nbViewer");
-    return;
-  }
-  // Fallback: in-page modal viewer
-  openViewer(filepath);
+  // No pywebview (the Mac build runs in a normal browser): open the real
+  // viewer page in its own window rather than dropping to the bare in-page
+  // modal, so compare / OK컷 / the prompt footer work there too. `pid` pins it
+  // to this project exactly like the Windows launcher does.
+  let url = `/viewer?path=${encodeURIComponent(filepath)}`;
+  if (activePid) url += `&pid=${encodeURIComponent(activePid)}`;
+  if (cmp) url += `&cmp=${encodeURIComponent(cmp)}`;
+  const w = window.open(url, "nbViewer");
+  if (w) { try { w.focus(); } catch (_) {} return; }
+  // Popup blocked — fall back to the in-page modal.
+  if (!cmp) openViewer(filepath);
+  else showToast("팝업이 차단되어 비교 창을 열지 못했습니다", "warn");
 }
 
 // Gallery header "⇆ 비교": open the split-compare viewer on the 2 selected

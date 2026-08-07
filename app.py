@@ -2989,7 +2989,10 @@ def prompt_popup():
 
 @app.route("/api/version")
 def api_version():
-    return jsonify({"version": _read_version()})
+    # `platform` lets the page hide what only exists on one OS (the Windows
+    # always-on-top pin) and pick the right update wording — the Mac build is
+    # run from source and updates with git, not by swapping an EXE.
+    return jsonify({"version": _read_version(), "platform": sys.platform})
 
 
 @app.route("/api/check-update", methods=["POST"])
@@ -2998,6 +3001,15 @@ def api_check_update():
     the background thread runs at startup and returns the outcome so the
     frontend can show a toast even if the modal popup flow is blocked
     (network hiccup, user dismissed too fast, etc.)."""
+    if sys.platform != "win32":
+        # Only the Windows build is a self-replacing EXE. Elsewhere the app runs
+        # from source and updates with `git pull` on launch, so offering an
+        # in-app install here would download an EXE that can never be used.
+        return jsonify({
+            "ok": True, "status": "current", "has_update": False,
+            "current": _read_version(), "remote": "",
+            "message": "앱을 껐다 다시 실행하면 최신 버전으로 업데이트됩니다.",
+        })
     try:
         from updater import check_for_update
         has_update, current, remote = check_for_update()
@@ -3039,6 +3051,10 @@ def api_apply_update():
       4. frontend overlay watches update_progress + update_swap events
       5. app disappears, new app launches, release-notes popup shows
     """
+    if sys.platform != "win32":
+        # Same reason as /api/check-update: there is no EXE to replace here.
+        return jsonify({"ok": False,
+                        "error": "맥에서는 앱을 껐다 다시 실행하면 자동으로 업데이트됩니다."})
     # Installing means os._exit(0) — any batch still running dies with it, in
     # any tab, not just the visible one. Refuse rather than throw away images
     # the user is paying for; the check runs again on the next launch.
@@ -4054,6 +4070,18 @@ def open_explorer():
                     ole32.CoUninitialize()
         except Exception:
             subprocess.Popen('explorer /select,"%s"' % os.path.normpath(fp))
+    elif sys.platform == "darwin":
+        # Was a silent no-op that still answered ok:true — the Explorer button
+        # simply did nothing on the Mac build. -R reveals and selects the file.
+        try:
+            subprocess.Popen(["open", "-R", fp])
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)[:80]})
+    else:
+        try:
+            subprocess.Popen(["xdg-open", os.path.dirname(fp)])
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)[:80]})
     return jsonify({"ok": True})
 
 
@@ -5399,8 +5427,25 @@ def copy_to_clipboard():
     fp = d.get("filepath", "")
     if not fp or not os.path.exists(fp):
         return jsonify({"ok": False, "error": "File not found"})
+    if sys.platform == "darwin":
+        # Right-click copy and the viewer's Cmd+C used to answer "Windows only".
+        # AppleScript puts real image data on the pasteboard, so it pastes into
+        # Preview / Keynote / Slack the same way it does on Windows.
+        script = (
+            'set the clipboard to (read (POSIX file "%s") as «class PNGf»)'
+            % fp.replace('"', '\\"')
+        )
+        try:
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=30)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)[:80]})
+        if r.returncode != 0:
+            return jsonify({"ok": False, "error": "클립보드 복사 실패"})
+        state.log(f"Copied to clipboard: {os.path.basename(fp)}")
+        return jsonify({"ok": True})
     if sys.platform != "win32":
-        return jsonify({"ok": False, "error": "Windows only"})
+        return jsonify({"ok": False, "error": "Windows/macOS only"})
 
     try:
         import ctypes

@@ -159,6 +159,40 @@ def auto_update():
         print("[NanoBanana] Skipped auto-update (offline or git unavailable).")
 
 
+def preflight_folders():
+    """Touch the folders the app writes to, at launch.
+
+    macOS gates ~/Desktop, ~/Documents and ~/Downloads behind a permission
+    prompt (TCC). The app writes generated images to ~/Desktop/NanoBanana_Output
+    and projects to ~/Documents/NanoBanana JSON, so without this the prompt
+    appears mid-generation — or, if the user had denied it earlier, images just
+    fail to save with no obvious reason. Doing it here surfaces the dialog while
+    the Terminal window is still in front and explains what it is for.
+    """
+    home = os.path.expanduser("~")
+    targets = [
+        (os.path.join(home, "Desktop", "NanoBanana_Output"), "생성된 이미지"),
+        (os.path.join(home, "Documents", "NanoBanana JSON"), "프로젝트 파일"),
+        (os.path.join(home, "Pictures", "Screenshots", "NanoBanana Clipboard"), "레퍼런스 캐시"),
+    ]
+    blocked = []
+    for path, label in targets:
+        try:
+            os.makedirs(path, exist_ok=True)
+            probe = os.path.join(path, ".nb_write_test")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+        except Exception as e:
+            blocked.append((path, label, str(e)[:60]))
+    if blocked:
+        print("[NanoBanana] 아래 폴더에 쓸 수 없습니다:")
+        for path, label, err in blocked:
+            print("  - %s (%s): %s" % (path, label, err))
+        print("  -> 시스템 설정 > 개인정보 보호 및 보안 > 파일 및 폴더 에서")
+        print("     터미널(또는 이 앱)에 접근을 허용한 뒤 다시 실행해 주세요.")
+
+
 def main():
     # Python floor guard. The Xcode CommandLineTools python3 is 3.9: pip can
     # only give it google-genai <= 1.47.0, whose ImageConfig has no image_size
@@ -189,6 +223,7 @@ def main():
     auto_update()
     check_deps()
     _fix_ssl_certs()
+    preflight_folders()
     print("[NanoBanana] Starting on " + URL)
     print("  Keep this Terminal window open while using the app (close it to quit).")
     threading.Thread(target=open_browser_when_ready, daemon=True).start()

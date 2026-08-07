@@ -3,7 +3,7 @@
 멀티 프로바이더 AI 이미지 생성 데스크톱 앱 (Flask + pywebview + PyInstaller).
 이 문서 하나로 **구조 · 원리 · 규칙 · 배포 · 관리**를 파악할 수 있게 씁니다. 낡은 내용을 발견하면 즉시 고칠 것.
 
-> 최종 갱신: 2026-07-30 (v2026-07-3002 기준)
+> 최종 갱신: 2026-08-07 (v2026-08-0701 기준)
 
 ---
 
@@ -13,6 +13,8 @@
 - **프론트**: HTML/CSS/JS를 Flask가 서빙, pywebview(WebView2) 창에서 렌더
 - **백엔드**: Flask 127.0.0.1:5656, `app.py` 단일 파일에 상태+라우트 전부
 - **프로바이더 4사**: Google Gemini(Vertex/Studio) · OpenAI gpt-image-2 · BytePlus Seedream · Reve
+- **멀티 프로젝트 탭**: 앱 상태는 `_Shared`(앱 전역) + 프로젝트별 `AppState` N개.
+  `state`는 "이 요청이 다루는 프로젝트"를 가리키는 프록시라 기존 라우트는 그대로 동작
 - **배포**: GitHub Release에 EXE 업로드 → 사용자는 **앱을 껐다 켜기만 하면 자동 설치** (클릭 불필요)
 - **버전**: `vYYYY-MM-DDNN` — **오늘 날짜 기준**, 같은 날 재릴리스는 NN 증가, 날짜 바뀌면 01부터
 - **맥**: EXE 없이 소스 실행 (`server_mac.py` + `keys.env`), git pull로 업데이트
@@ -166,7 +168,16 @@ gen_worker:
 14. **`.meta.json` 사이드카 부활 금지.** 읽는 코드가 없었고 고아만 쌓였다. `_maybe_autosave()`가 대체
 15. **이론만 믿고 배포 종료 금지.** 업데이트 관련 변경은 **실제 구버전 EXE로 E2E 검증**이 의무.
     v1733~v1738은 이 검증 없이 릴리스해 매번 실패했다
-16. **app.py에서 `import launcher` 금지.** launcher는 frozen 진입 모듈이라 재import 시 모듈 레벨
+16. **"생성 중" 판단에 `state.is_generating` 단독 사용 금지.** 그건 *보이는 탭* 하나뿐이다.
+    프로세스를 죽이거나 작업을 잃는 경로(자동 업데이트·종료)는 반드시 `any_project_generating()`.
+    v2026-08-0501까지 백그라운드 탭 배치가 자동 업데이트에 통째로 날아갔다
+17. **테스트 스크립트로 app.py를 import 할 땐 `NANOBANANA_DATA_DIR` + 임시 프로젝트 폴더 필수.**
+    안 하면 `_save_session()`이 사용자의 실제 `~/.nanobanana/session.json`을 덮어써
+    다음 실행 때 열려 있던 탭이 전부 바뀐다 (2026-08-07 실제로 발생)
+18. **UI 목록을 `innerHTML = ""`로 통째로 다시 그리지 말 것.** 갤러리·탭 스트립은 이미지가
+    완성될 때마다 갱신되므로 전체 재생성은 화면 깜빡임 + 썸네일 재요청 + 드래그 취소를 부른다.
+    키(파일경로 / pid) 기반으로 DOM을 재사용할 것
+19. **app.py에서 `import launcher` 금지.** launcher는 frozen 진입 모듈이라 재import 시 모듈 레벨
     부작용이 재실행된다. 공유가 필요하면 `updater.py`에 둘 것
 
 ---
@@ -289,7 +300,10 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 | 프리뷰 비율이 늘어남 | 푸터 성장으로 캔버스 백킹스토어 불일치 | `#stage` ResizeObserver로 재fit (적용됨) |
 | PNG 투명 배경이 검정 | `convert("RGB")` | `_to_display_image` / `_to_rgb_flatten` |
 | Stop 눌러도 UI 멈춤 | `with ThreadPoolExecutor`의 wait=True | `shutdown(wait=False, cancel_futures=True)` |
-| 병렬 생성 시 파일 덮어쓰기 | file_counter race | `file_counter_lock` |
+| 병렬 생성 시 파일 덮어쓰기 | file_counter race | `file_counter_lock` + `reserve_filepath()` (탭이 같은 출력 폴더를 써도 안전) |
+| 같은 모델인데 장마다 시간이 다름 | 프로바이더별 공유 리미터(제미나이 8 RPM) 대기 시간이 카드의 초에 포함됨 | 정상. 로그의 `rate-limit wait Ns` 로 확인 |
+| `finish_reason: NO_IMAGE` 반복 | 모델(특히 Lite)이 이미지를 안 내놓음 | 재시도 때 시드 재발급 + 다른 프로바이더 폴백. 잦으면 Flash/Pro로 |
+| 다른 탭 갔다 오니 스켈레톤이 사라짐 | 스켈레톤이 프로젝트 소유가 아니었음 | `/api/gallery`의 `outstanding`에서 개수를 유도 (적용됨) |
 | `/api/*` 403 | CSRF 토큰 없음 | `api()` 헬퍼 사용 |
 | Program Files 설치 사용자 | UAC로 자기교체 불가 | 일반 폴더로 이동 안내 |
 

@@ -784,6 +784,7 @@ class AppState:
         # changes: change it in one place, and each app collects it on its next
         # start. A key that comes back broken is discarded rather than
         # installed, so a bad answer can never take a working machine offline.
+        changed = False
         try:
             def _key_works(candidate):
                 if _OpenAI is None:
@@ -802,30 +803,13 @@ class AppState:
         except Exception as e:
             self.log(f"key refresh error: {str(e)[:100]}")
 
+        # Generation talks to OpenAI directly, exactly as it always has. The key
+        # server only supplies the key; routing images through it would put a
+        # relay in the middle of a two-minute 4K render for no benefit.
         openai_key = os.environ.get("OPENAI_API_KEY", "")
-        gw_token, gw_url = None, ""
-        try:
-            gw_token, gw_url = _nbgw.get_token(
-                _user_data_dir(), app_version=_read_version(), log=self.log)
-        except Exception as e:
-            self.log(f"gateway: client error ({str(e)[:80]})")
-        if gw_token and gw_url and _OpenAI is not None:
-            try:
-                self.client_openai = _OpenAI(base_url=gw_url + "/v1", api_key=gw_token)
-                self.log(f"OpenAI via gateway ({gw_url})")
-                self.openai_status = "connected"
-                self.openai_detail = f"서버를 통해 연결됨 ({gw_url})"
-                threading.Thread(target=self._openai_selftest, daemon=True).start()
-            except Exception as e:
-                self.log(f"OpenAI gateway client error: {e}")
-                self.openai_status = "error"
-        elif openai_key and _OpenAI is not None:
-            if gw_url:
-                # Enrolment did not work out. Falling back keeps the machine
-                # usable instead of turning a gateway hiccup into an outage.
-                self.log("OpenAI: gateway unavailable, using the local key")
-                self.openai_detail = ("서버에 연결하지 못했습니다 — 사무실 밖이거나 "
-                                      "서버 컴퓨터가 꺼져 있습니다. GPT 외 모델은 정상입니다.")
+        if openai_key and _OpenAI is not None:
+            if changed:
+                self.openai_detail = "서버에서 받은 키로 연결됨"
             try:
                 self.client_openai = _OpenAI(api_key=openai_key)
                 self.log("OpenAI connected")

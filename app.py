@@ -497,6 +497,11 @@ class _Shared:
         self.reve_status = "disconnected"
         self.vertex_credentials_path = None
         self.vertex_session_disabled = False
+        # Plain-language reason behind the OpenAI dot. A red dot with no
+        # explanation reads as "my key is broken", which is the wrong
+        # conclusion when the real answer is "the office server is not
+        # reachable from here".
+        self.openai_detail = ""
 
         # One log pane for the whole app (generation lines carry their project
         # name when more than one tab is open).
@@ -773,10 +778,30 @@ class AppState:
             self.log("AI Studio: key not configured (skipped)")
             self.studio_status = "disconnected"
 
-        # OpenAI — normally the key straight from OPENAI_API_KEY. When a gateway
-        # is configured the app carries a personal token instead and the real key
-        # stays on the server; the OpenAI SDK just needs a different base_url, so
-        # nothing downstream of here changes.
+        # OpenAI. Before anything else, ask the key server whether this machine
+        # is holding the current key — it proves itself with the key it already
+        # has. That is what replaced walking to 70 desks every time a key
+        # changes: change it in one place, and each app collects it on its next
+        # start. A key that comes back broken is discarded rather than
+        # installed, so a bad answer can never take a working machine offline.
+        try:
+            def _key_works(candidate):
+                if _OpenAI is None:
+                    return True
+                try:
+                    _OpenAI(api_key=candidate).models.list()
+                    return True
+                except Exception:
+                    return False
+
+            os.environ.setdefault("NANOBANANA_APP_VERSION", _read_version())
+            changed, msg = _nbgw.refresh_provider_key(
+                _user_data_dir(), log=self.log, validate=_key_works)
+            if msg and msg != "ok":
+                self.log(f"OpenAI: {msg}")
+        except Exception as e:
+            self.log(f"key refresh error: {str(e)[:100]}")
+
         openai_key = os.environ.get("OPENAI_API_KEY", "")
         gw_token, gw_url = None, ""
         try:
@@ -789,6 +814,7 @@ class AppState:
                 self.client_openai = _OpenAI(base_url=gw_url + "/v1", api_key=gw_token)
                 self.log(f"OpenAI via gateway ({gw_url})")
                 self.openai_status = "connected"
+                self.openai_detail = f"서버를 통해 연결됨 ({gw_url})"
                 threading.Thread(target=self._openai_selftest, daemon=True).start()
             except Exception as e:
                 self.log(f"OpenAI gateway client error: {e}")
@@ -798,6 +824,8 @@ class AppState:
                 # Enrolment did not work out. Falling back keeps the machine
                 # usable instead of turning a gateway hiccup into an outage.
                 self.log("OpenAI: gateway unavailable, using the local key")
+                self.openai_detail = ("서버에 연결하지 못했습니다 — 사무실 밖이거나 "
+                                      "서버 컴퓨터가 꺼져 있습니다. GPT 외 모델은 정상입니다.")
             try:
                 self.client_openai = _OpenAI(api_key=openai_key)
                 self.log("OpenAI connected")
@@ -854,6 +882,8 @@ class AppState:
             n = len(getattr(ms, "data", []) or [])
             self.log(f"OpenAI self-test OK ({n} models reachable)")
             self.openai_status = "connected"
+            if not self.openai_detail:
+                self.openai_detail = "정상"
         except Exception as e:
             detail = f"{type(e).__name__}: {str(e)}"
             cause = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
@@ -874,6 +904,9 @@ class AppState:
             if "invalid_organization" in low or "organization tied to the api key" in low:
                 self.log("OpenAI: the org/project behind this API key is not accessible "
                          "- check the project is still active and the key belongs to it")
+                if not self.openai_detail:
+                    self.openai_detail = ("이 PC 의 키로는 OpenAI 에 직접 접근할 수 없습니다. "
+                                          "서버를 통해 쓰는 구조라면 서버 연결을 확인하세요.")
             elif "invalid_api_key" in low or "incorrect api key" in low:
                 self.log("OpenAI: API key rejected - reinstall the key")
             elif "insufficient_quota" in low or "billing" in low:
@@ -2719,6 +2752,7 @@ _SHARED_ATTRS = (
     "seedream_rate_limiter", "reve_rate_limiter",
     "vertex_status", "studio_status", "openai_status", "seedream_status",
     "reve_status", "vertex_credentials_path", "vertex_session_disabled",
+    "openai_detail",
     "logs", "log_lock", "progress_events", "progress_lock",
     "skip_delete_confirm", "prompt_history", "max_prompt_history",
     "always_on_top", "close_requested",
@@ -3193,6 +3227,7 @@ def api_status():
         # Whether ANY tab is busy — the auto-updater and the close flow must
         # look at this, not at the visible tab alone.
         "any_generating": any_project_generating(),
+        "openai_detail": state.openai_detail,
         "done": state.done_count,
         "failed": state.fail_count,
         "total": state.queue_count,

@@ -12,6 +12,7 @@ this module has to stay importable from the gateway tests too.
 import json
 import os
 import platform
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -45,7 +46,8 @@ def _fetch_endpoint(timeout=6):
     startup, and a failure just falls through to the cached value."""
     try:
         req = urllib.request.Request(ENDPOINT_SOURCE,
-                                     headers={"Cache-Control": "no-cache"})
+                                     headers={"Cache-Control": "no-cache",
+                                              "User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read(4096).decode("utf-8", "replace")
     except Exception:
@@ -132,10 +134,17 @@ def _save_token(data_dir, url, payload):
     os.replace(tmp, p)
 
 
-def _post(url, obj, timeout=20):
+# Cloudflare turns away the default urllib agent as a bot, and the whole
+# exchange would fail with a 403 that looks nothing like a real problem.
+USER_AGENT = "NanoBanana/1.0"
+
+
+def _post(url, obj, timeout=20, headers=None):
     data = json.dumps(obj).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST",
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": USER_AGENT,
+                                          **(headers or {})})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status, json.loads(r.read().decode("utf-8", "replace") or "{}")
 
@@ -204,3 +213,116 @@ def get_token(data_dir, app_version="", log=None):
     if log:
         log(msg)
     return None, url
+
+# ---------------------------------------------------------------- key refresh
+KEY_STAMP = "key_stamp.txt"
+
+
+def _persist_windows_env(name, value):
+    """Write a user environment variable and tell running programs about it.
+
+    setx is used rather than the registry directly because it broadcasts the
+    change; without that, Explorer keeps handing the old value to everything it
+    launches until the next sign-in."""
+    import subprocess
+    try:
+        r = subprocess.run(["setx", name, value], capture_output=True, text=True,
+                           timeout=30, creationflags=0x08000000)  # no console window
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _persist_mac_env(name, value):
+    """macOS reads its keys from keys.env, so update the line there."""
+    import re
+    home = os.path.expanduser("~")
+    for path in (os.path.join(os.path.dirname(os.path.abspath(__file__)), "keys.env"),
+                 os.path.join(home, ".nanobanana", "keys.env")):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+            pat = r"(?m)^\s*%s\s*=.*$" % re.escape(name)
+            new, n = re.subn(pat, "%s=%s" % (name, value), text)
+            if n == 0:
+                new = text.rstrip("\n") + "\n%s=%s\n" % (name, value)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(new)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def refresh_provider_key(data_dir, log=None, validate=None):
+    """Collect the current provider key and install it on this machine.
+
+    The machine proves itself with the key it already has — the retired one to
+    begin with — so nothing has to be handed out by hand. A key that arrives
+    broken is discarded rather than installed: replacing a working key with a
+    dead one would take the machine offline for no reason.
+
+    Returns (changed, message)."""
+    def say(m):
+        if log:
+            log(m)
+
+    url = gateway_url(data_dir)
+    if not url:
+        return False, ""
+    tk = ticket()
+    if not tk:
+        return False, "key refresh: nothing to identify this machine with"
+
+    body = {
+        "ticket": tk,
+        "user": os.environ.get("USERNAME") or os.environ.get("USER") or "unknown",
+        "machine": platform.node() or "unknown",
+        "app_version": os.environ.get("NANOBANANA_APP_VERSION", ""),
+    }
+    # A token first: the key server no longer answers to the ticket alone, so a
+    # leaked ticket is worth nothing once enrollment is closed, and one machine
+    # can be cut off without disturbing the rest.
+    token, _ = get_token(data_dir, app_version=body["app_version"], log=log)
+    if not token:
+        return False, "key refresh: this machine is not enrolled yet"
+    try:
+        status, d = _post(url + "/key", body, timeout=20,
+                          headers={"Authorization": "Bearer " + token})
+    except urllib.error.HTTPError as e:
+        try:
+            d = json.loads(e.read().decode("utf-8", "replace") or "{}")
+        except Exception:
+            d = {}
+        return False, "key refresh refused (%s)" % (d.get("error") or ("HTTP %d" % e.code))
+    except Exception as e:
+        return False, "key server unreachable (%s)" % str(e)[:70]
+
+    new_key = (d.get("key") or "").strip()
+    if status != 200 or not new_key:
+        return False, "key refresh failed (%s)" % (d.get("error") or status)
+
+    current = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
+    if new_key == current:
+        return False, ""          # already current, nothing to say
+
+    if validate is not None and not validate(new_key):
+        return False, "key refresh: the key that came back does not work, keeping the current one"
+
+    os.environ["OPENAI_API_KEY"] = new_key      # this run
+    ok = False
+    if sys.platform == "win32":
+        ok = _persist_windows_env("OPENAI_API_KEY", new_key)
+    elif sys.platform == "darwin":
+        ok = _persist_mac_env("OPENAI_API_KEY", new_key)
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        with open(os.path.join(data_dir, KEY_STAMP), "w", encoding="utf-8") as f:
+            f.write("%s %s" % (time.strftime("%Y-%m-%dT%H:%M:%S"), d.get("key_id", "")))
+    except Exception:
+        pass
+    say("key updated from the key server (%s)%s"
+        % (d.get("key_id", "?"), "" if ok else " - this session only, could not save"))
+    return True, "ok"

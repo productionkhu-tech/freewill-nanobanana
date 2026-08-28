@@ -1,4 +1,4 @@
-# NanoBanana gateway address. One line, nothing else.
-# The app reads this at launch. Moving the gateway = edit this line.
+# NanoBanana key server. One line, nothing else.
+# The app reads this at launch. Moving the server = edit this line.
 # Employees do nothing; no release needed.
-http://192.168.50.154:8787
+https://nanobanana-gateway.production-khu.workers.dev

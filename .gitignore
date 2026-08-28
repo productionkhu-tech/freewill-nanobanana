@@ -60,3 +60,6 @@ gateway/data/
 gateway/build/
 gateway/dist/
 *.sha256
+wrangler.toml
+.wrangler/
+node_modules/

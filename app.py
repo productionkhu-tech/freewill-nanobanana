@@ -28,6 +28,8 @@ from PIL import Image, ImageGrab, ImageDraw, ImageFilter
 from google import genai
 from google.genai import types
 
+import nb_gateway as _nbgw
+
 try:
     from openai import OpenAI as _OpenAI
 except Exception:
@@ -771,9 +773,31 @@ class AppState:
             self.log("AI Studio: key not configured (skipped)")
             self.studio_status = "disconnected"
 
-        # OpenAI — requires OPENAI_API_KEY. Only used when user picks gpt-image-2.
+        # OpenAI — normally the key straight from OPENAI_API_KEY. When a gateway
+        # is configured the app carries a personal token instead and the real key
+        # stays on the server; the OpenAI SDK just needs a different base_url, so
+        # nothing downstream of here changes.
         openai_key = os.environ.get("OPENAI_API_KEY", "")
-        if openai_key and _OpenAI is not None:
+        gw_token, gw_url = None, ""
+        try:
+            gw_token, gw_url = _nbgw.get_token(
+                _user_data_dir(), app_version=_read_version(), log=self.log)
+        except Exception as e:
+            self.log(f"gateway: client error ({str(e)[:80]})")
+        if gw_token and gw_url and _OpenAI is not None:
+            try:
+                self.client_openai = _OpenAI(base_url=gw_url + "/v1", api_key=gw_token)
+                self.log(f"OpenAI via gateway ({gw_url})")
+                self.openai_status = "connected"
+                threading.Thread(target=self._openai_selftest, daemon=True).start()
+            except Exception as e:
+                self.log(f"OpenAI gateway client error: {e}")
+                self.openai_status = "error"
+        elif openai_key and _OpenAI is not None:
+            if gw_url:
+                # Enrolment did not work out. Falling back keeps the machine
+                # usable instead of turning a gateway hiccup into an outage.
+                self.log("OpenAI: gateway unavailable, using the local key")
             try:
                 self.client_openai = _OpenAI(api_key=openai_key)
                 self.log("OpenAI connected")
@@ -829,6 +853,7 @@ class AppState:
             ms = self.client_openai.models.list()
             n = len(getattr(ms, "data", []) or [])
             self.log(f"OpenAI self-test OK ({n} models reachable)")
+            self.openai_status = "connected"
         except Exception as e:
             detail = f"{type(e).__name__}: {str(e)}"
             cause = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
@@ -841,6 +866,18 @@ class AppState:
                 cause = nxt
                 depth += 1
             self.log(f"OpenAI self-test FAILED: {detail[:600]}")
+            # The dot went green just because the client object constructed, so a
+            # dead key still looked connected until a generation failed 30
+            # seconds later. Report what the API actually answered.
+            self.openai_status = "error"
+            low = f"{type(e).__name__}: {e}".lower()
+            if "invalid_organization" in low or "organization tied to the api key" in low:
+                self.log("OpenAI: the org/project behind this API key is not accessible "
+                         "- check the project is still active and the key belongs to it")
+            elif "invalid_api_key" in low or "incorrect api key" in low:
+                self.log("OpenAI: API key rejected - reinstall the key")
+            elif "insufficient_quota" in low or "billing" in low:
+                self.log("OpenAI: account has no usable quota - check billing")
 
     # --- Provider helpers ---
     def get_available_providers(self):
@@ -1828,7 +1865,10 @@ class AppState:
             restored_lines = [(self.pid, ln) for ln in saved_logs.strip().split("\n") if ln]
             with self.log_lock:
                 keep = [e for e in self.logs if e[0] != self.pid]
-                merged = keep + restored_lines
+                # Restored lines are older than anything this session wrote, so
+                # they go in front — appending them put yesterday's lines under
+                # today's in the pane.
+                merged = restored_lines + keep
                 self.logs[:] = merged[-2000:]
 
         self.current_project_path = filepath

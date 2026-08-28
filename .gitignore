@@ -49,3 +49,14 @@ NanoBanana_Output/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# gateway (local key proxy)
+gateway/ticket.txt
+gateway/*.log
+.nanobanana-gateway*/
+# gateway runtime secrets - the real provider key and issued tokens live here
+gateway_config.json
+gateway/data/
+gateway/build/
+gateway/dist/
+*.sha256

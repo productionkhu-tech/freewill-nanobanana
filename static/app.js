@@ -29,6 +29,22 @@ let settingsDebounce = null;
 // ==========================================
 document.addEventListener("DOMContentLoaded", async () => {
   await refreshProjects();     // 탭 먼저 — 이후 로드는 활성 프로젝트 기준
+  // The first fetch can race the server's session restore: the boot-time key
+  // refresh does network work BEFORE the tabs are restored, so a fast window
+  // sees only the starter tab and keeps that stale activePid forever — the
+  // tab strip shows the wrong project and project-stamped events get dropped.
+  // Re-sync a couple of times; renderProjectTabs reuses DOM, so an unchanged
+  // list repaints nothing.
+  setTimeout(async () => {
+    const before = activePid;
+    await refreshProjects();
+    if (activePid !== before) await reloadActiveProject();
+  }, 3000);
+  setTimeout(async () => {
+    const before = activePid;
+    await refreshProjects();
+    if (activePid !== before) await reloadActiveProject();
+  }, 8000);
   await loadModelPrefs();      // 드롭다운을 채우기 전에 숨김/기본화질부터
   await loadSettings();
   loadVersion();

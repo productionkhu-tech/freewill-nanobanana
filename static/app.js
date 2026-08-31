@@ -3638,7 +3638,16 @@ async function pollEvents() {
     // tab must NOT touch this screen — it only bumps that tab's badge, which
     // refreshProjects() picks up. Without this, a batch finishing in project B
     // would repaint project A's gallery and progress bar.
-    if (ev.pid && activePid && ev.pid !== activePid) {
+    //
+    // Update events are APP-level and exempt: during boot the project ids
+    // churn (starter tab created, session restored, starter removed), and a
+    // stamped update_status could lose that race and be dropped here — the
+    // auto-update then silently never ran (2026-08-31). The server now pushes
+    // them with pid null; this exemption also covers any older path that
+    // still stamps them.
+    const isAppEvent = ev.type === "update_status" || ev.type === "update_progress"
+                    || ev.type === "update_swap";
+    if (!isAppEvent && ev.pid && activePid && ev.pid !== activePid) {
       if (ev.type === "image_done" || ev.type === "image_failed" || ev.type === "done") anyOther = true;
       continue;
     }

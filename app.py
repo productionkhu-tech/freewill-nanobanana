@@ -3212,7 +3212,7 @@ def api_apply_update():
                                  UpdateNotReady)
         except Exception as e:
             state.log(f"updater import failed: {str(e)[:120]}")
-            state.push_event({"type": "update_swap", "phase": "failed",
+            state.push_event({"pid": None, "type": "update_swap", "phase": "failed",
                               "message": f"업데이트 모듈을 불러오지 못했습니다: {str(e)[:80]}"})
             _apply_update_running[0] = False
             return
@@ -3220,7 +3220,7 @@ def api_apply_update():
         try:
             has_update, current, remote = check_for_update()
             if not has_update:
-                state.push_event({"type": "update_swap", "phase": "noop",
+                state.push_event({"pid": None, "type": "update_swap", "phase": "noop",
                                   "message": f"이미 최신 버전입니다 ({current})"})
                 _apply_update_running[0] = False
                 return
@@ -3228,14 +3228,15 @@ def api_apply_update():
             def _on_dl_progress(done, total):
                 pct = int(done * 100 / total) if total else 0
                 state.push_event({
+                    "pid": None,   # app-level: must survive a mid-download tab switch
                     "type": "update_progress",
                     "done": done, "total": total, "pct": pct,
                 })
 
-            state.push_event({"type": "update_swap", "phase": "downloading",
+            state.push_event({"pid": None, "type": "update_swap", "phase": "downloading",
                               "message": f"{remote} 다운로드 중..."})
             apply_update_and_relaunch(remote, on_progress=_on_dl_progress)
-            state.push_event({"type": "update_swap", "phase": "handing_off",
+            state.push_event({"pid": None, "type": "update_swap", "phase": "handing_off",
                               "message": "설치 준비 중..."})
             # One poll tick (800ms) for the frontend to pick up the last
             # event before our process dies.
@@ -3255,12 +3256,12 @@ def api_apply_update():
             except Exception:
                 pass
             state.log(f"Update {remote} not published yet - will retry on next launch")
-            state.push_event({"type": "update_swap", "phase": "not_ready",
+            state.push_event({"pid": None, "type": "update_swap", "phase": "not_ready",
                               "message": "새 버전을 준비 중입니다. 다음 실행 때 자동으로 설치됩니다."})
             _apply_update_running[0] = False
         except Exception as e:
             state.log(f"apply-update failed: {str(e)[:120]}")
-            state.push_event({"type": "update_swap", "phase": "failed",
+            state.push_event({"pid": None, "type": "update_swap", "phase": "failed",
                               "message": f"업데이트 실패: {str(e)[:120]}"})
         finally:
             # Success never reaches here (os._exit). Any other exit must clear

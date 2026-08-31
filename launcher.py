@@ -973,6 +973,14 @@ def main():
                     _clear_auto_update_state()
                 state.log(msg)
                 state.push_event({
+                    # App-level, not project-level. During boot the project ids
+                    # churn (starter tab created, session restored, starter
+                    # removed) and the window's idea of the active project can
+                    # disagree with the server's for a few seconds. A stamped
+                    # update event lost that race and was silently dropped by
+                    # the frontend pid filter - the auto-update then simply
+                    # never happened (reproduced 2026-08-31, flaky since 0701).
+                    "pid": None,
                     "type": "update_status",
                     "kind": kind,
                     "message": msg,

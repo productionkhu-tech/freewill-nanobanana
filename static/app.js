@@ -29,6 +29,7 @@ let settingsDebounce = null;
 // ==========================================
 document.addEventListener("DOMContentLoaded", async () => {
   await refreshProjects();     // 탭 먼저 — 이후 로드는 활성 프로젝트 기준
+  await loadModelPrefs();      // 드롭다운을 채우기 전에 숨김/기본화질부터
   await loadSettings();
   loadVersion();
   refreshRefs();
@@ -862,6 +863,11 @@ async function saveActiveProjectQuiet() {
 async function loadSettings() {
   const d = await api("/api/settings");
   if (!d.model) return;
+  // Rebuild the dropdown around whatever this project uses. A restored project
+  // (or a Load from a gallery card) may reference a model the user has since
+  // hidden — setting .value on a missing <option> silently keeps the OLD
+  // selection, and every dropdown after it would describe the wrong model.
+  rebuildModelSelect(d.model);
   document.getElementById("modelSelect").value = d.model;
   // 저장된 값을 적용하기 전에 모델 스펙으로 드롭다운을 먼저 재구성 — 그래야
   // 저장된 옵션(GPT-2 quality 등)이 <select>에 실제로 존재함.
@@ -1027,6 +1033,15 @@ const MODEL_SPECS = {
     hint: "BytePlus Seedream 4.5 - jpeg. 2K/4K.",
     refHint: "Up to 14 reference images. Mention them as 'image 1', 'image 2' in the prompt.",
   },
+  "gpt-image-2": {
+    aspects: ["auto","1:1","3:2","2:3","4:3","3:4","4:5","5:4","16:9","9:16","21:9","9:21","3:1","1:3","custom"],
+    resolutions: ["1K","2K","4K"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: true,
+    defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "high",
+    hint: "OpenAI Image API — generation may take up to ~2 min.",
+    refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
+  },
   "reve-create": {
     aspects: ["auto","4:1","3:1","21:9","2:1","17:9","16:9","3:2","4:3","5:4","1:1","4:5","3:4","2:3","9:16","1:2","1:3","1:4"],
     resolutions: ["auto"],
@@ -1038,16 +1053,67 @@ const MODEL_SPECS = {
     hint: "Reve 2.1 — text & reference-to-image. Wide aspects (4:1..1:4). ~40-80s/image.",
     refHint: "Up to 8 reference images. Describe them in the prompt (no [Image N] tags).",
   },
-  "gpt-image-2": {
-    aspects: ["auto","1:1","3:2","2:3","4:3","3:4","4:5","5:4","16:9","9:16","21:9","9:21","3:1","1:3","custom"],
-    resolutions: ["1K","2K","4K"],
-    counts: ["1","2","3","4","5","6","7","8","9","10"],
-    showQuality: true,
-    defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "high",
-    hint: "OpenAI Image API — generation may take up to ~2 min.",
-    refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
-  },
 };
+
+// ==========================================
+// Model preferences (which models show + starting resolution per model)
+// ==========================================
+// App-wide, stored in ~/.nanobanana/prefs.json server-side: survives restarts
+// and version updates, and every project tab shares one answer. A project's
+// OWN model/resolution still lives in the project — these only shape the
+// dropdown and what a model starts on when the user switches to it.
+// Derived from MODEL_SPECS, in definition order. Registering a model is ONE
+// step — add its spec — and it appears at the bottom of the dropdown and the
+// settings modal automatically: visible, starting on its highest quality.
+// A second hand-kept list here would be exactly the place a new model gets
+// forgotten.
+const MODEL_ORDER = Object.keys(MODEL_SPECS);
+const MODEL_LABELS = {
+  "seedream-5-0-pro-260628": "seedream-5-0-pro",
+  "seedream-4-5-251128": "seedream-4-5",
+  "gpt-image-2": "gpt-image-2 (OpenAI)",
+  "reve-create": "Reve 2.1",
+};
+let _modelPrefs = { hidden: [], default_res: {} };
+
+async function loadModelPrefs() {
+  try {
+    const d = await api("/api/model-prefs");
+    if (d && d.ok) _modelPrefs = { hidden: d.hidden || [], default_res: d.default_res || {} };
+  } catch (e) { /* 못 읽으면 아무것도 숨기지 않는다 — 기능이 죽는 쪽보다 낫다 */ }
+}
+
+// Rebuild #modelSelect from MODEL_ORDER minus the hidden ones. `keepModel` is
+// always included even when hidden (tagged), so a project that still uses a
+// hidden model keeps working — hiding is a dropdown filter, never a ban.
+function rebuildModelSelect(keepModel) {
+  const sel = document.getElementById("modelSelect");
+  if (!sel) return;
+  const keep = migrateModelId(keepModel || sel.value);
+  const hidden = new Set(_modelPrefs.hidden || []);
+  let ids = MODEL_ORDER.filter(m => !hidden.has(m) || m === keep);
+  if (!ids.length) ids = MODEL_ORDER.slice();          // 방어: 전부 숨겨졌으면 무시
+  sel.innerHTML = "";
+  ids.forEach(m => {
+    const opt = document.createElement("option");
+    opt.value = m;
+    opt.textContent = (MODEL_LABELS[m] || m) + (hidden.has(m) ? " (숨김)" : "");
+    sel.appendChild(opt);
+  });
+  if (ids.includes(keep)) sel.value = keep;
+}
+
+// What a model starts on when the user switches TO it. The user's per-model
+// choice wins when it is valid for that model; otherwise the highest quality
+// (the v2026-08-05 rule that fixed "4K 모델인데 하위 화질에 갇힘"). A loaded
+// project's own stored resolution always beats this — load paths pass explicit
+// values, and this only fills the gaps.
+function preferredResolution(model) {
+  const spec = getModelSpec(model);
+  const pref = (_modelPrefs.default_res || {})[migrateModelId(model)];
+  if (pref && (spec.resolutions || []).includes(pref)) return pref;
+  return bestResolution(spec);
+}
 
 // The Gemini API token is "512px" (NOT "0.5K" — verified: 0.5K returns 400).
 // v2026-06-12 01/02 shipped the wrong "0.5K" token; migrate it back here.
@@ -1152,7 +1218,7 @@ function applyModelSpec(model, preserved) {
   // H8: migrate the wrong "0.5K" token (shipped v1201/02) back to "512px".
   const prefRes = preserved ? migrateResolution(preserved.resolution) : undefined;
   repopulateSelect("aspectSelect",     spec.aspects,     preserved?.aspect, spec.defaultAspect);
-  repopulateSelect("resolutionSelect", spec.resolutions, prefRes,           spec.defaultResolution);
+  repopulateSelect("resolutionSelect", spec.resolutions, prefRes,           preferredResolution(model));
   const rw = document.getElementById("resolutionWrap");
   if (rw) rw.style.display = (spec.showResolution === false) ? "none" : "";
   const bgRow = document.getElementById("reveBgRow");
@@ -1199,13 +1265,102 @@ function bestResolution(spec) {
   return best || list[list.length - 1];
 }
 
+// ---- 모델 설정 모달 -------------------------------------------------------
+// One screen, one row per model: [show] [name] [starting resolution]. Saved
+// server-side into prefs.json, so it holds across restarts, app updates, and
+// every project tab at once.
+function openModelPrefs() {
+  const box = document.getElementById("modelPrefsRows");
+  if (!box) return;
+  box.innerHTML = "";
+  const hidden = new Set(_modelPrefs.hidden || []);
+  const cur = migrateModelId(document.getElementById("modelSelect").value);
+  MODEL_ORDER.forEach(m => {
+    const spec = getModelSpec(m);
+    const row = document.createElement("div");
+    row.className = "mp-row";
+
+    const chk = document.createElement("input");
+    chk.type = "checkbox";
+    chk.id = "mp_show_" + m;
+    chk.checked = !hidden.has(m);
+    chk.dataset.model = m;
+
+    const name = document.createElement("label");
+    name.className = "mp-name";
+    name.setAttribute("for", chk.id);
+    name.textContent = MODEL_LABELS[m] || m;
+    if (m === cur) {
+      const tag = document.createElement("span");
+      tag.className = "mp-current";
+      tag.textContent = "사용 중";
+      name.appendChild(tag);
+    }
+
+    const resSel = document.createElement("select");
+    resSel.className = "mp-res";
+    resSel.dataset.model = m;
+    const resList = (spec.resolutions || []).filter(r => r !== "auto");
+    if (spec.showResolution === false || resList.length <= 1) {
+      // Reve(화질 없음)나 1K 단일 모델은 고를 게 없다.
+      resSel.disabled = true;
+      const o = document.createElement("option");
+      o.value = ""; o.textContent = resList.length === 1 ? resList[0] + " 고정" : "—";
+      resSel.appendChild(o);
+    } else {
+      const oBest = document.createElement("option");
+      oBest.value = ""; oBest.textContent = "최고 화질 (기본)";
+      resSel.appendChild(oBest);
+      resList.forEach(r => {
+        const o = document.createElement("option");
+        o.value = r; o.textContent = r;
+        resSel.appendChild(o);
+      });
+      const pref = (_modelPrefs.default_res || {})[m] || "";
+      resSel.value = resList.includes(pref) ? pref : "";
+    }
+
+    row.append(chk, name, resSel);
+    box.appendChild(row);
+  });
+  document.getElementById("modelPrefsModal").classList.remove("hidden");
+}
+
+function closeModelPrefs() {
+  document.getElementById("modelPrefsModal").classList.add("hidden");
+}
+
+async function saveModelPrefs() {
+  const box = document.getElementById("modelPrefsRows");
+  const hidden = [...box.querySelectorAll("input[type=checkbox]")]
+    .filter(c => !c.checked).map(c => c.dataset.model);
+  if (hidden.length >= MODEL_ORDER.length) {
+    showToast("모델을 전부 숨길 수는 없습니다 — 최소 1개는 남겨주세요", "warn");
+    return;
+  }
+  const default_res = {};
+  box.querySelectorAll("select.mp-res").forEach(sel => {
+    if (!sel.disabled && sel.value) default_res[sel.dataset.model] = sel.value;
+  });
+  const d = await api("/api/model-prefs", { method: "POST", body: { hidden, default_res } });
+  if (!d.ok) { showToast(d.error || "저장 실패", "error"); return; }
+  _modelPrefs = { hidden: d.hidden || [], default_res: d.default_res || {} };
+  // The dropdown reflects the change immediately; the model in use stays put
+  // even if it was just hidden (tagged), so nothing on screen breaks.
+  rebuildModelSelect(document.getElementById("modelSelect").value);
+  closeModelPrefs();
+  showToast("모델 설정 저장됨 — 모든 프로젝트에 적용", "success");
+}
+
 function onModelChange() {
   const model = document.getElementById("modelSelect").value;
-  const spec = getModelSpec(model);
   // 종횡비는 모델과 무관한 '모양'이므로 유지한다(새 모델이 못 받는 값일 때만
-  // repopulateSelect가 기본값으로 떨어뜨린다).
-  applyModelSpec(model, { resolution: bestResolution(spec) });
+  // repopulateSelect가 기본값으로 떨어뜨린다). 화질은 사용자의 모델별 기본값이
+  // 있으면 그것, 없으면 최고 화질.
+  applyModelSpec(model, { resolution: preferredResolution(model) });
   saveSettings();
+  // 숨김 모델에서 빠져나왔으면 "(숨김)" 항목을 목록에서 걷어낸다.
+  rebuildModelSelect(model);
 }
 
 // ==========================================
@@ -1650,6 +1805,8 @@ function updateRemovePromptBtn() {
 }
 
 function resetSetup() {
+  // 기본 모델이 숨겨져 있어도 리셋이 조용히 실패하지 않게 목록부터 재구성.
+  rebuildModelSelect("gemini-3-pro-image");
   document.getElementById("modelSelect").value = "gemini-3-pro-image";
   applyModelSpec("gemini-3-pro-image");
   // Close the mention menu if it was open over a box we're about to wipe —
@@ -3617,7 +3774,15 @@ async function refreshApiStatus() {
   document.getElementById("vertexDot").className = "dot " + d.vertex;
   document.getElementById("studioDot").className = "dot " + d.studio;
   const openaiDot = document.getElementById("openaiDot");
-  if (openaiDot) openaiDot.className = "dot " + (d.openai || "disconnected");
+  if (openaiDot) {
+    openaiDot.className = "dot " + (d.openai || "disconnected");
+    // A red dot with no explanation reads as "my key is broken". When the key
+    // is only a ticket into the company server, the real reason is usually
+    // "that server is not reachable from here" — say so.
+    openaiDot.title = d.openai_detail || "";
+    const row = openaiDot.closest(".api-row") || openaiDot.parentElement;
+    if (row) row.title = d.openai_detail || "";
+  }
   const seedreamDot = document.getElementById("seedreamDot");
   if (seedreamDot) seedreamDot.className = "dot " + (d.seedream || "disconnected");
   const reveDot = document.getElementById("reveDot");

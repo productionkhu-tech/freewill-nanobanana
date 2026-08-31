@@ -368,6 +368,65 @@ def _normalize_model_name(m):
         return m
     return _MODEL_RENAMES.get(m, m)
 
+# Every model the app knows. NEW MODEL CHECKLIST (2 steps, both one-liners):
+#   1. static/app.js MODEL_SPECS 에 스펙 추가  <- 드롭다운/설정 모달은 여기서 파생
+#   2. 이 튜플에 id 추가                        <- "전부 숨김" 방지 기준
+# That is all: it appears at the BOTTOM of the dropdown, visible, starting on
+# its highest quality. Prefs accept unknown-but-plausible ids too, so a lagging
+# build cannot lose a user's choice for a newer model.
+_ALL_MODEL_IDS = (
+    "gemini-2.5-flash-image",
+    "gemini-3-pro-image",
+    "gemini-3.1-flash-image",
+    "gemini-3.1-flash-lite-image",
+    "seedream-5-0-pro-260628",
+    "seedream-4-5-251128",
+    "gpt-image-2",
+    "reve-create",
+)
+_RES_TOKENS = {"512px", "1K", "2K", "4K", "auto"}
+
+
+_MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
+
+
+def _plausible_model_id(m):
+    """Also accept ids this build has never heard of, as long as they LOOK like
+    a model id. When a future release adds a model, the frontend learns it
+    first (MODEL_SPECS is the single registry there) — the user must be able to
+    hide it or pick its starting quality even if this list lags a build behind.
+    Junk strings are still refused, and hiding a nonexistent model is harmless:
+    the dropdown only ever filters what the frontend actually offers."""
+    return m in _ALL_MODEL_IDS or bool(_MODEL_ID_RE.match(m))
+
+
+def _sanitize_model_prefs(mp):
+    """Whatever arrives (an old prefs.json, a hand-edited file, a buggy POST)
+    comes out as a safe, well-formed prefs dict. Bogus tokens are dropped
+    rather than stored - the frontend re-checks against the live model spec
+    anyway, so a stale value can only ever fall back to "highest", never lock
+    the UI."""
+    hidden, default_res = [], {}
+    raw_hidden = mp.get("hidden") if isinstance(mp, dict) else None
+    if isinstance(raw_hidden, list):
+        for m in raw_hidden[:32]:
+            m = _normalize_model_name(str(m).strip())
+            if _plausible_model_id(m) and m not in hidden:
+                hidden.append(m)
+    # Refuse to hide the whole KNOWN catalogue - an empty dropdown is a dead
+    # app. Unknown ids do not count toward this: hiding them filters nothing.
+    if len([m for m in hidden if m in _ALL_MODEL_IDS]) >= len(_ALL_MODEL_IDS):
+        hidden = []
+    raw_res = mp.get("default_res") if isinstance(mp, dict) else None
+    if isinstance(raw_res, dict):
+        for k, v in list(raw_res.items())[:32]:
+            k = _normalize_model_name(str(k).strip())
+            v = str(v).strip()
+            if _plausible_model_id(k) and v in _RES_TOKENS:
+                default_res[k] = v
+    return {"hidden": hidden, "default_res": default_res}
+
+
 
 def _to_display_image(img):
     """Normalize a PIL image for in-app display / storage while PRESERVING
@@ -518,6 +577,14 @@ class _Shared:
         self.skip_delete_confirm = False
         self.prompt_history = []
         self.max_prompt_history = 50
+        # Which models the dropdown shows, and the resolution a model starts on
+        # when the user switches to it. App-wide on purpose: these describe the
+        # PERSON's taste, not a project's content, so every tab shares them and
+        # a project file never carries them. Persisted in prefs.json, which an
+        # EXE swap never touches - so neither a restart nor an update resets it.
+        #   hidden      : ["gemini-2.5-flash-image", ...]
+        #   default_res : {"gemini-3-pro-image": "2K", ...}  ("" = highest)
+        self.model_prefs = {"hidden": [], "default_res": {}}
 
         # Window-level flags
         self.always_on_top = False
@@ -677,7 +744,11 @@ class AppState:
 
     # --- Persisted preferences (skip_delete_confirm, prompt_history) ---
     def _prefs_file(self):
-        d = os.path.join(os.path.expanduser("~"), ".nanobanana")
+        # Through _user_data_dir() so NANOBANANA_DATA_DIR redirects prefs too.
+        # This hardcoded ~/.nanobanana was a hole in the test isolation: a test
+        # run wrote its throwaway model prefs into the REAL prefs.json
+        # (2026-08-31, third incident of tests reaching live state).
+        d = _user_data_dir()
         try:
             os.makedirs(d, exist_ok=True)
         except Exception:
@@ -692,6 +763,9 @@ class AppState:
             hist = data.get("prompt_history", [])
             if isinstance(hist, list):
                 self.prompt_history = [str(x) for x in hist][: self.max_prompt_history]
+            mp = data.get("model_prefs")
+            if isinstance(mp, dict):
+                self.model_prefs = _sanitize_model_prefs(mp)
         except Exception:
             pass
 
@@ -701,6 +775,7 @@ class AppState:
             data = {
                 "skip_delete_confirm": self.skip_delete_confirm,
                 "prompt_history": self.prompt_history,
+                "model_prefs": self.model_prefs,
             }
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -2739,6 +2814,7 @@ _SHARED_ATTRS = (
     "openai_detail",
     "logs", "log_lock", "progress_events", "progress_lock",
     "skip_delete_confirm", "prompt_history", "max_prompt_history",
+    "model_prefs",
     "always_on_top", "close_requested",
     "temp_ref_dir", "temp_ref_paths", "project_default_save_dir",
 )
@@ -5262,6 +5338,38 @@ def close_requested():
     # Reset after read so the dialog only triggers once per click
     state.close_requested = False
     return jsonify({"close_requested": requested})
+
+
+@app.route("/api/model-prefs")
+def get_model_prefs():
+    """Model visibility + per-model starting resolution. App-wide: the answer
+    is identical no matter which tab asks, and a project file never stores it -
+    that is what keeps every open project seeing the same dropdown."""
+    return jsonify({
+        "ok": True,
+        "hidden": list(state.model_prefs.get("hidden", [])),
+        "default_res": dict(state.model_prefs.get("default_res", {})),
+        "all_models": list(_ALL_MODEL_IDS),
+    })
+
+
+@app.route("/api/model-prefs", methods=["POST"])
+def set_model_prefs():
+    d = request.get_json(silent=True) or {}
+    cleaned = _sanitize_model_prefs(d)
+    raw_hidden = d.get("hidden")
+    if (isinstance(raw_hidden, list)
+            and len([m for m in raw_hidden if _normalize_model_name(str(m)) in _ALL_MODEL_IDS])
+            >= len(_ALL_MODEL_IDS)):
+        # The sanitizer silently un-hides everything in this case; tell the
+        # user instead so the save does not look like it worked.
+        return jsonify({"ok": False, "error": "모델을 전부 숨길 수는 없습니다"})
+    state.model_prefs = cleaned
+    state.save_prefs()
+    state.log("Model prefs saved: %d hidden, %d default resolutions"
+              % (len(cleaned["hidden"]), len(cleaned["default_res"])))
+    return jsonify({"ok": True, "hidden": cleaned["hidden"],
+                    "default_res": cleaned["default_res"]})
 
 
 @app.route("/api/delete-confirm-state")

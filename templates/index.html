@@ -41,7 +41,10 @@
     <div class="sidebar-scroll">
 
       <!-- Model -->
-      <div class="section-title">Model</div>
+      <div class="section-title model-title">
+        <span>Model</span>
+        <button class="model-cfg-btn" onclick="openModelPrefs()" title="모델 표시 / 기본 화질 설정">&#9881;</button>
+      </div>
       <select id="modelSelect" onchange="onModelChange()">
         <option value="gemini-2.5-flash-image">gemini-2.5-flash-image</option>
         <option value="gemini-3-pro-image" selected>gemini-3-pro-image</option>
@@ -394,6 +397,22 @@
       <button class="btn-sm" onclick="answerSaveBeforeClose('cancel')">취소</button>
       <button class="btn-sm" onclick="answerSaveBeforeClose('discard')">저장 안 함</button>
       <button class="btn-accent-sm" onclick="answerSaveBeforeClose('save')">저장</button>
+    </div>
+  </div>
+</div>
+
+<!-- MODEL PREFS (which models show + starting resolution; app-wide) -->
+<div id="modelPrefsModal" class="close-modal hidden">
+  <div class="close-dialog mp-dialog">
+    <h2>모델 설정</h2>
+    <p class="close-desc">체크를 끄면 목록에서 숨겨지고, 화질은 그 모델로 바꿀 때 처음 선택될 값입니다.<br>
+      모든 프로젝트에 함께 적용되며, 앱을 껐다 켜거나 업데이트해도 유지됩니다.</p>
+    <div class="mp-head"><span>표시</span><span>모델</span><span>시작 화질</span></div>
+    <div id="modelPrefsRows" class="mp-rows"></div>
+    <p class="hint">숨긴 모델을 쓰던 프로젝트는 계속 그 모델로 동작합니다 — 목록에 "(숨김)"으로 남습니다.</p>
+    <div class="close-buttons">
+      <button class="btn-sm" onclick="closeModelPrefs()">취소</button>
+      <button class="btn-accent-sm" onclick="saveModelPrefs()">저장</button>
     </div>
   </div>
 </div>

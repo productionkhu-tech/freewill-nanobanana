@@ -2037,3 +2037,52 @@ footer {
 }
 .rn-notes li::marker { color: var(--accent); }
 .rn-empty  { color: var(--text3); text-align: center; padding: 8px 0; }
+
+/* ---- Model prefs (gear next to the Model title + the settings modal) ---- */
+.section-title.model-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.model-cfg-btn {
+  border: none;
+  background: none;
+  color: var(--text3);
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.model-cfg-btn:hover { color: var(--accent); }
+.mp-dialog { min-width: 380px; }
+.mp-head, .mp-row {
+  display: grid;
+  grid-template-columns: 34px 1fr 132px;
+  align-items: center;
+  gap: 6px;
+}
+.mp-head {
+  font-size: 10px;
+  color: var(--text3);
+  text-transform: uppercase;
+  letter-spacing: .3px;
+  padding: 0 2px 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+.mp-rows { display: flex; flex-direction: column; gap: 4px; max-height: 320px; overflow-y: auto; }
+.mp-row { padding: 3px 2px; border-radius: 6px; }
+.mp-row:hover { background: var(--surface2); }
+.mp-row input[type=checkbox] { margin: 0 auto; cursor: pointer; }
+.mp-name { font-size: 12px; color: var(--text); cursor: pointer; display: flex; align-items: center; gap: 6px; }
+.mp-current {
+  font-size: 9px;
+  color: var(--bg);
+  background: var(--accent);
+  border-radius: 6px;
+  padding: 1px 5px;
+  font-weight: bold;
+}
+.mp-res { font-size: 11px; height: 24px; }
+.mp-res:disabled { opacity: .45; }

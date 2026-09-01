@@ -12,6 +12,7 @@ import json
 import math
 import re
 import subprocess
+import tempfile
 
 import time
 import random
@@ -1223,20 +1224,60 @@ class AppState:
                 parts.append(self.ref_bytes_to_part(rd))
         return parts or [types.Part.from_text(text=prompt)]
 
+    def _find_identical_ref(self, pil):
+        """Slot index already holding this exact picture, or None.
+
+        The filename dedup (SHA1 of the source bytes) cannot see a clipboard
+        round-trip: copying a ref out and pasting it back re-encodes it —
+        Windows hands over a DIB, which the page re-saves as PNG — so the bytes
+        differ while every pixel is the same. Measured: a 1200x900 JPEG came
+        back with a different SHA1 but a byte-identical pixel buffer, and took
+        a second slot. Comparing decoded pixels closes that.
+
+        Cheap: the size+mode pre-filter rejects almost every candidate before
+        any pixel work, so the common add (a picture unlike the others) does
+        none. Exact comparison, so it can never refuse a different image.
+        Caller must hold ref_lock.
+        """
+        try:
+            key = (pil.size, pil.mode)
+            raw = None
+            for i, existing in enumerate(self.ref_images):
+                if existing is None or (existing.size, existing.mode) != key:
+                    continue
+                if raw is None:
+                    raw = pil.tobytes()
+                if existing.tobytes() == raw:
+                    return i
+        except Exception:
+            # A compare that blew up must never block a legitimate add.
+            return None
+        return None
+
     def add_ref_image(self, filepath, pinned=False, slot=None):
+        """Bool-only wrapper — most callers just want "did it land?"."""
+        ok, _reason = self.add_ref_image_ex(filepath, pinned=pinned, slot=slot)
+        return ok
+
+    def add_ref_image_ex(self, filepath, pinned=False, slot=None):
         """Add a ref image as a NEW slot at the end. A generic add never fills
         an existing hole — empty slots left by a delete are only filled by an
         explicit drop/click on that slot's placeholder (which goes through
         replace_ref, not here). Pass `slot` to place at a specific index —
-        used by project load to restore exact slot positions, holes included."""
+        used by project load to restore exact slot positions, holes included.
+
+        Returns (ok, reason) with reason in {None, "duplicate", "limit",
+        "unreadable"} so a route can tell the user WHY nothing happened. The
+        early-outs used to only reach the server log, which is how a refused
+        drop looked like a silent failure."""
         with self.ref_lock:
             if filepath in self.ref_path_list:
                 self.log(f"Ref already added: {os.path.basename(filepath)}")
-                return False
+                return False, "duplicate"
             limit = self.get_ref_limit()
             if slot is None and self._filled_ref_count() >= limit:
                 self.log(f"Max {limit} reference images")
-                return False
+                return False, "limit"
             try:
                 with Image.open(filepath) as img:
                     # Preserve alpha — PNG logos/icons should stay as
@@ -1244,7 +1285,16 @@ class AppState:
                     pil = _to_display_image(img)
             except Exception as e:
                 self.log(f"Ref load failed: {str(e)[:80]}")
-                return False
+                return False, "unreadable"
+            # A generic add must not sneak in a picture that is already loaded.
+            # Explicit slot placement (project load) is exempt: a saved project
+            # decides its own slots, and silently dropping one there would cost
+            # the user an image the file legitimately contains.
+            if slot is None:
+                twin = self._find_identical_ref(pil)
+                if twin is not None:
+                    self.log(f"Ref already added (same image as slot {twin + 1})")
+                    return False, "duplicate"
             if slot is not None:
                 # Explicit slot placement (load): grow the lists with holes.
                 while len(self.ref_images) <= slot:
@@ -1261,7 +1311,7 @@ class AppState:
                 self.ref_path_list.append(filepath)
                 self.ref_pinned.append(bool(pinned))
             self.project_dirty = True
-            return True
+            return True, None
 
     def remove_ref(self, idx):
         # Delete = empty the slot (set to None), do NOT compact. Other slots
@@ -3400,9 +3450,10 @@ def download_ref_url():
                 "error": f"Max {limit} reference images (drop on a slot to replace)",
                 "limit_reached": True,
             })
-    if state.add_ref_image(fp):
+    ok, reason = state.add_ref_image_ex(fp)
+    if ok:
         return jsonify({"ok": True, "added": 1})
-    return jsonify({"ok": False, "error": "Could not add"})
+    return jsonify({"ok": False, "error": _REF_ADD_ERRORS.get(reason, "추가할 수 없습니다")})
 
 
 @app.route("/api/browse-replace-ref", methods=["POST"])
@@ -3441,14 +3492,25 @@ def browse_replace_ref():
         return jsonify({"ok": False, "error": str(e)[:80]})
 
 
+# Why an add was refused, in the user's words. Without these a refusal reached
+# the page as a bare {"ok": false} and read as "it just broke".
+_REF_ADD_ERRORS = {
+    "duplicate": "이미 추가된 이미지입니다",
+    "limit": "레퍼런스 개수가 가득 찼습니다",
+    "unreadable": "이미지를 읽을 수 없습니다",
+}
+
+
 @app.route("/api/refs/add-path", methods=["POST"])
 def add_ref_path():
     d = request.get_json(silent=True) or {}
     fp = d.get("filepath", "")
     if not fp or not os.path.exists(fp):
         return jsonify({"ok": False, "error": "File not found"})
-    ok = state.add_ref_image(fp)
-    return jsonify({"ok": ok})
+    ok, reason = state.add_ref_image_ex(fp)
+    if ok:
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": _REF_ADD_ERRORS.get(reason, "추가할 수 없습니다")})
 
 
 @app.route("/api/refs/<int:idx>", methods=["DELETE"])
@@ -3945,8 +4007,10 @@ def use_as_ref():
                 "error": f"Max {limit} reference images (drop on a slot to replace)",
                 "limit_reached": True,
             })
-    ok = state.add_ref_image(fp)
-    return jsonify({"ok": ok})
+    ok, reason = state.add_ref_image_ex(fp)
+    if ok:
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": _REF_ADD_ERRORS.get(reason, "추가할 수 없습니다")})
 
 
 @app.route("/api/refs/replace-from-path/<int:idx>", methods=["POST"])
@@ -5255,37 +5319,48 @@ def log_message():
 
 
 # --- Clipboard copy ---
-@app.route("/api/copy-to-clipboard", methods=["POST"])
-def copy_to_clipboard():
-    d = request.get_json(silent=True) or {}
-    fp = d.get("filepath", "")
-    if not fp or not os.path.exists(fp):
-        return jsonify({"ok": False, "error": "File not found"})
+def _clipboard_put_pil(pil):
+    """Put a PIL image on the system clipboard at its FULL resolution.
+
+    One implementation for both clipboard callers (gallery card copy and ref
+    slot copy) so they can never drift apart. Takes a PIL image rather than a
+    path because a ref may have no readable file behind it (clipboard paste,
+    or an external file the user moved after adding it) — the same reason
+    /api/refs/preview serves from memory.
+
+    Returns (ok, error).
+    """
     if sys.platform == "darwin":
-        # Right-click copy and the viewer's Cmd+C used to answer "Windows only".
         # AppleScript puts real image data on the pasteboard, so it pastes into
-        # Preview / Keynote / Slack the same way it does on Windows.
-        script = (
-            'set the clipboard to (read (POSIX file "%s") as «class PNGf»)'
-            % fp.replace('"', '\\"')
-        )
+        # Preview / Keynote / Slack the same way it does on Windows. Encode to
+        # PNG ourselves instead of reading the source file: `read ... as PNGf`
+        # tags whatever bytes it finds AS png, which is wrong for a JPEG ref.
+        tmp = os.path.join(tempfile.gettempdir(),
+                           "nb_clip_%d.png" % int(time.time() * 1000))
         try:
+            _to_display_image(pil).save(tmp, "PNG")   # alpha survives on mac
+            script = ('set the clipboard to (read (POSIX file "%s") as «class PNGf»)'
+                      % tmp.replace('"', '\\"'))
             r = subprocess.run(["osascript", "-e", script],
                                capture_output=True, text=True, timeout=30)
         except Exception as e:
-            return jsonify({"ok": False, "error": str(e)[:80]})
+            return False, str(e)[:80]
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
         if r.returncode != 0:
-            return jsonify({"ok": False, "error": "클립보드 복사 실패"})
-        state.log(f"Copied to clipboard: {os.path.basename(fp)}")
-        return jsonify({"ok": True})
+            return False, "클립보드 복사 실패"
+        return True, None
     if sys.platform != "win32":
-        return jsonify({"ok": False, "error": "Windows/macOS only"})
+        return False, "Windows/macOS only"
 
     try:
         import ctypes
         from ctypes import wintypes
-        with Image.open(fp) as img:
-            image = _to_rgb_flatten(img)
+        # CF_DIB carries no alpha, so transparency must be flattened here.
+        image = _to_rgb_flatten(pil)
         output = io.BytesIO()
         image.save(output, "BMP")
         data = output.getvalue()[14:]
@@ -5337,9 +5412,49 @@ def copy_to_clipboard():
             user32.CloseClipboard()
             if h:
                 kernel32.GlobalFree(h)
-        return jsonify({"ok": True})
+        return True, None
+    except Exception as e:
+        return False, str(e)[:80]
+
+
+@app.route("/api/copy-to-clipboard", methods=["POST"])
+def copy_to_clipboard():
+    d = request.get_json(silent=True) or {}
+    fp = d.get("filepath", "")
+    if not fp or not os.path.exists(fp):
+        return jsonify({"ok": False, "error": "File not found"})
+    try:
+        with Image.open(fp) as img:
+            img.load()
+            pil = img.copy()
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)[:80]})
+    ok, err = _clipboard_put_pil(pil)
+    if ok:
+        state.log(f"Copied to clipboard: {os.path.basename(fp)}")
+    return jsonify({"ok": ok} if ok else {"ok": False, "error": err})
+
+
+@app.route("/api/refs/copy/<int:idx>", methods=["POST"])
+def copy_ref_to_clipboard(idx):
+    """Right-click a ref slot -> put that reference on the clipboard, full size.
+
+    Served from the in-memory PIL, which is the ORIGINAL-resolution image (refs
+    are never downscaled on the way in — only the 100px thumbnail and the
+    <=2048px hover preview are). Index-based rather than path-based so it works
+    for every ref source and survives the source file being moved or deleted.
+    """
+    with state.ref_lock:
+        if idx < 0 or idx >= len(state.ref_images) or state.ref_images[idx] is None:
+            return jsonify({"ok": False, "error": "Empty slot"})
+        pil = state.ref_images[idx].copy()
+        fp = state.ref_path_list[idx] or ""
+    ok, err = _clipboard_put_pil(pil)
+    if not ok:
+        return jsonify({"ok": False, "error": err})
+    state.log("Copied ref %d to clipboard (%dx%d)" % (idx + 1, pil.size[0], pil.size[1]))
+    return jsonify({"ok": True, "w": pil.size[0], "h": pil.size[1],
+                    "filename": os.path.basename(fp)})
 
 
 # ==========================================

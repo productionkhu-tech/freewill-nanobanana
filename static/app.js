@@ -2547,6 +2547,15 @@ async function refreshRefs() {
     // Hover -> large preview beside the cell (all ref sources, file-independent)
     _wireRefHover(cell, media, i, ref, _stamp);
 
+    // Right-click = copy this reference to the clipboard at full resolution,
+    // matching the gallery card. The hover preview is showing at this moment,
+    // so drop it or it sits on top of the toast.
+    cell.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      hideRefHover();
+      copyRefToClipboard(i);
+    });
+
     // [Image N] label
     const lbl = document.createElement("div");
     lbl.className = "ref-label";
@@ -3427,7 +3436,10 @@ async function toggleFav(fp, btn) {
 
 async function useAsRef(fp) {
   const d = await api("/api/gallery/use-as-ref", { method: "POST", body: { filepath: fp } });
+  // A refusal (already loaded / slots full) used to show nothing at all, which
+  // reads as the click having been swallowed.
   if (d.ok) { refreshRefs(); showToast("Added as reference", "success"); }
+  else showToast(d.error || "추가할 수 없습니다", "warn");
 }
 
 async function openInExplorer(fp) {
@@ -3448,6 +3460,15 @@ async function loadSetup(fp) {
 async function copyToClipboard(fp) {
   const d = await api("/api/copy-to-clipboard", { method: "POST", body: { filepath: fp } });
   showToast(d.ok ? "Copied to clipboard" : (d.error || "Failed"), d.ok ? "success" : "error");
+}
+
+// Ref slots are addressed by INDEX, not path: a ref may have been pasted from
+// the clipboard or point at a file the user has since moved, and the in-memory
+// copy is the original-resolution one either way.
+async function copyRefToClipboard(idx) {
+  const d = await api(`/api/refs/copy/${idx}`, { method: "POST" });
+  showToast(d.ok ? `[Image ${idx + 1}] 원본 복사됨 (${d.w}×${d.h})` : (d.error || "복사 실패"),
+            d.ok ? "success" : "error");
 }
 
 async function showPromptPopup(prompt, filename) {

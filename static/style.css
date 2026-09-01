@@ -1399,11 +1399,9 @@ textarea.prompt-box { min-height: 82px; }
   height: 28px;
   border-radius: 8px;
 }
-/* Gallery-header entry: quiet ghost pill so it doesn't fight the page title
 
 .cmp-btn { background: #1e1e22; color: #ccc; border: 1px solid #2a2a2e; border-radius: 6px; padding: 6px 12px; font-size: 12px; cursor: pointer; white-space: nowrap; }
 .cmp-btn:hover { background: #2a2a2e; color: #fff; }
-/* Debug log drawer — above the busy overlay (z 7000) so failures can be
 
 /* === Favorite: bg #17130B, text #F6D36B, border #6C5830 === */
 .card-btn.fav {

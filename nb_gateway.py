@@ -226,7 +226,12 @@ def _persist_windows_env(name, value):
     launches until the next sign-in."""
     import subprocess
     try:
-        r = subprocess.run(["setx", name, value], capture_output=True, text=True,
+        # Discard setx's output instead of decoding it: on a Korean Windows it
+        # comes back in cp949, and capturing it as text blew up in subprocess's
+        # reader thread the moment the interpreter's default encoding was UTF-8.
+        # Nothing here ever reads that output — only the exit code matters.
+        r = subprocess.run(["setx", name, value],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            timeout=30, creationflags=0x08000000)  # no console window
         return r.returncode == 0
     except Exception:

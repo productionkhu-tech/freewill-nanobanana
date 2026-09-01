@@ -893,8 +893,6 @@ async function loadSettings() {
     count: String(d.count),
     quality: d.quality || "high",
   });
-  const _bgc = document.getElementById("reveBgRemoveChk");
-  if (_bgc) _bgc.checked = !!d.reve_bg_remove;
   // H7: applyModelSpec() above already populated AND selected each dropdown
   // (loaded value, else this model's default). Raw-setting .value here would
   // bypass that fallback and blank out any value the model no longer offers
@@ -1058,18 +1056,10 @@ const MODEL_SPECS = {
     hint: "OpenAI Image API — generation may take up to ~2 min.",
     refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
   },
-  "reve-create": {
-    aspects: ["auto","4:1","3:1","21:9","2:1","17:9","16:9","3:2","4:3","5:4","1:1","4:5","3:4","2:3","9:16","1:2","1:3","1:4"],
-    resolutions: ["auto"],
-    counts: ["1","2","3","4","5","6","7","8","9","10"],
-    showQuality: false,
-    showResolution: false,
-    showBgRemove: true,
-    defaultAspect: "16:9", defaultResolution: "auto",
-    hint: "Reve 2.1 — text & reference-to-image. Wide aspects (4:1..1:4). ~40-80s/image.",
-    refHint: "Up to 8 reference images. Describe them in the prompt (no [Image N] tags).",
-  },
 };
+// (Reve 2.1 removed 2026-09-01 — Reve shut down its API service. Old projects
+// that still say reve-create are remapped server-side to the default model;
+// gallery cards KEEP their Reve badge/label so history stays honest.)
 
 // ==========================================
 // Model preferences (which models show + starting resolution per model)
@@ -1088,7 +1078,6 @@ const MODEL_LABELS = {
   "seedream-5-0-pro-260628": "seedream-5-0-pro",
   "seedream-4-5-251128": "seedream-4-5",
   "gpt-image-2": "gpt-image-2 (OpenAI)",
-  "reve-create": "Reve 2.1",
 };
 let _modelPrefs = { hidden: [], default_res: {} };
 
@@ -1187,47 +1176,7 @@ function repopulateSelect(id, values, preferred, fallback) {
   else sel.value = values[values.length - 1];
 }
 
-// Reve is budget-limited (not count-limited): total ref pixels <= 50.3M px AND
-// <= 100MB bytes across all refs. Show a live pixel gauge (bytes guarded server-side).
-const REVE_PX_BUDGET = 50331648;   // total across all refs
-const REVE_PX_PER_IMG = 33554432;  // per single image
-const REVE_DIM_MAX = 8192;         // each dimension, per image
-let _lastRefs = [];                // last /api/refs snapshot (for the budget gauge)
-function updateReveRefBudget(refs) {
-  const el = document.getElementById("reveRefBudget");
-  if (!el) return;
-  const model = document.getElementById("modelSelect").value;
-  if (model !== "reve-create") { el.style.display = "none"; return; }
-  let px = 0, n = 0; const bad = [];
-  (refs || []).forEach((r, i) => {
-    if (r && !r.empty && r.w && r.h) {
-      px += r.w * r.h; n++;
-      if (r.w * r.h > REVE_PX_PER_IMG || r.w > REVE_DIM_MAX || r.h > REVE_DIM_MAX) bad.push(i + 1);
-    }
-  });
-  el.style.display = "";
-  let msg = "Reve 레퍼런스 예산: " + (px / 1e6).toFixed(1) + "M / "
-          + (REVE_PX_BUDGET / 1e6).toFixed(1) + "M px (" + n + "장)";
-  if (bad.length) msg += " · " + bad.join(",") + "번 이미지 초과 (1장 33.5MP·8192px 한도)";
-  el.textContent = msg;
-  el.classList.toggle("hint-warn", px > REVE_PX_BUDGET || bad.length > 0);
-}
-
-// ============================================================
-// Reve layout editor — entry points only. The editor itself now
-// lives in its OWN window (/reve-editor + static/reve_editor.js)
-// so its close button can never be confused with the app's close
-// button. Single instance: JsApi.open_reve_editor reuses the
-// existing editor window (pywebview); the browser dev fallback
-// reuses a named window.
-// ============================================================
-let _reveOn = false;   // Reve API key present (from /api/status)
-// (Reve layout editor removed 2026-07-20 — generation only. History in
-// 인수인계_2026-07-15_Reve2.1.md; retired sources in _retired/.)
-// Reve-only sidebar toggle: remove_background postprocessing on generate.
-function onReveBgRemoveChange(v) {
-  api("/api/settings", { method: "POST", body: { reve_bg_remove: !!v } });
-}
+let _lastRefs = [];                // last /api/refs snapshot (Custom auto-fill reads it)
 
 function applyModelSpec(model, preserved) {
   const spec = getModelSpec(model);
@@ -1237,8 +1186,6 @@ function applyModelSpec(model, preserved) {
   repopulateSelect("resolutionSelect", spec.resolutions, prefRes,           preferredResolution(model));
   const rw = document.getElementById("resolutionWrap");
   if (rw) rw.style.display = (spec.showResolution === false) ? "none" : "";
-  const bgRow = document.getElementById("reveBgRow");
-  if (bgRow) bgRow.style.display = spec.showBgRemove ? "" : "none";
   repopulateSelect("countSelect",      spec.counts,      preserved?.count);
   if (spec.showQuality) {
     repopulateSelect("qualitySelect", ["low","medium","high","auto"], preserved?.quality, spec.defaultQuality || "high");
@@ -1258,7 +1205,6 @@ function applyModelSpec(model, preserved) {
   }
   // Show/hide the Custom pixel inputs for the current model+aspect.
   if (typeof toggleCustomWrap === "function") toggleCustomWrap();
-  updateReveRefBudget(_lastRefs);
 }
 
 // "1K/2K/4K"는 모델마다 실제 픽셀이 다른 라벨이므로(GPT 4K=8.29M, Seedream 4.5 4K=4096²,
@@ -1270,7 +1216,7 @@ const _RES_RANK = { "512px": 0, "1K": 1, "2K": 2, "4K": 3 };
 function bestResolution(spec) {
   const list = (spec && spec.resolutions) || [];
   if (!list.length) return undefined;
-  // 알려진 등급끼리는 순위로 비교하고, 목록에 없는 값(예: Reve의 "auto")은
+  // 알려진 등급끼리는 순위로 비교하고, 목록에 없는 값(예: "auto")은
   // 배열 순서를 신뢰해 마지막 항목으로 떨어진다.
   let best = null, bestRank = -1;
   for (const r of list) {
@@ -1318,7 +1264,7 @@ function openModelPrefs() {
     resSel.dataset.model = m;
     const resList = (spec.resolutions || []).filter(r => r !== "auto");
     if (spec.showResolution === false || resList.length <= 1) {
-      // Reve(화질 없음)나 1K 단일 모델은 고를 게 없다.
+      // 화질 선택지가 하나뿐인 모델은 고를 게 없다.
       resSel.disabled = true;
       const o = document.createElement("option");
       o.value = ""; o.textContent = resList.length === 1 ? resList[0] + " 고정" : "—";
@@ -2450,7 +2396,6 @@ async function refreshRefs() {
   refCount = d.count || 0;
   refSlotCount = d.slot_count || (d.refs ? d.refs.length : 0);
   _lastRefs = d.refs || [];
-  updateReveRefBudget(_lastRefs);
   refFilledSlots = new Set();
   (d.refs || []).forEach((ref, i) => { if (!ref.empty) refFilledSlots.add(i + 1); });
   // Auto-follow slot-1 dimensions into the Custom inputs (no chip click needed).
@@ -3810,10 +3755,6 @@ async function refreshApiStatus() {
   }
   const seedreamDot = document.getElementById("seedreamDot");
   if (seedreamDot) seedreamDot.className = "dot " + (d.seedream || "disconnected");
-  const reveDot = document.getElementById("reveDot");
-  if (reveDot) reveDot.className = "dot " + (d.reve || "disconnected");
-  _reveOn = (d.reve === "connected");
-  document.body.classList.toggle("reve-off", !_reveOn);
   _anyGenerating = !!d.any_generating;
   // Status is always the ACTIVE project's, so the placeholder count follows the
   // tab on screen: a background batch never steals or clears them.

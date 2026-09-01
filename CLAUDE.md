@@ -12,7 +12,8 @@
 - **실행**: onefile PyInstaller EXE (`NanoBanana.exe`) + 키 설치 스크립트
 - **프론트**: HTML/CSS/JS를 Flask가 서빙, pywebview(WebView2) 창에서 렌더
 - **백엔드**: Flask 127.0.0.1:5656, `app.py` 단일 파일에 상태+라우트 전부
-- **프로바이더 4사**: Google Gemini(Vertex/Studio) · OpenAI gpt-image-2 · BytePlus Seedream · Reve
+- **프로바이더 3사**: Google Gemini(Vertex/Studio) · OpenAI gpt-image-2 · BytePlus Seedream
+  (Reve는 2026-09 API 서비스 종료로 제거 — 구 프로젝트의 reve-create는 로드 시 기본 모델로 자동 폴백)
 - **멀티 프로젝트 탭**: 앱 상태는 `_Shared`(앱 전역) + 프로젝트별 `AppState` N개.
   `state`는 "이 요청이 다루는 프로젝트"를 가리키는 프록시라 기존 라우트는 그대로 동작
 - **배포**: GitHub Release에 EXE 업로드 → 사용자는 **앱을 껐다 켜기만 하면 자동 설치** (클릭 불필요)
@@ -107,7 +108,7 @@ gen_worker:
   - 종료 3분기: cancel이면 pending 폐기 / 레이스로 남은 pending 있으면 워커 재스폰 / 아니면 done
 
 각 워커 generate_one_image:
-  - 모델별 분기 → RateLimiter.acquire (Gemini 7.5s=8RPM, OpenAI 1.5s, Seedream·Reve 0.3s)
+  - 모델별 분기 → RateLimiter.acquire (Gemini 7.5s=8RPM, OpenAI 1.5s, Seedream 0.3s)
   - 재시도 최대 5회 (백오프 10→120s + 지터), Gemini는 vertex↔studio 폴백 + 무이미지 원인 로깅
 ```
 
@@ -258,10 +259,11 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 | Google AI Studio | 동일 모델군 | `NANOBANANA_STUDIO_KEY` |
 | OpenAI | gpt-image-2 | `OPENAI_API_KEY` |
 | BytePlus | seedream-5-0-pro / 4-5 | `ARK_API_KEY` |
-| Reve | reve-create | `REVE_API_KEY` |
 
 - Gemini는 10 RPM → 앱이 8 RPM으로 스로틀. **결제 미연결 시 Studio 429(limit:0) + Vertex 403(BILLING_DISABLED)**
-- Reve 402는 키 문제가 아니라 계정 예산 — 콘솔에서 충전
+- Reve는 2026-09 API 서비스 종료로 v2026-09-0101에서 완전 제거. `_RETIRED_MODEL_FALLBACK`이
+  저장물의 reve-create를 기본 모델로 폴백 (개명 맵 `_MODEL_RENAMES`와 다름 — prefs 키는 건드리지 않음).
+  과거 Reve 생성물의 갤러리 배지/라벨은 그대로 표시
 - Seedream 5.0 Pro 커스텀 크기 상한은 `2048²×1.1025 = 4,624,220px` (그냥 2048²로 두면 통과할 크기가 잘림)
 
 ### 6.2 맥 (소스 실행)
@@ -270,7 +272,7 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 - **python.org Python 3.10+ 필수.** Xcode 내장 3.9는 google-genai 1.47까지만 설치돼
   `image_size`(2K/4K)가 없어 Gemini가 즉사한다 → 앱이 시작 시 안내 후 종료
 - **SSL**: python.org 파이썬은 `Install Certificates.command` 를 안 돌리면 CA 번들이 비어
-  Reve 등 표준 urllib 경로가 전부 실패 → `server_mac.py`가 certifi 번들로 자동 보정
+  표준 urllib 경로(업데이트 체크 등)가 전부 실패 → `server_mac.py`가 certifi 번들로 자동 보정
 - 업데이트: 실행 시 `git pull --ff-only` (clone 설치 한정). **진입 스크립트 특성상 pull 받은 다음 실행부터 적용**
 
 ### 6.3 문서 지도
@@ -280,7 +282,7 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 | `.claude/skills/나노바나나api배포/SKILL.md` | 배포 실행 절차 + 스크립트 전문 |
 | `인수인계_2026-07-30_전체.md` | 현행 인수인계 (제품 현황·최근 이력·다음 할 일) |
 | `맥_실행_가이드.md` | 맥 고객 배포용 안내 |
-| `Reve API 문서.md` / `seedream *.md` / `API_레퍼런스_종횡비.md` | 외부 API 스펙 + 실측 주석 |
+| `seedream *.md` / `API_레퍼런스_종횡비.md` | 외부 API 스펙 + 실측 주석 (`Reve API 문서.md`는 서비스 종료로 이력용) |
 | `인수인계_2026-07-15/20_*.md`(구) | 과거 스냅샷 — 이력 참고용 |
 
 ---

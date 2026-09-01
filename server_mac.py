@@ -60,7 +60,7 @@ def _fix_ssl_certs():
     """python.org macOS Python ships with an EMPTY CA bundle until the user
     runs 'Install Certificates.command' - most people skip that step. The SDK
     providers (Gemini/OpenAI/Seedream via httpx) bundle certifi so they still
-    work, but Reve and every other plain-urllib call in app.py dies with
+    work, but every plain-urllib call in app.py (update check etc.) dies with
     CERTIFICATE_VERIFY_FAILED (seen live 2026-07-21). Point the stdlib ssl
     default-context lookup at certifi's bundle (certifi is always present as
     an openai/httpx dependency). keys.env can override by setting

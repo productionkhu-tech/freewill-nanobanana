@@ -12,8 +12,8 @@ description: NanoBanana 정식 배포(릴리스) 절차 전체 — VERSION bump 
 
 - `GH_TOKEN` 환경변수 (GitHub 토큰) — 없으면 릴리스 생성/업로드 불가, 사용자에게 요청
 - 빌드 venv: `C:\NanoBanana_build\venv\Scripts\python.exe` (CLAUDE.md의 venv_build 표기는 낡은 것)
-- Reve 키 bat: `레베 api key.bat` (프로젝트 루트) — 재기동 시 키 주입용
 - 릴리스 저장소: `productionkhu-tech/freewill-nanobanana`
+- (Reve는 2026-09 서비스 종료로 제거됨 — 키 주입 불필요. 나머지 키는 setx로 이미 사용자 환경변수에 있음)
 
 ## 1. VERSION bump
 
@@ -207,8 +207,6 @@ PASS 후 정리: NanoBanana 프로세스 kill + `C:\NanoBanana_build\e2e` 삭제
 
 ```powershell
 Get-Process NanoBanana -ErrorAction SilentlyContinue | Stop-Process -Force -Confirm:$false
-$bat = Get-Content ".\레베 api key.bat" -Raw
-if ($bat -match 'REVE_API_KEY\s+"([^"]+)"') { $env:REVE_API_KEY = $Matches[1] }
 Start-Process ".\dist\NanoBanana\NanoBanana.exe"
 # 8초 후 http://127.0.0.1:5656/api/version 이 새 버전인지 확인
 ```

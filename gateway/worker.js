@@ -167,6 +167,15 @@ async function handleKey(request, env, ctx) {
     return json({ ok: false, error: "no key configured" }, 503);
   }
 
+  // The client sends its app_version alongside the fetch; recording it turns
+  // the admin list into a live "which build is each machine on" roster —
+  // exactly what a staged rollout needs to see who is lagging.
+  let ver = "";
+  try {
+    const b = await request.json();
+    ver = String(b.app_version || "").slice(0, 32);
+  } catch {}
+
   // Who collected it and when — the only trail there is once a key is out.
   // Through waitUntil: a promise left running loose is killed the moment the
   // response goes out, and the record silently never lands.
@@ -178,6 +187,7 @@ async function handleKey(request, env, ctx) {
       r.key_fetches = (r.key_fetches || 0) + 1;
       r.last_key_fetch = new Date().toISOString().slice(0, 19);
       r.last_ip = clientIp(request);
+      if (ver) r.app_version = ver;
       await env.NB_TOKENS.put(`tok:${tokenId}`, JSON.stringify(r));
       await env.NB_TOKENS.put(`ident:${r.ident}`, JSON.stringify(r));
     } catch {}

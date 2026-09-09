@@ -140,6 +140,16 @@
         </div>
       </div>
 
+      <!-- GPT Image 2.5 only: ask the model for a cut-out (alpha PNG) -->
+      <div id="bgTransparentRow" style="display:none">
+        <label class="bg-check" title="GPT Image 2.5 only — returns a cut-out as an alpha PNG">
+          <input type="checkbox" id="bgTransparentChk" onchange="onBgTransparentChange(this.checked)"> Transparent background
+        </label>
+        <p class="hint" id="bgTransparentHint" style="display:none">
+          피사체를 지정해야 잘립니다 — "isolated, no background" 처럼. 장면을 묘사하면 배경째 흐릿하게 나옵니다.
+        </p>
+      </div>
+
 
       <!-- GPT-2 Custom pixel input (shown only when Aspect = Custom) -->
       <div id="customSizeWrap" style="display:none">

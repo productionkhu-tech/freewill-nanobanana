@@ -55,6 +55,12 @@ GPT2_ASPECTS = ["1:1", "3:2", "2:3", "4:3", "3:4", "4:5", "5:4",
 GPT2_RESOLUTIONS = ["1K", "2K", "4K"]
 GPT2_QUALITIES = ["low", "medium", "high", "auto"]
 GPT25_QUALITIES = ["low", "medium", "high", "xhigh", "max", "auto"]
+# 2.5 can return a cut-out instead of a filled background. Off by default —
+# "auto" is what the API does on its own, and a transparent PNG is a specific
+# ask (logos, overlays), not something to hand someone who didn't ask for it.
+# The API only honours it on png/webp output, so the format is pinned to png
+# alongside it rather than left to the default.
+GPT25_BACKGROUNDS = ("auto", "transparent", "opaque")
 
 
 def openai_qualities(model):
@@ -699,6 +705,9 @@ class AppState:
         # GPT Image 2 "Custom" aspect — raw user-entered pixels (pre-correction).
         self.custom_w = 1024
         self.custom_h = 1024
+        # GPT Image 2.5 전용 — 배경을 투명하게 받을지. 프로젝트별 설정이라
+        # 탭마다 다르게 둘 수 있고, 프로젝트 파일에 함께 저장된다.
+        self.openai_bg_transparent = False
         self.fixed_prompt = ""
         self.prompt_sections = [""]
         self.naming_enabled = False
@@ -1838,6 +1847,7 @@ class AppState:
                 "quality": self.quality,
                 "custom_w": self.custom_w,
                 "custom_h": self.custom_h,
+                "openai_bg_transparent": self.openai_bg_transparent,
                 "count": str(self.count),
                 "output_dir": self.output_dir,
                 "naming": self.get_naming_settings(),
@@ -1923,6 +1933,7 @@ class AppState:
         self.quality = ui.get("quality", self.quality)
         self.custom_w = _safe_int(ui.get("custom_w"), self.custom_w, lo=16, hi=99999)
         self.custom_h = _safe_int(ui.get("custom_h"), self.custom_h, lo=16, hi=99999)
+        self.openai_bg_transparent = bool(ui.get("openai_bg_transparent", False))
         # Tolerant parse — older projects sometimes have count="" which would
         # raise ValueError and abort load mid-way, losing the whole session.
         try:
@@ -2144,6 +2155,13 @@ class AppState:
             try:
                 self.log(f"{label} requesting...")
                 t = time.time()
+                # Only sent when the user asked for a cut-out; every other run
+                # keeps the exact request shape it had before.
+                extra = {}
+                if img_cfg.get("background"):
+                    extra["background"] = img_cfg["background"]
+                if img_cfg.get("output_format"):
+                    extra["output_format"] = img_cfg["output_format"]
                 if ref_payloads:
                     result = self.client_openai.images.edit(
                         model=model,
@@ -2152,6 +2170,7 @@ class AppState:
                         size=size,
                         quality=quality,
                         n=1,
+                        **extra,
                     )
                 else:
                     result = self.client_openai.images.generate(
@@ -2160,6 +2179,7 @@ class AppState:
                         size=size,
                         quality=quality,
                         n=1,
+                        **extra,
                     )
                 self.log(f"{label} OK ({time.time()-t:.1f}s)")
                 data_list = getattr(result, "data", None) or []
@@ -2564,6 +2584,7 @@ class AppState:
                             "prompt_sections": list(job.get("prompt_sections") or []),
                             "model": model, "aspect": aspect, "resolution": resolution,
                             "quality": job.get("quality", "high"),
+                            "openai_bg_transparent": bool(job.get("openai_bg_transparent")),
                             "custom_w": job.get("custom_w"), "custom_h": job.get("custom_h"),
                             "count": saved_count, "output_dir": job["output_dir"],
                             "naming": naming,
@@ -3169,6 +3190,7 @@ def get_settings():
         "quality": state.quality,
         "custom_w": state.custom_w,
         "custom_h": state.custom_h,
+        "openai_bg_transparent": state.openai_bg_transparent,
         "count": state.count,
         "output_dir": state.output_dir,
         "fixed_prompt": state.fixed_prompt,
@@ -3188,7 +3210,7 @@ def _settings_fingerprint(proj):
     tell a genuine edit from the page simply re-sending what it already had."""
     return (
         proj.model, proj.aspect, proj.resolution, proj.quality,
-        proj.custom_w, proj.custom_h, proj.count,
+        proj.custom_w, proj.custom_h, proj.openai_bg_transparent, proj.count,
         proj.output_dir, proj.fixed_prompt, tuple(proj.prompt_sections or []),
         proj.naming_enabled, proj.naming_prefix, proj.naming_delimiter,
         proj.naming_index_prefix, proj.naming_padding, proj.gallery_columns,
@@ -3238,6 +3260,8 @@ def update_settings():
         state.output_dir = str(d["output_dir"])
     if "naming_enabled" in d:
         state.naming_enabled = bool(d.get("naming_enabled"))
+    if "openai_bg_transparent" in d:
+        state.openai_bg_transparent = bool(d.get("openai_bg_transparent"))
     if "naming_padding" in d:
         state.naming_padding = _safe_int(d.get("naming_padding"), state.naming_padding, lo=1, hi=5)
     if "prompt_sections" in d:
@@ -3699,6 +3723,10 @@ def get_gallery():
             "elapsed_sec": round(item.get("elapsed_sec", 0), 1),
             "api_used": item.get("api_used", ""),
             "model": item.get("generation_settings", {}).get("model", ""),
+            # Hoisted out of generation_settings the same way `model` is — the
+            # listing deliberately doesn't ship the whole settings blob, and the
+            # grid needs this one bit to put a checkerboard behind a cut-out.
+            "transparent": bool(item.get("generation_settings", {}).get("openai_bg_transparent")),
             "generated_at": item.get("generated_at", ""),
             "favorite": fp in state.favorites,
         })
@@ -3918,13 +3946,27 @@ def serve_gallery_thumb():
         return "", 404
     try:
         with Image.open(fp) as img:
-            pil = _to_rgb_flatten(img)
-            pil.thumbnail((size, size), Image.LANCZOS)
-            buf = io.BytesIO()
-            # Larger previews (2-column and up) deserve less JPEG mush.
-            pil.save(buf, "JPEG", quality=(92 if size >= 1024 else 85))
+            # A cut-out has to stay a cut-out here too. JPEG carries no alpha,
+            # so a transparent generation used to come back as a white box in
+            # the grid while the full-size view showed it correctly. Only the
+            # images that actually have alpha pay the PNG cost.
+            transparent = img.mode in ("RGBA", "LA", "P") and (
+                img.mode != "P" or "transparency" in img.info)
+            if transparent:
+                pil = _to_display_image(img)      # alpha preserved
+                pil.thumbnail((size, size), Image.LANCZOS)
+                buf = io.BytesIO()
+                pil.save(buf, "PNG")
+                mime = "image/png"
+            else:
+                pil = _to_rgb_flatten(img)
+                pil.thumbnail((size, size), Image.LANCZOS)
+                buf = io.BytesIO()
+                # Larger previews (2-column and up) deserve less JPEG mush.
+                pil.save(buf, "JPEG", quality=(92 if size >= 1024 else 85))
+                mime = "image/jpeg"
         buf.seek(0)
-        return send_file(buf, mimetype="image/jpeg")
+        return send_file(buf, mimetype=mime)
     except Exception:
         return "", 500
 
@@ -4088,6 +4130,7 @@ def load_setup():
     state.quality = saved.get("quality", state.quality)
     state.custom_w = _safe_int(saved.get("custom_w"), state.custom_w, lo=16, hi=99999)
     state.custom_h = _safe_int(saved.get("custom_h"), state.custom_h, lo=16, hi=99999)
+    state.openai_bg_transparent = bool(saved.get("openai_bg_transparent", False))
     state.count = int(saved.get("count", 1))
     state.output_dir = saved.get("output_dir", state.output_dir)
 
@@ -4234,6 +4277,13 @@ def start_generate():
         else:
             size = gpt2_resolve_size(aspect, resolution, ref_size)
         img_cfg = {"size": size, "quality": openai_clamp_quality(model, state.quality)}
+        # Transparency is a 2.5-only parameter; gpt-image-2 400s on it. The
+        # format goes with it because the API only keeps an alpha channel on
+        # png/webp — asking for transparent without it silently returns a
+        # filled background.
+        if model in GPT25_MODEL_IDS and state.openai_bg_transparent:
+            img_cfg["background"] = "transparent"
+            img_cfg["output_format"] = "png"
     elif is_seedream:
         # Seedream size: Custom = explicit WxH (Method 1, clamped to the model's
         # pixel cap). Named aspect / Auto = the resolution LEVEL (Method 2) with
@@ -4340,6 +4390,7 @@ def start_generate():
                 "quality": quality,
                 "custom_w": custom_w,
                 "custom_h": custom_h,
+                "openai_bg_transparent": bool(img_cfg.get("background") == "transparent"),
                 "img_cfg": dict(img_cfg),
                 "naming": dict(naming),
                 "ref_payloads": ref_payloads,

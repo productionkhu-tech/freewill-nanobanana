@@ -893,6 +893,12 @@ async function loadSettings() {
     count: String(d.count),
     quality: d.quality || "high",
   });
+  // The cut-out toggle rides with the project, so a reopened project (or a
+  // setup loaded off a gallery card) comes back asking for the same thing.
+  // applyModelSpec ran first and has already shown or hidden the row.
+  const _bgc = document.getElementById("bgTransparentChk");
+  if (_bgc) _bgc.checked = !!d.openai_bg_transparent;
+  _syncBgHint();
   // H7: applyModelSpec() above already populated AND selected each dropdown
   // (loaded value, else this model's default). Raw-setting .value here would
   // bypass that fallback and blank out any value the model no longer offers
@@ -1068,6 +1074,7 @@ const MODEL_SPECS = {
     counts: ["1","2","3","4","5","6","7","8","9","10"],
     showQuality: true,
     qualities: ["low","medium","high","xhigh","max","auto"],
+    showBackground: true,
     defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "max",
     hint: "GPT Image 2.5 Fast — quick everyday generation. Starts at max quality.",
     refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
@@ -1078,6 +1085,7 @@ const MODEL_SPECS = {
     counts: ["1","2","3","4","5","6","7","8","9","10"],
     showQuality: true,
     qualities: ["low","medium","high","xhigh","max","auto"],
+    showBackground: true,
     defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "max",
     hint: "GPT Image 2.5 Heavy — editing precision. Starts at max quality.",
     refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
@@ -1222,6 +1230,28 @@ function repopulateSelect(id, values, preferred, fallback) {
 
 let _lastRefs = [];                // last /api/refs snapshot (Custom auto-fill reads it)
 
+// 2.5-only cut-out toggle. Off by default and never implied by anything else —
+// a transparent PNG is a specific ask, so it is only ever set by this click or
+// restored from a saved project / loaded setup.
+function onBgTransparentChange(v) {
+  api("/api/settings", { method: "POST", body: { openai_bg_transparent: !!v } });
+  _syncBgHint();
+}
+
+// The parameter alone does not make a cut-out: measured on gpt-image-2.5, a
+// bare subject noun ("사과") returns a full scene with a weak matte over it —
+// 0% of pixels fully transparent — while naming an isolated subject returns a
+// real cut-out (46-57% fully transparent). So the hint only appears when the
+// box is on, where it is the difference between working and not.
+function _syncBgHint() {
+  const chk = document.getElementById("bgTransparentChk");
+  const hint = document.getElementById("bgTransparentHint");
+  const row = document.getElementById("bgTransparentRow");
+  if (!chk || !hint || !row) return;
+  const rowVisible = row.style.display !== "none";
+  hint.style.display = (rowVisible && chk.checked) ? "" : "none";
+}
+
 function applyModelSpec(model, preserved) {
   const spec = getModelSpec(model);
   // H8: migrate the wrong "0.5K" token (shipped v1201/02) back to "512px".
@@ -1242,6 +1272,19 @@ function applyModelSpec(model, preserved) {
     const qw = document.getElementById("qualityWrap");
     if (qw) qw.style.display = "none";
   }
+  // Transparency is a 2.5-only parameter. Hiding the row is not enough — a
+  // model without it must not keep a checked box alive in the background, or
+  // switching away would silently leave the request asking for a cut-out.
+  const bgRow = document.getElementById("bgTransparentRow");
+  if (bgRow) bgRow.style.display = spec.showBackground ? "" : "none";
+  if (!spec.showBackground) {
+    const chk = document.getElementById("bgTransparentChk");
+    if (chk && chk.checked) {
+      chk.checked = false;
+      api("/api/settings", { method: "POST", body: { openai_bg_transparent: false } });
+    }
+  }
+  _syncBgHint();
   const hintEl = document.getElementById("modelHint");
   if (hintEl) hintEl.textContent = spec.hint;
   // Every OpenAI model ignores [Image N] tags, so the warning styling applies
@@ -3067,7 +3110,11 @@ async function refreshGallery() {
       }
     }
     const img = document.createElement("img");
-    img.className = "card-img";
+    // A cut-out needs the checkerboard behind it to read as transparent
+    // rather than as "dark background". The flag rides in the saved
+    // generation settings, so it survives a project reload.
+    const _alpha = !!item.transparent;
+    img.className = "card-img" + (_alpha ? " alpha" : "");
     // Without this the <img>'s native drag hijacks the gesture: the browser
     // fires an image/uri-list drag with no custom data, so the card-level
     // dragstart (which stamps application/x-nb-gallery-path) effectively

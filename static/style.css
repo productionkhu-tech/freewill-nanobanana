@@ -1298,6 +1298,28 @@ textarea.prompt-box { min-height: 82px; }
   background: #111113;
 }
 
+/* Cut-out generations (background: transparent). Against the flat card colour
+   a transparent PNG is indistinguishable from one with a dark background, so
+   the usual checkerboard goes behind exactly those images. Applied by class,
+   not to every card, or the letterbox bars on ordinary images would get it. */
+/* GPT Image 2.5 cut-out toggle in the sidebar. */
+.bg-check { font-size: 12px; color: #ccc; display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; margin: 2px 0 8px; }
+
+.card-img.alpha {
+  /* Big, low-contrast cells. The first pass used 16px squares with a bright
+     step, which read as noise competing with the artwork; a checkerboard only
+     has to say "this is empty", so it sits just far enough off the card colour
+     to be legible and no further. */
+  background-color: #1b1b1e;
+  background-image:
+    linear-gradient(45deg, #232327 25%, transparent 25%),
+    linear-gradient(-45deg, #232327 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #232327 75%),
+    linear-gradient(-45deg, transparent 75%, #232327 75%);
+  background-size: 28px 28px;
+  background-position: 0 0, 0 14px, 14px -14px, -14px 0;
+}
+
 /* Card body: sits below image, always renders in full */
 .card-body {
   padding: 8px 12px 12px;

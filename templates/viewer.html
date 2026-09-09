@@ -403,6 +403,31 @@ function fit() {
   render();
 }
 
+// Checkerboard laid under an image before it is drawn, so a cut-out reads as
+// transparent instead of picking up the canvas colour. Painted only inside the
+// image's own rectangle: an opaque image covers it completely, so ordinary
+// previews look exactly as before and no detection is needed.
+let _alphaPat = null;
+function alphaPattern() {
+  if (_alphaPat) return _alphaPat;
+  // Must match .card-img.alpha in style.css — same cell size and colours, so
+  // an image looks the same in the grid and in here.
+  const c = document.createElement("canvas");
+  c.width = c.height = 28;
+  const g = c.getContext("2d");
+  g.fillStyle = "#1b1b1e"; g.fillRect(0, 0, 28, 28);
+  g.fillStyle = "#232327"; g.fillRect(0, 0, 14, 14); g.fillRect(14, 14, 14, 14);
+  _alphaPat = ctx.createPattern(c, "repeat");
+  return _alphaPat;
+}
+function drawWithAlphaBacking(im, dx, dy, dw, dh) {
+  ctx.save();
+  ctx.fillStyle = alphaPattern();
+  ctx.fillRect(dx, dy, dw, dh);
+  ctx.restore();
+  ctx.drawImage(im, dx, dy, dw, dh);
+}
+
 function render() {
   if (!state.img) return;
   resizeCanvas();
@@ -411,7 +436,7 @@ function render() {
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = "high";
   if (cmp.on && cmp.img) { renderWipe(v); return; }
-  ctx.drawImage(state.img, state.offsetX, state.offsetY,
+  drawWithAlphaBacking(state.img, state.offsetX, state.offsetY,
     state.img.width * state.scale, state.img.height * state.scale);
 }
 
@@ -466,7 +491,7 @@ function renderWipe(v) {
     if (i === 0) ctx.rect(0, 0, sx, v.h);
     else ctx.rect(sx, 0, v.w - sx, v.h);
     ctx.clip();
-    ctx.drawImage(im, dx, dy, dw, dh);
+    drawWithAlphaBacking(im, dx, dy, dw, dh);
     ctx.restore();
   }
   // divider + drag handle

@@ -12,7 +12,7 @@
 - **실행**: onefile PyInstaller EXE (`NanoBanana.exe`) + 키 설치 스크립트
 - **프론트**: HTML/CSS/JS를 Flask가 서빙, pywebview(WebView2) 창에서 렌더
 - **백엔드**: Flask 127.0.0.1:5656, `app.py` 단일 파일에 상태+라우트 전부
-- **프로바이더 3사**: Google Gemini(Vertex/Studio) · OpenAI gpt-image-2 · BytePlus Seedream
+- **프로바이더 3사**: Google Gemini(Vertex/Studio) · OpenAI gpt-image-2 / 2.5 · BytePlus Seedream
   (Reve는 2026-09 API 서비스 종료로 제거 — 구 프로젝트의 reve-create는 로드 시 기본 모델로 자동 폴백)
 - **멀티 프로젝트 탭**: 앱 상태는 `_Shared`(앱 전역) + 프로젝트별 `AppState` N개.
   `state`는 "이 요청이 다루는 프로젝트"를 가리키는 프록시라 기존 라우트는 그대로 동작
@@ -257,10 +257,17 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 |---|---|---|
 | Google Vertex | gemini-3-pro-image 등 | `GOOGLE_APPLICATION_CREDENTIALS` + `NANOBANANA_PROJECT_ID` |
 | Google AI Studio | 동일 모델군 | `NANOBANANA_STUDIO_KEY` |
-| OpenAI | gpt-image-2 | `OPENAI_API_KEY` |
+| OpenAI | gpt-image-2 · gpt-image-2.5-sunburst / -flare | `OPENAI_API_KEY` |
 | BytePlus | seedream-5-0-pro / 4-5 | `ARK_API_KEY` |
 
 - Gemini는 10 RPM → 앱이 8 RPM으로 스로틀. **결제 미연결 시 Studio 429(limit:0) + Vertex 403(BILLING_DISABLED)**
+- **GPT Image 2.5 (2026-09-08)**: sunburst(편집 정밀도) / flare(빠른 생성). 크기 규칙은 gpt-image-2와
+  자릿수까지 동일해 `_gpt2_*` 헬퍼를 그대로 공유한다. 다른 건 화질 사다리뿐 — `xhigh`, `max` 추가.
+  화질 목록은 `openai_qualities()`(서버) + `MODEL_SPECS[].qualities`(프론트) 두 곳이 원본이고,
+  `openai_clamp_quality()`가 모델이 모르는 값을 `high`로 눌러 400을 막는다.
+  **조직 인증 필수** — 미인증이면 403 `organization must be verified`
+  (https://platform.openai.com/settings/organization/general → Verify Organization, 반영까지 최대 15분).
+  xhigh/max는 이미지당 토큰이 늘어 비용이 커진다(단가는 gpt-image-2와 동일) → 기본값은 `high` 유지
 - Reve는 2026-09 API 서비스 종료로 v2026-09-0101에서 완전 제거. `_RETIRED_MODEL_FALLBACK`이
   저장물의 reve-create를 기본 모델로 폴백 (개명 맵 `_MODEL_RENAMES`와 다름 — prefs 키는 건드리지 않음).
   과거 Reve 생성물의 갤러리 배지/라벨은 그대로 표시

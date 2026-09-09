@@ -40,12 +40,39 @@ except Exception:
 # GPT Image 2 config
 # ==========================================
 GPT2_MODEL_ID = "gpt-image-2"
+# GPT Image 2.5 (2026-09-08). Two variants with IDENTICAL request shapes —
+# sunburst is tuned for editing precision, flare for fast everyday generation.
+# Their size rules are the same as gpt-image-2's to the digit (16-multiple
+# edges, max edge 3840, 1:3..3:1, 655,360..8,294,400 px), so every size helper
+# below is shared rather than duplicated. What is genuinely new is the quality
+# ladder: xhigh and max sit above high.
+GPT25_MODEL_IDS = ("gpt-image-2.5-sunburst", "gpt-image-2.5-flare")
+OPENAI_MODEL_IDS = (GPT2_MODEL_ID,) + GPT25_MODEL_IDS
 # 13 explicit aspect ratios exposed for gpt-image-2 (all within the API's 3:1
 # cap). "auto" is a UI sentinel resolved before these are used.
 GPT2_ASPECTS = ["1:1", "3:2", "2:3", "4:3", "3:4", "4:5", "5:4",
                 "16:9", "9:16", "21:9", "9:21", "3:1", "1:3"]
 GPT2_RESOLUTIONS = ["1K", "2K", "4K"]
 GPT2_QUALITIES = ["low", "medium", "high", "auto"]
+GPT25_QUALITIES = ["low", "medium", "high", "xhigh", "max", "auto"]
+
+
+def openai_qualities(model):
+    """Quality ladder for an OpenAI image model."""
+    return GPT25_QUALITIES if model in GPT25_MODEL_IDS else GPT2_QUALITIES
+
+
+def openai_clamp_quality(model, quality):
+    """Keep a quality the chosen model actually accepts.
+
+    Nothing validated this before: state.quality is a free string that went
+    straight into the request. Picking "max" on 2.5 and then switching back to
+    gpt-image-2 would send "max" to a model that only knows up to "high" — a
+    hard 400, retried five times before failing. The dropdown drops the value
+    on a model switch, but the server is what the API sees."""
+    allowed = openai_qualities(model)
+    q = (quality or "").strip()
+    return q if q in allowed else "high"
 
 # OpenAI gpt-image-2 hard constraints (official docs):
 #   16-multiple edges · max edge <= 3840 · long:short <= 3:1 · 655,360..8,294,400 px
@@ -286,7 +313,10 @@ def _seedream_prompt(prompt):
 
 def _model_file_prefix(model):
     """Default-naming filename prefix reflecting which model made the image:
-    GP2 (gpt-image-2), SD (BytePlus Seedream), nano (Gemini / Nano Banana)."""
+    GP2 (gpt-image-2), GP25 (GPT Image 2.5), SD (BytePlus Seedream),
+    nano (Gemini / Nano Banana)."""
+    if model in GPT25_MODEL_IDS:
+        return "GP25"
     if model == GPT2_MODEL_ID:
         return "GP2"
     if model in SEEDREAM_MODEL_IDS:
@@ -387,6 +417,8 @@ _ALL_MODEL_IDS = (
     "seedream-5-0-pro-260628",
     "seedream-4-5-251128",
     "gpt-image-2",
+    "gpt-image-2.5-sunburst",
+    "gpt-image-2.5-flare",
 )
 _RES_TOKENS = {"512px", "1K", "2K", "4K", "auto"}
 
@@ -1132,8 +1164,8 @@ class AppState:
     # renders as literal text.
     def get_ref_limit(self, model=None):
         m = model or self.model
-        if m == GPT2_MODEL_ID:
-            # gpt-image-2 edits endpoint: OpenAI 가이드 기준 최대 16장.
+        if m in OPENAI_MODEL_IDS:
+            # OpenAI edits 엔드포인트: 가이드 기준 최대 16장 (2.5도 동일).
             return 16
         if m in SEEDREAM_MODEL_IDS:
             return 10 if m == "seedream-5-0-pro-260628" else 14
@@ -2082,10 +2114,14 @@ class AppState:
             for i, data in enumerate(ref_payloads)
         ]
 
-    def _generate_one_image_openai(self, job, prompt, ref_payloads, img_cfg):
+    def _generate_one_image_openai(self, job, prompt, ref_payloads, model, img_cfg):
         idx = job["index"]
         total = job["total"]
         seed = job["seed"]
+        # The model has to travel with the request: this used to send
+        # GPT2_MODEL_ID unconditionally, so once there was more than one OpenAI
+        # model, picking 2.5 would still have generated on gpt-image-2.
+        model = model or GPT2_MODEL_ID
         label = "OpenAI"
         # 슬롯 모델에서 ref_payloads는 빈 슬롯 자리에 None을 담을 수 있다.
         # OpenAI edits 엔드포인트는 None을 못 받으므로 채워진 것만 추린다.
@@ -2110,7 +2146,7 @@ class AppState:
                 t = time.time()
                 if ref_payloads:
                     result = self.client_openai.images.edit(
-                        model=GPT2_MODEL_ID,
+                        model=model,
                         image=self._openai_file_tuples(ref_payloads),
                         prompt=prompt,
                         size=size,
@@ -2119,7 +2155,7 @@ class AppState:
                     )
                 else:
                     result = self.client_openai.images.generate(
-                        model=GPT2_MODEL_ID,
+                        model=model,
                         prompt=prompt,
                         size=size,
                         quality=quality,
@@ -2252,8 +2288,8 @@ class AppState:
                 "error": "Max retries exceeded", "elapsed": time.time() - start}
 
     def generate_one_image(self, job, prompt, ref_payloads, model, img_cfg, modalities):
-        if model == GPT2_MODEL_ID:
-            return self._generate_one_image_openai(job, prompt, ref_payloads, img_cfg)
+        if model in OPENAI_MODEL_IDS:
+            return self._generate_one_image_openai(job, prompt, ref_payloads, model, img_cfg)
         if model in SEEDREAM_MODEL_IDS:
             return self._generate_one_image_seedream(job, prompt, ref_payloads, model, img_cfg)
         idx = job["index"]
@@ -4118,7 +4154,7 @@ def load_setup():
 @app.route("/api/generate", methods=["POST"])
 def start_generate():
     model = state.model
-    is_openai = (model == GPT2_MODEL_ID)
+    is_openai = model in OPENAI_MODEL_IDS
     is_seedream = model in SEEDREAM_MODEL_IDS
 
     if is_openai:
@@ -4197,7 +4233,7 @@ def start_generate():
             size = "%dx%d" % (cw, ch)
         else:
             size = gpt2_resolve_size(aspect, resolution, ref_size)
-        img_cfg = {"size": size, "quality": state.quality or "high"}
+        img_cfg = {"size": size, "quality": openai_clamp_quality(model, state.quality)}
     elif is_seedream:
         # Seedream size: Custom = explicit WxH (Method 1, clamped to the model's
         # pixel cap). Named aspect / Auto = the resolution LEVEL (Method 2) with

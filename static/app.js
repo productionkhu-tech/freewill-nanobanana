@@ -1052,8 +1052,34 @@ const MODEL_SPECS = {
     resolutions: ["1K","2K","4K"],
     counts: ["1","2","3","4","5","6","7","8","9","10"],
     showQuality: true,
+    qualities: ["low","medium","high","auto"],
     defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "high",
     hint: "OpenAI Image API — generation may take up to ~2 min.",
+    refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
+  },
+  // GPT Image 2.5 (2026-09-08). Same size rules as gpt-image-2 to the digit,
+  // so the aspect/resolution/custom-pixel machinery is reused untouched. The
+  // difference is the quality ladder — xhigh and max above high — and which
+  // job each variant is tuned for. Default stays "high": xhigh/max cost more
+  // per image, so stepping up is the user's choice, not the default.
+  "gpt-image-2.5-sunburst": {
+    aspects: ["auto","1:1","3:2","2:3","4:3","3:4","4:5","5:4","16:9","9:16","21:9","9:21","3:1","1:3","custom"],
+    resolutions: ["1K","2K","4K"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: true,
+    qualities: ["low","medium","high","xhigh","max","auto"],
+    defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "high",
+    hint: "GPT Image 2.5 Sunburst — 편집 정밀도 우선. xhigh/max 화질 사용 가능.",
+    refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
+  },
+  "gpt-image-2.5-flare": {
+    aspects: ["auto","1:1","3:2","2:3","4:3","3:4","4:5","5:4","16:9","9:16","21:9","9:21","3:1","1:3","custom"],
+    resolutions: ["1K","2K","4K"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: true,
+    qualities: ["low","medium","high","xhigh","max","auto"],
+    defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "high",
+    hint: "GPT Image 2.5 Flare — 빠른 일상 생성용. xhigh/max 화질 사용 가능.",
     refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
   },
 };
@@ -1078,6 +1104,8 @@ const MODEL_LABELS = {
   "seedream-5-0-pro-260628": "seedream-5-0-pro",
   "seedream-4-5-251128": "seedream-4-5",
   "gpt-image-2": "gpt-image-2 (OpenAI)",
+  "gpt-image-2.5-sunburst": "gpt-image-2.5 Sunburst (편집)",
+  "gpt-image-2.5-flare": "gpt-image-2.5 Flare (빠름)",
 };
 let _modelPrefs = { hidden: [], default_res: {} };
 
@@ -1142,6 +1170,8 @@ const _MODEL_SHORT = {
   "gemini-3.1-flash-lite-image": "Gemini 3.1 Lite",
   "gemini-2.5-flash-image": "Gemini 2.5 Flash",
   "gpt-image-2": "GPT Image 2",
+  "gpt-image-2.5-sunburst": "GPT Image 2.5 Sunburst",
+  "gpt-image-2.5-flare": "GPT Image 2.5 Flare",
   "seedream-5-0-pro-260628": "Seedream 5 Pro",
   "seedream-4-5-251128": "Seedream 4.5",
   "reve-create": "Reve 2.1",
@@ -1188,7 +1218,10 @@ function applyModelSpec(model, preserved) {
   if (rw) rw.style.display = (spec.showResolution === false) ? "none" : "";
   repopulateSelect("countSelect",      spec.counts,      preserved?.count);
   if (spec.showQuality) {
-    repopulateSelect("qualitySelect", ["low","medium","high","auto"], preserved?.quality, spec.defaultQuality || "high");
+    // From the spec, not a literal here: 2.5 adds xhigh/max, and a hardcoded
+    // list would have silently hidden them however the model was registered.
+    const quals = spec.qualities || ["low","medium","high","auto"];
+    repopulateSelect("qualitySelect", quals, preserved?.quality, spec.defaultQuality || "high");
     const qw = document.getElementById("qualityWrap");
     if (qw) qw.style.display = "";
   } else {
@@ -1197,11 +1230,13 @@ function applyModelSpec(model, preserved) {
   }
   const hintEl = document.getElementById("modelHint");
   if (hintEl) hintEl.textContent = spec.hint;
-  const isGpt2 = (model === "gpt-image-2");
+  // Every OpenAI model ignores [Image N] tags, so the warning styling applies
+  // to 2.5 as much as to gpt-image-2.
+  const isOpenAI = (model || "").indexOf("gpt-image-") === 0;
   const refHintEl = document.getElementById("refLimitHint");
   if (refHintEl) {
     refHintEl.textContent = spec.refHint;
-    refHintEl.classList.toggle("hint-warn", isGpt2);
+    refHintEl.classList.toggle("hint-warn", isOpenAI);
   }
   // Show/hide the Custom pixel inputs for the current model+aspect.
   if (typeof toggleCustomWrap === "function") toggleCustomWrap();

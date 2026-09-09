@@ -5446,11 +5446,21 @@ def _clipboard_put_pil(pil):
     try:
         import ctypes
         from ctypes import wintypes
-        # CF_DIB carries no alpha, so transparency must be flattened here.
+        # Two formats on the clipboard at once, which is what a browser does
+        # when copying a PNG off a page: CF_DIB for everything that only speaks
+        # bitmaps, plus the registered "PNG" format carrying the real file
+        # bytes. Apps that understand PNG (Photoshop, Figma, Discord, Office…)
+        # take that one and keep the alpha; the rest fall back to the flattened
+        # DIB exactly as before. CF_DIB has no alpha channel, so on its own it
+        # turned every cut-out into a white-filled rectangle.
         image = _to_rgb_flatten(pil)
         output = io.BytesIO()
         image.save(output, "BMP")
         data = output.getvalue()[14:]
+
+        png_buf = io.BytesIO()
+        _to_display_image(pil).save(png_buf, "PNG")   # alpha preserved
+        png_bytes = png_buf.getvalue()
 
         GMEM_MOVEABLE = 0x0002
         CF_DIB = 8
@@ -5470,16 +5480,32 @@ def _clipboard_put_pil(pil):
         user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
         user32.SetClipboardData.restype = ctypes.c_void_p
         user32.CloseClipboard.restype = wintypes.BOOL
+        user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+        user32.RegisterClipboardFormatW.restype = wintypes.UINT
 
-        h = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
-        if not h:
-            raise OSError("GlobalAlloc failed")
-        locked = kernel32.GlobalLock(h)
-        if not locked:
-            kernel32.GlobalFree(h)
-            raise OSError("GlobalLock failed")
-        ctypes.memmove(locked, data, len(data))
-        kernel32.GlobalUnlock(h)
+        def _hglobal(payload):
+            """Movable global block holding payload, ready to hand to the
+            clipboard. Ownership passes to Windows on a successful
+            SetClipboardData, so it is only freed when that never happens."""
+            hh = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(payload))
+            if not hh:
+                raise OSError("GlobalAlloc failed")
+            locked = kernel32.GlobalLock(hh)
+            if not locked:
+                kernel32.GlobalFree(hh)
+                raise OSError("GlobalLock failed")
+            ctypes.memmove(locked, payload, len(payload))
+            kernel32.GlobalUnlock(hh)
+            return hh
+
+        h = _hglobal(data)
+        h_png = None
+        cf_png = user32.RegisterClipboardFormatW("PNG")   # 0 if it fails
+        if cf_png:
+            try:
+                h_png = _hglobal(png_bytes)
+            except Exception:
+                h_png = None          # DIB alone is still a usable copy
 
         opened = False
         for _ in range(12):
@@ -5489,16 +5515,24 @@ def _clipboard_put_pil(pil):
             time.sleep(0.03)
         if not opened:
             kernel32.GlobalFree(h)
+            if h_png:
+                kernel32.GlobalFree(h_png)
             raise OSError("OpenClipboard failed")
         try:
             user32.EmptyClipboard()
             if not user32.SetClipboardData(CF_DIB, h):
                 raise OSError("SetClipboardData failed")
             h = None
+            # Best-effort: losing the PNG only costs transparency, so a failure
+            # here must not fail a copy that already succeeded.
+            if h_png and user32.SetClipboardData(cf_png, h_png):
+                h_png = None
         finally:
             user32.CloseClipboard()
             if h:
                 kernel32.GlobalFree(h)
+            if h_png:
+                kernel32.GlobalFree(h_png)
         return True, None
     except Exception as e:
         return False, str(e)[:80]

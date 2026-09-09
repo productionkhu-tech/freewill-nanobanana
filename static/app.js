@@ -1062,24 +1062,24 @@ const MODEL_SPECS = {
   // difference is the quality ladder — xhigh and max above high — and which
   // job each variant is tuned for. Default stays "high": xhigh/max cost more
   // per image, so stepping up is the user's choice, not the default.
-  "gpt-image-2.5-sunburst": {
-    aspects: ["auto","1:1","3:2","2:3","4:3","3:4","4:5","5:4","16:9","9:16","21:9","9:21","3:1","1:3","custom"],
-    resolutions: ["1K","2K","4K"],
-    counts: ["1","2","3","4","5","6","7","8","9","10"],
-    showQuality: true,
-    qualities: ["low","medium","high","xhigh","max","auto"],
-    defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "high",
-    hint: "GPT Image 2.5 Sunburst — 편집 정밀도 우선. xhigh/max 화질 사용 가능.",
-    refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
-  },
   "gpt-image-2.5-flare": {
     aspects: ["auto","1:1","3:2","2:3","4:3","3:4","4:5","5:4","16:9","9:16","21:9","9:21","3:1","1:3","custom"],
     resolutions: ["1K","2K","4K"],
     counts: ["1","2","3","4","5","6","7","8","9","10"],
     showQuality: true,
     qualities: ["low","medium","high","xhigh","max","auto"],
-    defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "high",
-    hint: "GPT Image 2.5 Flare — 빠른 일상 생성용. xhigh/max 화질 사용 가능.",
+    defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "max",
+    hint: "GPT Image 2.5 Fast — quick everyday generation. Starts at max quality.",
+    refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
+  },
+  "gpt-image-2.5-sunburst": {
+    aspects: ["auto","1:1","3:2","2:3","4:3","3:4","4:5","5:4","16:9","9:16","21:9","9:21","3:1","1:3","custom"],
+    resolutions: ["1K","2K","4K"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: true,
+    qualities: ["low","medium","high","xhigh","max","auto"],
+    defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "max",
+    hint: "GPT Image 2.5 Heavy — editing precision. Starts at max quality.",
     refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
   },
 };
@@ -1104,8 +1104,8 @@ const MODEL_LABELS = {
   "seedream-5-0-pro-260628": "seedream-5-0-pro",
   "seedream-4-5-251128": "seedream-4-5",
   "gpt-image-2": "gpt-image-2 (OpenAI)",
-  "gpt-image-2.5-sunburst": "gpt-image-2.5 Sunburst (편집)",
-  "gpt-image-2.5-flare": "gpt-image-2.5 Flare (빠름)",
+  "gpt-image-2.5-flare": "gpt-image-2.5 Flare (Fast)",
+  "gpt-image-2.5-sunburst": "gpt-image-2.5 Sunburst (Heavy)",
 };
 let _modelPrefs = { hidden: [], default_res: {} };
 
@@ -1148,6 +1148,20 @@ function preferredResolution(model) {
   return bestResolution(spec);
 }
 
+// What a model starts on when the user switches TO it — its own top tier, the
+// same rule resolution follows. This has to be passed explicitly: with no
+// preferred value repopulateSelect keeps whatever the previous model was
+// showing, so arriving at 2.5 from gpt-image-2 (which stops at high) would sit
+// on high and hide the very tiers the model was picked for. A loaded project
+// still wins — load paths pass their stored quality.
+function preferredQuality(model) {
+  const spec = getModelSpec(model);
+  const list = spec.qualities || [];
+  const d = spec.defaultQuality;
+  if (d && list.includes(d)) return d;
+  return list.length ? list[list.length - 1] : undefined;
+}
+
 // The Gemini API token is "512px" (NOT "0.5K" — verified: 0.5K returns 400).
 // v2026-06-12 01/02 shipped the wrong "0.5K" token; migrate it back here.
 const _RES_MIGRATIONS = { "0.5K": "512px" };
@@ -1170,8 +1184,8 @@ const _MODEL_SHORT = {
   "gemini-3.1-flash-lite-image": "Gemini 3.1 Lite",
   "gemini-2.5-flash-image": "Gemini 2.5 Flash",
   "gpt-image-2": "GPT Image 2",
-  "gpt-image-2.5-sunburst": "GPT Image 2.5 Sunburst",
   "gpt-image-2.5-flare": "GPT Image 2.5 Flare",
+  "gpt-image-2.5-sunburst": "GPT Image 2.5 Sunburst",
   "seedream-5-0-pro-260628": "Seedream 5 Pro",
   "seedream-4-5-251128": "Seedream 4.5",
   "reve-create": "Reve 2.1",
@@ -1352,9 +1366,12 @@ async function saveModelPrefs() {
 function onModelChange() {
   const model = document.getElementById("modelSelect").value;
   // 종횡비는 모델과 무관한 '모양'이므로 유지한다(새 모델이 못 받는 값일 때만
-  // repopulateSelect가 기본값으로 떨어뜨린다). 화질은 사용자의 모델별 기본값이
-  // 있으면 그것, 없으면 최고 화질.
-  applyModelSpec(model, { resolution: preferredResolution(model) });
+  // repopulateSelect가 기본값으로 떨어뜨린다). 해상도·화질은 새 모델 기준으로
+  // 다시 잡는다 — 등급 이름이 같아도 모델마다 뜻이 다르기 때문.
+  applyModelSpec(model, {
+    resolution: preferredResolution(model),
+    quality: preferredQuality(model),
+  });
   saveSettings();
   // 숨김 모델에서 빠져나왔으면 "(숨김)" 항목을 목록에서 걷어낸다.
   rebuildModelSelect(model);

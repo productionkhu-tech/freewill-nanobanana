@@ -657,6 +657,14 @@ class _Shared:
         self.skip_delete_confirm = False
         self.prompt_history = []
         self.max_prompt_history = 50
+        # 마지막으로 고른 팀/프로젝트. 앱 전역이고 prefs 에 남는다.
+        #
+        # 확인 자체는 켤 때마다 다시 받는다(요구사항). 하지만 17개 팀 x 7개
+        # 프로젝트를 매번 처음부터 찾아 고르게 하는 건 다른 얘기다. 지난번 값을
+        # 미리 골라둔 채로 띄워 Enter 한 번이면 끝나게 한다. 프로젝트 파일에
+        # 저장된 값이 있으면 그게 우선이고, 이건 없을 때의 기본값이다.
+        self.last_billing_team_id = ""
+        self.last_billing_project_id = ""
         # Which models the dropdown shows, and the resolution a model starts on
         # when the user switches to it. App-wide on purpose: these describe the
         # PERSON's taste, not a project's content, so every tab shares them and
@@ -856,6 +864,8 @@ class AppState:
             mp = data.get("model_prefs")
             if isinstance(mp, dict):
                 self.model_prefs = _sanitize_model_prefs(mp)
+            self.last_billing_team_id = str(data.get("last_billing_team_id", "") or "")
+            self.last_billing_project_id = str(data.get("last_billing_project_id", "") or "")
         except Exception:
             pass
 
@@ -866,6 +876,8 @@ class AppState:
                 "skip_delete_confirm": self.skip_delete_confirm,
                 "prompt_history": self.prompt_history,
                 "model_prefs": self.model_prefs,
+                "last_billing_team_id": self.last_billing_team_id,
+                "last_billing_project_id": self.last_billing_project_id,
             }
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -2797,7 +2809,7 @@ _SHARED_ATTRS = (
     "openai_detail",
     "logs", "log_lock", "progress_events", "progress_lock",
     "skip_delete_confirm", "prompt_history", "max_prompt_history",
-    "model_prefs",
+    "model_prefs", "last_billing_team_id", "last_billing_project_id",
     "always_on_top", "close_requested",
     "temp_ref_dir", "temp_ref_paths", "project_default_save_dir",
 )
@@ -4332,6 +4344,9 @@ def billing_state():
         "team_id": state.billing_team_id,
         "project_id": state.billing_project_id,
         "confirmed": bool(state.billing_confirmed),
+        # 이 탭에 값이 없을 때 모달이 미리 골라둘 기본값 (이 PC 가 마지막에 쓴 것).
+        "last_team_id": state.last_billing_team_id,
+        "last_project_id": state.last_billing_project_id,
     })
 
 
@@ -4348,6 +4363,11 @@ def billing_set():
     state.billing_confirmed = True
     if changed:
         state.project_dirty = True
+    # 프로젝트를 저장하지 않고 껐다 켜도 다음 실행 때 미리 골라져 있게 한다.
+    if (team, proj) != (state.last_billing_team_id, state.last_billing_project_id):
+        state.last_billing_team_id = team
+        state.last_billing_project_id = proj
+        state.save_prefs()
     return jsonify({"ok": True})
 
 
@@ -5883,7 +5903,18 @@ def _start_usage_flusher():
 
     생성 경로와 완전히 분리된 데몬 스레드다. 네트워크가 죽어 있으면 spool 에
     그대로 남았다가 다음 차례에 올라가고, 앱을 꺼도 파일이라 사라지지 않는다.
-    한 번에 200건까지만 보내 큰 백로그가 한 방에 몰리지 않게 한다."""
+    한 번에 200건까지만 보내 큰 백로그가 한 방에 몰리지 않게 한다.
+
+    NANOBANANA_DATA_DIR 이 잡혀 있으면 **올리지 않는다.** 그건 테스트가 격리용으로
+    거는 변수라(CLAUDE.md 규칙 17), 그대로 두면 테스트가 만든 가짜 사용량이 20초 뒤
+    이 PC 토큰으로 운영 집계에 올라간다 — 실제로 qa-proj 같은 행이 섞여 들어갔다.
+    테스트가 어차피 반드시 세팅하는 변수라 잊어버릴 수가 없는 안전장치다.
+    진짜로 데이터 폴더만 옮긴 경우엔 NANOBANANA_USAGE_UPLOAD=1 로 되살린다."""
+    if os.environ.get("NANOBANANA_DATA_DIR") and \
+       os.environ.get("NANOBANANA_USAGE_UPLOAD") != "1":
+        state.log("usage: upload disabled (isolated data dir)")
+        return
+
     def _loop():
         time.sleep(20)          # 부팅 직후엔 다른 일이 더 급하다
         while True:

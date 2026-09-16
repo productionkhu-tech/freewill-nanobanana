@@ -3639,6 +3639,8 @@ async function showPromptPopup(prompt, filename) {
 // 목록은 서버가 쥔다. 앱마다 박아두면 팀이 바뀔 때 70대를 다시 깔아야 하고,
 // 자유 입력이면 "디자인팀" 과 "디자인" 이 따로 집계돼 리포트를 못 쓴다.
 let _billCatalog = { teams: [], projects: [] };
+// 창을 즉시 띄우기 위한 직전 상태. 없으면 한 번은 서버에 물어본다.
+let _billLastState = null;
 
 function _billProjectName(id) {
   if (!id) return "";
@@ -3660,6 +3662,7 @@ async function refreshBillingBar() {
   let st = null;
   try { st = await api("/api/billing/state"); } catch (e) { /* 표시일 뿐이다 */ }
   if (!_billCatalog.teams.length) { try { await loadBillingCatalog(false); } catch (e) {} }
+  _billLastState = st;      // 모달을 즉시 띄울 때 쓸 현재 탭의 값
   const set = st && st.confirmed && st.team_id && st.project_id;
   bar.classList.toggle("needs", !set);
   txt.textContent = set
@@ -3715,33 +3718,76 @@ function onBillingTeamChange(preferProject) {
   }
 }
 
+// 창은 **먼저 띄우고** 목록은 뒤따라 받는다. 예전엔 클라우드 왕복이 끝나야
+// 창이 나타나서 누를 때마다 한 박자씩 버벅였다. 캐시로 즉시 그려놓고 최신
+// 목록이 오면 조용히 다시 채운다 — 고른 값은 그대로 유지한다.
 async function openBillingModal() {
-  // 고르는 순간에는 캐시가 아니라 최신 목록을 본다. 관리자가 방금 뺀 건이
-  // 목록에 남아 있으면 그대로 골라버리고, 방금 추가한 건은 안 보인다.
-  const warn = await loadBillingCatalog(true);
-  const cur = await api("/api/billing/state");
-  _fillBillingSelects(cur && cur.team_id, cur && cur.project_id);
+  const m = document.getElementById("billingModal");
   const hint = document.getElementById("billingHint");
+  if (hint) hint.textContent = "";
+
+  const cur = _billLastState;
+  if (_billCatalog.teams.length) _fillBillingSelects(cur && cur.team_id, cur && cur.project_id);
+  if (m) m.classList.remove("hidden");
+  // 최신 목록이 오기 전까지는 못 누르게 막는다. 캐시가 다른 탭 값일 수 있어
+  // 여기서 Enter 가 통하면 엉뚱한 프로젝트로 확정돼 버린다.
+  _billBusy(true);
+
+  // 고르는 순간에는 최신 목록이어야 한다. 관리자가 방금 뺀 건이 남아 있으면
+  // 그대로 골라버리고, 방금 추가한 건은 안 보인다.
+  const warn = await loadBillingCatalog(true);
+  const fresh = await api("/api/billing/state");
+  _billLastState = fresh;
+  // 이 탭에 값이 없으면 이 PC 가 마지막에 쓴 걸 미리 골라둔다. 확인은 어차피
+  // 매번 받지만, 17개 팀에서 매번 처음부터 찾게 만들 이유는 없다.
+  const preTeam = (fresh && fresh.team_id) || (fresh && fresh.last_team_id) || "";
+  const preProj = (fresh && fresh.project_id) || (fresh && fresh.last_project_id) || "";
+  _fillBillingSelects(preTeam, preProj);
+  _billBusy(false);
   if (hint && !hint.textContent) {
     // 이 탭이 쓰던 팀/프로젝트가 목록에서 빠졌으면 말해준다. 조용히 다른 값이
     // 선택돼 엉뚱한 곳에 비용이 달리는 게 최악이다.
     const gone = [];
-    if (cur && cur.team_id && !(_billCatalog.teams || []).some(t => t.id === cur.team_id)) gone.push("팀");
-    if (cur && cur.project_id && !(_billCatalog.projects || []).some(p => p.id === cur.project_id)) gone.push("프로젝트");
+    if (fresh && fresh.team_id && !(_billCatalog.teams || []).some(t => t.id === fresh.team_id)) gone.push("팀");
+    if (fresh && fresh.project_id && !(_billCatalog.projects || []).some(p => p.id === fresh.project_id)) gone.push("프로젝트");
     if (gone.length) {
       hint.textContent = "이 탭이 쓰던 " + gone.join("·") + "이(가) 목록에서 빠졌습니다. 다시 골라주세요.";
     } else if (warn) {
       hint.textContent = warn;
+    } else if (preTeam && preProj) {
+      // 앱을 껐다 켜면 확인은 매번 받지만(요구사항), 고른 값 자체는 남아 있다.
+      // 그대로 쓸 거면 Enter 한 번이면 끝이라는 걸 알려준다.
+      hint.textContent = "지난번에 쓰던 설정이 미리 골라져 있습니다. 그대로 쓰려면 Enter.";
     }
   }
-  const m = document.getElementById("billingModal");
-  if (m) m.classList.remove("hidden");
+  _focusBillingApply();
+}
+
+function _focusBillingApply() {
+  const b = document.getElementById("billingApply");
+  if (b && !b.disabled) try { b.focus(); } catch (e) {}
+}
+
+function _billBusy(on) {
+  ["billingTeam", "billingProject", "billingApply"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = Boolean(on);
+  });
 }
 
 function closeBillingModal() {
   const m = document.getElementById("billingModal");
   if (m) m.classList.add("hidden");
 }
+
+// Enter = 적용, Escape = 닫기. 매 실행마다 거치는 창이라 손이 마우스로 갈
+// 일이 없어야 한다.
+document.addEventListener("keydown", (e) => {
+  const m = document.getElementById("billingModal");
+  if (!m || m.classList.contains("hidden")) return;
+  if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); saveBilling(); }
+  else if (e.key === "Escape") { e.preventDefault(); closeBillingModal(); }
+});
 
 async function saveBilling() {
   const team = document.getElementById("billingTeam").value;

@@ -41,7 +41,7 @@
 
       <!-- 이 탭의 비용이 어디로 달리는지. 생성을 막는 값이라 맨 위에 두고,
            눌러서 바로 바꾼다. 다른 입력들과 같은 모양이라 따로 놀지 않는다. -->
-      <div class="section-title">Billing</div>
+      <div class="section-title">Status</div>
       <button id="billingBar" class="bill-select" onclick="openBillingModal()"
               title="팀과 프로젝트를 골라야 생성할 수 있다 — 눌러서 선택">
         <span id="billingBarText">선택 필요</span>
@@ -431,7 +431,7 @@
     <p class="hint" id="billingHint"></p>
     <div class="close-buttons">
       <button class="btn-sm" onclick="closeBillingModal()">나중에</button>
-      <button class="btn-accent-sm" onclick="saveBilling()">이 탭에 적용</button>
+      <button class="btn-accent-sm" id="billingApply" onclick="saveBilling()">이 탭에 적용</button>
     </div>
   </div>
 </div>

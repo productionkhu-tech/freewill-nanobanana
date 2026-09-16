@@ -319,14 +319,16 @@ async function handleAdmin(request, env, path) {
     return json(await handleAdminUsage(new URL(request.url), env));
   }
   if (path === "/admin/catalog") {
-    return json(await handleCatalog(env));
+    return json(await handleCatalog(env, true));   // 보관된 것까지 (되살리기용)
   }
-  // 팀·프로젝트 추가/수정. active=0 으로 두면 앱 목록에서 사라지지만 과거
-  // 사용량 행은 그대로 남는다 — 지난달 집계가 조용히 바뀌면 안 되기 때문.
+  // 팀·프로젝트 추가/수정. active=0 은 삭제가 아니라 **보관**이다 — 앱 목록에서만
+  // 사라지고 과거 사용량 행과 이름은 그대로 남아 리포트에 계속 나온다.
+  // 끝난 프로젝트의 지난 비용이 안 보이면 그건 집계가 아니라 구멍이다.
   if (path === "/admin/team" && request.method === "POST") {
     let b; try { b = await request.json(); } catch { return json({ ok: false, error: "bad request" }, 400); }
     const id = slug(b.id || b.name);
     if (!id) return json({ ok: false, error: "name required" }, 400);
+    if (b.delete) return json(await dropCatalogRow(env, "teams", "team_id", id));
     await env.USAGE_DB.prepare(
       `INSERT INTO teams (id, name, active, created_at) VALUES (?,?,?,?)
        ON CONFLICT(id) DO UPDATE SET name=excluded.name, active=excluded.active`)
@@ -337,6 +339,7 @@ async function handleAdmin(request, env, path) {
     let b; try { b = await request.json(); } catch { return json({ ok: false, error: "bad request" }, 400); }
     const id = slug(b.id || b.name);
     if (!id) return json({ ok: false, error: "name required" }, 400);
+    if (b.delete) return json(await dropCatalogRow(env, "projects", "project_id", id));
     // 팀은 선택이다. 한 건을 여러 팀이 같이 하는 게 정상이라, 프로젝트에 팀을
     // 하나 박으면 실제로 작업한 팀이 아닌 쪽으로 비용이 잡힌다.
     const teamId = b.team_id ? slug(b.team_id) : null;
@@ -350,17 +353,50 @@ async function handleAdmin(request, env, path) {
     if (request.method === "POST") {
       let b; try { b = await request.json(); } catch { return json({ ok: false, error: "bad request" }, 400); }
       if (!b.model) return json({ ok: false, error: "model required" }, 400);
+      const model = String(b.model).slice(0, 64);
+      const day = (s) => (/^\d{4}-\d{2}-\d{2}$/.test(String(s || "")) ? String(s) : null);
+
+      // 직전 행을 기준으로 삼는다 — provider 같은 건 매번 다시 받을 이유가 없다.
+      const prev = await env.USAGE_DB.prepare(
+        "SELECT * FROM prices WHERE model=? ORDER BY effective_from DESC LIMIT 1")
+        .bind(model).first();
+
+      // effective_from 을 주면 그 시점 행을 만들거나 고친다. 안 주면 가장 최근
+      // 행을 고친다(오타 정정). **model 만 보고 UPDATE 하면 과거 시점 행까지
+      // 같이 덮여 지난달 집계가 조용히 바뀐다** — 예전 코드가 그랬다.
+      const eff = day(b.effective_from) || (prev ? prev.effective_from : "2000-01-01");
+      const num = (v, d) => (v === undefined || v === null || v === "" ? (d || 0) : Number(v) || 0);
       await env.USAGE_DB.prepare(
-        `UPDATE prices SET mode=?, in_text_per_m=?, in_image_per_m=?, out_per_m=?,
-                           per_image=?, verified=?, note=?, updated_at=?
-         WHERE model=?`)
-        .bind(String(b.mode || "token"), Number(b.in_text_per_m) || 0, Number(b.in_image_per_m) || 0,
-              Number(b.out_per_m) || 0, Number(b.per_image) || 0, b.verified ? 1 : 0,
-              String(b.note || "").slice(0, 200), nowIso(), String(b.model)).run();
-      return json({ ok: true });
+        `INSERT INTO prices
+           (model, effective_from, provider, mode, in_text_per_m, in_image_per_m, out_per_m,
+            per_image, per_image_hi, px_threshold, in_per_image, in_free_count,
+            verified, note, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(model, effective_from) DO UPDATE SET
+           provider=excluded.provider, mode=excluded.mode,
+           in_text_per_m=excluded.in_text_per_m, in_image_per_m=excluded.in_image_per_m,
+           out_per_m=excluded.out_per_m, per_image=excluded.per_image,
+           per_image_hi=excluded.per_image_hi, px_threshold=excluded.px_threshold,
+           in_per_image=excluded.in_per_image, in_free_count=excluded.in_free_count,
+           verified=excluded.verified, note=excluded.note, updated_at=excluded.updated_at`)
+        .bind(model, eff,
+              String(b.provider || (prev && prev.provider) || "").slice(0, 24),
+              String(b.mode || (prev && prev.mode) || "token"),
+              num(b.in_text_per_m, prev && prev.in_text_per_m),
+              num(b.in_image_per_m, prev && prev.in_image_per_m),
+              num(b.out_per_m, prev && prev.out_per_m),
+              num(b.per_image, prev && prev.per_image),
+              // 고화소 단가와 레퍼런스 과금도 같이 저장한다. 예전엔 화면에 칸만
+              // 있고 저장이 안 돼 고쳐도 조용히 원래 값으로 남았다.
+              num(b.per_image_hi, prev && prev.per_image_hi),
+              num(b.px_threshold, prev && prev.px_threshold),
+              num(b.in_per_image, prev && prev.in_per_image),
+              num(b.in_free_count, prev && prev.in_free_count),
+              b.verified ? 1 : 0, String(b.note || "").slice(0, 200), nowIso()).run();
+      return json({ ok: true, model, effective_from: eff });
     }
     const r = await env.USAGE_DB.prepare(
-      "SELECT * FROM prices ORDER BY provider, model").all();
+      "SELECT * FROM prices ORDER BY provider, model, effective_from").all();
     return json({ ok: true, prices: r.results || [] });
   }
   if (path === "/admin/revoke" && request.method === "POST") {
@@ -397,30 +433,85 @@ const slug = (s) => String(s || "").trim().toLowerCase()
 const ADMIN_HTML = `<!DOCTYPE html><html lang="ko"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>NanoBanana 사용량</title><link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231e1e23'/%3E%3Crect x='7' y='17' width='4.5' height='9' rx='1.5' fill='%23D4A574'/%3E%3Crect x='13.8' y='12' width='4.5' height='14' rx='1.5' fill='%23D4A574'/%3E%3Crect x='20.6' y='6' width='4.5' height='20' rx='1.5' fill='%23E8C9A0'/%3E%3C/svg%3E"><style>
-:root{--bg:#16161a;--surf:#1e1e23;--line:#2e2e36;--tx:#e9e9ee;--tx2:#9a9aa4;--acc:#D4A574;--warn:#FFD60A}
+:root{--bg:#16161a;--surf:#1e1e23;--surf2:#25252b;--line:#2e2e36;--tx:#e9e9ee;--tx2:#9a9aa4;
+      --acc:#D4A574;--acc2:#E8C9A0;--warn:#FFD60A;--ok:#7ee08a;--err:#ff8a8a}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--tx);font:13px/1.55 'Malgun Gothic','Segoe UI',system-ui,sans-serif;padding:20px}
-h1{font-size:17px;margin-bottom:4px}.sub{color:var(--tx2);font-size:12px;margin-bottom:16px}
-.tabs{display:flex;gap:6px;margin-bottom:14px;border-bottom:1px solid var(--line)}
-.tabs button{background:none;border:none;color:var(--tx2);padding:8px 14px;cursor:pointer;font:inherit;border-bottom:2px solid transparent}
+body{background:var(--bg);color:var(--tx);font:13px/1.55 'Malgun Gothic','Segoe UI',system-ui,sans-serif;
+     padding:22px;max-width:1180px;margin:0 auto}
+h1{font-size:18px;letter-spacing:-.2px}
+.top{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:3px}
+.sub{color:var(--tx2);font-size:12px}
+.tabs{display:flex;gap:4px;margin:16px 0 14px;border-bottom:1px solid var(--line)}
+.tabs button{background:none;border:none;color:var(--tx2);padding:9px 15px;cursor:pointer;font:inherit;
+             border-bottom:2px solid transparent}
 .tabs button.on{color:var(--tx);border-bottom-color:var(--acc)}
-.card{background:var(--surf);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px}
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.card{background:var(--surf);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+.card h2{font-size:13px;color:var(--tx2);font-weight:600;margin-bottom:12px;letter-spacing:.2px}
+.row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
 label{color:var(--tx2);font-size:12px}
-input,select{background:#121216;color:var(--tx);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}
-button.go{background:var(--acc);color:#221a10;border:none;border-radius:6px;padding:7px 14px;font-weight:700;cursor:pointer}
-button.ghost{background:#26262c;color:var(--tx);border:1px solid var(--line);border-radius:6px;padding:6px 12px;cursor:pointer}
-table{width:100%;border-collapse:collapse;margin-top:10px}
-th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);font-size:12px}
+input,select{background:#121216;color:var(--tx);border:1px solid var(--line);border-radius:7px;
+             padding:6px 9px;font:inherit}
+button.go{background:var(--acc);color:#221a10;border:none;border-radius:7px;padding:7px 15px;
+          font-weight:700;cursor:pointer}
+button.ghost{background:var(--surf2);color:var(--tx);border:1px solid var(--line);border-radius:7px;
+             padding:5px 11px;cursor:pointer;font:inherit;white-space:nowrap}
+button.ghost:hover{border-color:var(--acc)}
+.chips{display:flex;gap:5px;flex-wrap:wrap}
+.chips button{background:none;border:1px solid var(--line);color:var(--tx2);border-radius:999px;
+              padding:5px 12px;cursor:pointer;font:inherit;font-size:12px}
+.chips button.on{background:var(--acc);border-color:var(--acc);color:#221a10;font-weight:700}
+
+/* 기간을 문장으로 크게 — 이 화면을 남과 같이 볼 때 제일 먼저 물어보는 게 "언제부터?" 다 */
+.period{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.period .range{font-size:20px;font-weight:700;letter-spacing:-.3px}
+.period .len{color:var(--tx2);font-size:12px}
+
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:14px}
+.kpi{background:var(--surf);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.kpi .k{color:var(--tx2);font-size:12px;margin-bottom:5px}
+.kpi .v{font-size:25px;font-weight:700;letter-spacing:-.5px;line-height:1.15}
+.kpi .s{color:var(--tx2);font-size:12px;margin-top:3px}
+.kpi.flag{border-color:#5a4a12}
+.kpi.flag .v{color:var(--warn)}
+
+table{width:100%;border-collapse:collapse;margin-top:4px}
+th,td{text-align:left;padding:8px 9px;border-bottom:1px solid var(--line);font-size:12px}
 th{color:var(--tx2);font-weight:600}
+tr:last-child td{border-bottom:none}
 td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
-.big{font-size:24px;font-weight:700}
-.pill{display:inline-block;background:#3a2f12;color:var(--warn);border-radius:10px;padding:2px 9px;font-size:11px}
-.muted{color:var(--tx2)}.err{color:#ff8a8a}.ok{color:#7ee08a}
-.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+tfoot td{font-weight:700;border-top:1px solid var(--line)}
+.pill{display:inline-block;background:#3a2f12;color:var(--warn);border-radius:10px;padding:1px 8px;font-size:11px}
+.pill.arch{background:#2b2b33;color:var(--tx2)}
+.muted{color:var(--tx2)}.err{color:var(--err)}.ok{color:var(--ok)}
+.bar{height:7px;background:var(--surf2);border-radius:4px;overflow:hidden;min-width:60px}
+.bar > i{display:block;height:100%;background:var(--acc);border-radius:4px}
+.empty{color:var(--tx2);padding:18px 2px}
+svg.chart{width:100%;height:160px;display:block}
+svg.chart .gl{stroke:var(--line);stroke-width:1}
+svg.chart .bb{fill:var(--acc);opacity:.85}
+svg.chart .bb:hover{opacity:1;fill:var(--acc2)}
+svg.chart text{fill:var(--tx2);font-size:10px}
+.legend{color:var(--tx2);font-size:11px;margin-top:6px}
+.split{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+/* 단가표는 칸이 많다 — 접어놓으면 읽을 수 없으니 가로로 밀어서 본다. */
+#priceTable{overflow-x:auto}
+#priceTable table{min-width:940px}
+#priceTable td,#priceTable th{white-space:nowrap}
+#priceTable input{width:62px;padding:4px 6px}
+#priceTable select{padding:4px 6px}
+/* 모델명은 한 줄로, 설명만 접힌다 */
+#priceTable td:first-child{white-space:nowrap}
+#priceTable td:first-child div{white-space:normal;max-width:240px}
+/* 이름이 길어도 ID·버튼 칸이 짜불어지지 않게 */
+#teamList td:first-child,#projList td:first-child{word-break:keep-all}
+#teamList td:nth-child(2),#projList td:nth-child(2){font-size:11px;max-width:150px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#teamList td:last-child,#projList td:last-child{width:1%;white-space:nowrap}
+@media(max-width:860px){.split{grid-template-columns:1fr}}
 </style></head><body>
-<h1>NanoBanana 사용량</h1>
-<div class="sub">이미지 한 장마다 팀·프로젝트로 비용이 잡힙니다. 금액은 저장하지 않고, 조회할 때 단가를 곱합니다.</div>
+
+<div class="top"><h1>NanoBanana 사용량</h1><span class="sub" id="fxLine"></span></div>
+<div class="sub">이미지 한 장마다 팀·프로젝트로 비용이 잡힙니다. 금액은 저장하지 않고, 조회할 때 그 날짜의 단가와 환율을 곱합니다.</div>
 
 <div class="tabs">
   <button id="tb-usage" class="on" onclick="show('usage')">사용량</button>
@@ -429,45 +520,70 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 </div>
 
 <div id="pane-usage">
-  <div class="card row">
-    <label>기간</label><input type="date" id="from"><span class="muted">~</span><input type="date" id="to">
-    <label>묶기</label>
-    <select id="gb"><option value="project">프로젝트</option><option value="team">팀</option>
-      <option value="user">사람</option><option value="model">모델</option><option value="day">날짜</option>
-      <option value="machine">PC</option></select>
-    <button class="go" onclick="loadUsage()">조회</button>
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <div class="chips" id="presets"></div>
+      <div class="row">
+        <input type="date" id="from"><span class="muted">~</span><input type="date" id="to">
+        <button class="go" onclick="loadUsage()">조회</button>
+      </div>
+    </div>
   </div>
-  <div class="card grid3" id="summary"></div>
-  <div class="card"><div id="usageTable" class="muted">조회를 눌러주세요.</div></div>
+
+  <div class="period"><span class="range" id="periodText">—</span><span class="len" id="periodLen"></span></div>
+  <div class="kpis" id="kpis"></div>
+
+  <div class="card">
+    <h2>날짜별 추이</h2>
+    <div id="trend"><div class="empty">불러오는 중…</div></div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between;margin-bottom:10px">
+      <h2 style="margin:0">묶어 보기</h2>
+      <div class="chips" id="gbChips"></div>
+    </div>
+    <div id="shareChart"></div>
+    <div id="usageTable"><div class="empty">조회를 눌러주세요.</div></div>
+  </div>
 </div>
 
 <div id="pane-setup" style="display:none">
-  <div class="card">
-    <b>팀 추가</b>
-    <div class="row" style="margin-top:8px">
-      <input id="tName" placeholder="예: 디자인팀" style="min-width:200px">
-      <button class="go" onclick="addTeam()">추가</button>
+  <div class="split">
+    <div class="card">
+      <h2>팀</h2>
+      <div class="row">
+        <input id="tName" placeholder="예: 11팀" style="flex:1;min-width:140px">
+        <button class="go" onclick="addTeam()">추가</button>
+      </div>
+      <div id="teamList"></div>
     </div>
-    <div id="teamList"></div>
-  </div>
-  <div class="card">
-    <b>프로젝트 추가</b>
-    <div class="row" style="margin-top:8px">
-      <input id="pName" placeholder="예: [26P50]DL E&amp;C PT" style="min-width:260px">
-      <button class="go" onclick="addProject()">추가</button>
+    <div class="card">
+      <h2>프로젝트</h2>
+      <div class="row">
+        <input id="pName" placeholder="예: [26P53]○○○ 캠페인" style="flex:1;min-width:160px">
+        <button class="go" onclick="addProject()">추가</button>
+      </div>
+      <div id="projList"></div>
     </div>
-    <div id="projList"></div>
   </div>
-  <div class="sub">팀과 프로젝트는 각각 따로 고릅니다 &mdash; 한 건을 여러 팀이 같이 할 수 있기 때문입니다.<br>끄기를 누르면 앱 목록에서 사라집니다. 지난 사용 기록은 그대로 남습니다.</div>
+  <div class="card sub" style="line-height:1.7">
+    팀과 프로젝트는 각각 따로 고릅니다 &mdash; 한 건을 여러 팀이 같이 할 수 있기 때문입니다.<br>
+    <b>보관</b>은 삭제가 아닙니다. 앱의 선택 목록에서만 빠지고 <b>지난 사용량과 비용은 리포트에 그대로 남습니다.</b>
+    끝난 프로젝트는 보관해 두면 목록이 깔끔해지고, 나중에 다시 쓸 일이 생기면 되살리면 됩니다.
+  </div>
 </div>
 
 <div id="pane-price" style="display:none">
-  <div class="card"><b>환율</b> <span id="fxNow" class="muted"></span>
-    <button class="ghost" style="margin-left:8px" onclick="refreshFx()">지금 갱신</button>
-    <div class="sub" style="margin:8px 0 0">매일 자동으로 받아옵니다. 리포트는 각 이미지가 만들어진 날의 환율로 환산합니다.</div>
+  <div class="card">
+    <h2>환율</h2>
+    <div class="row"><span id="fxNow" class="muted"></span>
+      <button class="ghost" onclick="refreshFx()">지금 갱신</button></div>
+    <div class="sub" style="margin-top:8px">매일 자동으로 받아옵니다. 리포트는 각 이미지가 만들어진 <b>그 날의 환율</b>로 환산합니다 &mdash; 오늘 환율로 과거를 환산하면 지난달 숫자가 매일 달라집니다.</div>
   </div>
-  <div class="card"><b>모델 단가</b><div id="priceTable"></div>
-    <div class="sub" style="margin-top:8px">단가를 바꾸면 <b>과거 집계까지 다시 계산</b>됩니다. 금액이 아니라 사용량을 저장하기 때문입니다.</div>
+  <div class="card"><h2>모델 단가 (USD)</h2><div id="priceTable"></div>
+    <div class="sub" style="margin-top:10px">단가를 고치면 <b>과거 집계까지 다시 계산</b>됩니다. 금액이 아니라 사용량을 저장하기 때문입니다.<br>
+      장당가는 출력 픽셀이 기준을 넘으면 고화소 단가로 바뀝니다 (Seedream 5 Pro: 2.61M 픽셀 초과).</div>
   </div>
 </div>
 
@@ -476,10 +592,18 @@ const KEY_LS = "nb_admin_key";
 let KEY = localStorage.getItem(KEY_LS) || "";
 if (!KEY) { KEY = prompt("관리자 키") || ""; if (KEY) localStorage.setItem(KEY_LS, KEY); }
 const H = () => ({ "X-Admin-Key": KEY, "Content-Type": "application/json" });
-const fmtUsd = n => "$" + (Number(n) || 0).toFixed(4);
-const fmtKrw = n => Math.round(Number(n) || 0).toLocaleString("ko-KR") + "원";
+
 const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const nf = n => (Number(n) || 0).toLocaleString("ko-KR");
+const krw = n => nf(Math.round(Number(n) || 0)) + "원";
+// 작은 금액이 전부 $0.00 으로 보이면 아무것도 못 읽는다 — 자리수를 값에 맞춘다.
+const usd = n => { const v = Number(n) || 0;
+  return "$" + (v === 0 ? "0" : v < 1 ? v.toFixed(4) : v < 1000 ? v.toFixed(2) : nf(Math.round(v))); };
+const pct = (a, b) => b > 0 ? (a / b * 100).toFixed(1) + "%" : "0%";
+// 2장/16일 을 반올림해 "0장" 으로 보여주면 숫자가 거짓말을 한다.
+const avg = n => { const v = Number(n) || 0;
+  return v > 0 && v < 10 ? v.toFixed(1) : nf(Math.round(v)); };
 
 async function api(path, opt) {
   const r = await fetch(path, { headers: H(), ...(opt || {}) });
@@ -499,69 +623,259 @@ function show(which) {
   if (which === "price") { loadPrices(); loadFx(); }
 }
 
-async function loadUsage() {
-  const f = document.getElementById("from").value || "2000-01-01";
-  const t = document.getElementById("to").value || "2999-12-31";
-  const gb = document.getElementById("gb").value;
-  const d = await api("/admin/usage?from=" + f + "&to=" + t + "&group_by=" + gb);
-  const tbl = document.getElementById("usageTable");
-  if (!d.ok) { tbl.innerHTML = '<span class="err">' + esc(d.error || "조회 실패") + '</span>'; return; }
-  const rate = d.usd_krw || 0;
-  document.getElementById("summary").innerHTML =
-    '<div><div class="muted">총 비용</div><div class="big">' + fmtUsd(d.total_cost_usd) + '</div>'
-    + (rate ? '<div class="muted">' + fmtKrw(d.total_cost_usd * rate) + '</div>' : '') + '</div>'
-    + '<div><div class="muted">이미지</div><div class="big">' + (d.total_images || 0).toLocaleString() + '장</div></div>'
-    + '<div><div class="muted">단가 미설정</div><div class="big">' + (d.unpriced_images || 0) + '장</div>'
-    + (d.unpriced_images > 0 ? '<span class="pill">단가 탭에서 채워주세요</span>' : '') + '</div>';
-  if (!d.rows.length) { tbl.innerHTML = '<span class="muted">이 기간에 기록이 없습니다.</span>'; return; }
-  let h = '<table><tr><th>' + esc(gb) + '</th><th class="num">이미지</th><th class="num">출력 토큰</th>'
-        + '<th class="num">비용(USD)</th>' + (rate ? '<th class="num">원화</th>' : '') + '</tr>';
-  for (const r of d.rows) {
-    h += '<tr><td>' + esc(r.label) + (r.unpriced > 0 ? ' <span class="pill">단가없음</span>' : '') + '</td>'
-      + '<td class="num">' + (r.images || 0).toLocaleString() + '</td>'
-      + '<td class="num">' + (r.out_tokens || 0).toLocaleString() + '</td>'
-      + '<td class="num">' + fmtUsd(r.cost_usd) + '</td>'
-      + (rate ? '<td class="num">' + fmtKrw((r.cost_usd || 0) * rate) + '</td>' : '') + '</tr>';
-  }
-  tbl.innerHTML = h + '</table>';
+/* ---- 기간 ---- */
+const iso = d => d.toISOString().slice(0, 10);
+function presetRange(k) {
+  const now = new Date(), y = now.getFullYear(), m = now.getMonth();
+  if (k === "thisMonth") return [iso(new Date(Date.UTC(y, m, 1))), iso(now)];
+  if (k === "lastMonth") return [iso(new Date(Date.UTC(y, m - 1, 1))), iso(new Date(Date.UTC(y, m, 0)))];
+  if (k === "d7")  { const s = new Date(now); s.setDate(s.getDate() - 6); return [iso(s), iso(now)]; }
+  if (k === "d30") { const s = new Date(now); s.setDate(s.getDate() - 29); return [iso(s), iso(now)]; }
+  if (k === "year") return [iso(new Date(Date.UTC(y, 0, 1))), iso(now)];
+  return ["2000-01-01", iso(now)];
+}
+const PRESETS = [["thisMonth", "이번 달"], ["lastMonth", "지난달"], ["d7", "최근 7일"],
+                 ["d30", "최근 30일"], ["year", "올해"], ["all", "전체"]];
+let curPreset = "thisMonth";
+document.getElementById("presets").innerHTML = PRESETS.map(p =>
+  '<button data-preset="' + p[0] + '">' + p[1] + '</button>').join("");
+function applyPreset(k) {
+  curPreset = k;
+  const r = presetRange(k);
+  document.getElementById("from").value = r[0];
+  document.getElementById("to").value = r[1];
+  markPreset();
+  loadUsage();
+}
+function markPreset() {
+  document.querySelectorAll("#presets button").forEach(b =>
+    b.className = (b.dataset.preset === curPreset) ? "on" : "");
+}
+const KDATE = s => { const p = String(s).split("-");
+  return p.length === 3 ? Number(p[0]) + "년 " + Number(p[1]) + "월 " + Number(p[2]) + "일" : s; };
+function periodLabel(f, t) {
+  document.getElementById("periodText").textContent =
+    (f <= "2000-01-01" ? "전체 기간" : KDATE(f)) + " ~ " + KDATE(t);
+  const days = Math.round((Date.parse(t) - Date.parse(f)) / 86400000) + 1;
+  document.getElementById("periodLen").textContent =
+    (f <= "2000-01-01" || !isFinite(days)) ? "" : "(" + nf(days) + "일간)";
+  return days;
 }
 
-async function loadCatalog() {
-  const d = await api("/admin/catalog");
-  const teams = d.teams || [], projects = d.projects || [];
-  document.getElementById("teamList").innerHTML = teams.length
-    ? '<table><tr><th>팀</th><th>ID</th><th></th></tr>' + teams.map(t =>
-        '<tr><td>' + esc(t.name) + '</td><td class="muted">' + esc(t.id) + '</td>'
-        + '<td><button class="ghost" data-off-team="' + esc(t.id) + '" data-name="' + esc(t.name) + '">끄기</button></td></tr>'
-      ).join("") + '</table>'
-    : '<div class="muted" style="margin-top:8px">아직 팀이 없습니다. 하나 추가하면 앱에서 바로 보입니다.</div>';
-  document.getElementById("projList").innerHTML = projects.length
-    ? '<table><tr><th>프로젝트</th><th>ID</th><th></th></tr>' + projects.map(p =>
-        '<tr><td>' + esc(p.name) + '</td>'
-        + '<td class="muted">' + esc(p.id) + '</td>'
-        + '<td><button class="ghost" data-off-proj="' + esc(p.id) + '" data-name="' + esc(p.name)
-        + '">끄기</button></td></tr>'
-      ).join("") + '</table>'
-    : '<div class="muted" style="margin-top:8px">아직 프로젝트가 없습니다.</div>';
+/* ---- 묶기 ---- */
+const GBS = [["project", "프로젝트"], ["team", "팀"], ["user", "사람"],
+             ["model", "모델"], ["machine", "PC"], ["day", "날짜"]];
+let curGb = "project";
+document.getElementById("gbChips").innerHTML = GBS.map(g =>
+  '<button data-gb="' + g[0] + '">' + g[1] + '</button>').join("");
+function markGb() {
+  document.querySelectorAll("#gbChips button").forEach(b =>
+    b.className = (b.dataset.gb === curGb) ? "on" : "");
 }
+const gbName = k => (GBS.find(g => g[0] === k) || [k, k])[1];
 
-// 버튼 핸들러는 위임으로 붙인다 — 이름에 따옴표가 들어가도 깨지지 않는다.
 document.addEventListener("click", async (e) => {
   const b = e.target.closest("button");
   if (!b) return;
+  if (b.dataset.preset) { applyPreset(b.dataset.preset); return; }
+  if (b.dataset.gb) { curGb = b.dataset.gb; markGb(); loadUsage(); return; }
   if (b.dataset.offTeam) {
     await api("/admin/team", { method: "POST", body: JSON.stringify(
       { id: b.dataset.offTeam, name: b.dataset.name, active: false }) });
+    loadCatalog();
+  } else if (b.dataset.onTeam) {
+    await api("/admin/team", { method: "POST", body: JSON.stringify(
+      { id: b.dataset.onTeam, name: b.dataset.name, active: true }) });
     loadCatalog();
   } else if (b.dataset.offProj) {
     await api("/admin/project", { method: "POST", body: JSON.stringify(
       { id: b.dataset.offProj, name: b.dataset.name, active: false }) });
     loadCatalog();
+  } else if (b.dataset.onProj) {
+    await api("/admin/project", { method: "POST", body: JSON.stringify(
+      { id: b.dataset.onProj, name: b.dataset.name, active: true }) });
+    loadCatalog();
+  } else if (b.dataset.delTeam || b.dataset.delProj) {
+    const isTeam = Boolean(b.dataset.delTeam);
+    const id = b.dataset.delTeam || b.dataset.delProj;
+    if (!confirm('"' + b.dataset.name
+               + '" 을(를) 목록에서 완전히 지울까요? 사용 기록이 한 건이라도 있으면 지워지지 않습니다.')) return;
+    const d = await api(isTeam ? "/admin/team" : "/admin/project",
+      { method: "POST", body: JSON.stringify({ id, name: b.dataset.name, delete: true }) });
+    if (!d.ok) alert(d.error || "실패");
+    loadCatalog();
   } else if (b.dataset.savePrice) {
-    savePrice(b.dataset.savePrice, b.dataset.pid);
+    savePrice(b.dataset.savePrice, b.dataset.pid, b.dataset.eff);
   }
 });
 
+/* ---- 일별 막대 (라이브러리 없이 SVG 로 직접) ---- */
+// 기록이 있는 날만 그리면 빈 날이 접혀 막대 간격이 날짜와 어긋난다 — 기간 전체를 깔아둔다.
+// 너무 긴 구간(1년+)은 그대로 두면 막대가 머리카락이 되므로 있는 날만 보여준다.
+function fillDays(from, to, rows) {
+  const a = Date.parse(from), b = Date.parse(to);
+  if (!isFinite(a) || !isFinite(b) || b < a) return rows;
+  const n = Math.round((b - a) / 86400000) + 1;
+  if (n > 120) return rows;
+  const by = {};
+  rows.forEach(r => { by[r.day] = r; });
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const day = new Date(a + i * 86400000).toISOString().slice(0, 10);
+    out.push(by[day] || { day, images: 0, cost_usd: 0, cost_krw: 0 });
+  }
+  return out;
+}
+function trendSvg(days, useKrw) {
+  if (!days.length) return '<div class="empty">이 기간에 기록이 없습니다.</div>';
+  const W = 1000, HH = 160, PB = 22, PL = 4;
+  const val = d => useKrw ? (d.cost_krw || 0) : (d.cost_usd || 0);
+  const max = Math.max.apply(null, days.map(val).concat([0])) || 1;
+  const n = days.length, slot = (W - PL * 2) / n, bw = Math.max(2, Math.min(38, slot * 0.68));
+  let s = '<svg class="chart" viewBox="0 0 ' + W + ' ' + HH + '" preserveAspectRatio="none">';
+  for (let i = 0; i <= 3; i++) {
+    const y = PB + (HH - PB * 2) * i / 3;
+    s += '<line class="gl" x1="0" y1="' + y.toFixed(1) + '" x2="' + W + '" y2="' + y.toFixed(1) + '"/>';
+  }
+  days.forEach((d, i) => {
+    const v = val(d), h = Math.max(1, (HH - PB * 2) * v / max);
+    const x = PL + slot * i + (slot - bw) / 2, y = HH - PB - h;
+    s += '<rect class="bb" x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" width="' + bw.toFixed(1)
+       + '" height="' + h.toFixed(1) + '" rx="2"><title>' + esc(d.day) + '  '
+       + (useKrw ? krw(d.cost_krw) : usd(d.cost_usd)) + '  ' + nf(d.images) + '장</title></rect>';
+  });
+  // 라벨은 첫·중간·끝만. 30일치 날짜를 다 찍으면 읽을 수 없는 띠가 된다.
+  [0, Math.floor(n / 2), n - 1].filter((v, i, a) => a.indexOf(v) === i).forEach(i => {
+    const x = PL + slot * i + slot / 2;
+    s += '<text x="' + x.toFixed(1) + '" y="' + (HH - 6) + '" text-anchor="middle">'
+       + esc(days[i].day.slice(5)) + '</text>';
+  });
+  s += '<text x="2" y="14">' + (useKrw ? krw(max) : usd(max)) + '</text>';
+  return s + '</svg><div class="legend">막대 하나가 하루입니다. 올려두면 그 날 금액과 장수가 보입니다.</div>';
+}
+
+/* ---- 비중 막대 ---- */
+function shareBars(rows, total, useKrw) {
+  if (!rows.length) return "";
+  const val = r => useKrw ? (r.cost_krw || 0) : (r.cost_usd || 0);
+  const top = rows.slice(0, 8);
+  const rest = rows.slice(8).reduce((a, r) => a + val(r), 0);
+  let h = '<table style="margin-bottom:14px">';
+  top.forEach(r => {
+    const v = val(r);
+    h += '<tr><td style="width:34%">' + esc(r.label)
+       + (r.archived ? ' <span class="pill arch">보관</span>' : '')
+       + '</td><td><div class="bar"><i style="width:' + (total > 0 ? (v / total * 100) : 0).toFixed(1)
+       + '%"></i></div></td><td class="num" style="width:120px">'
+       + (useKrw ? krw(v) : usd(v)) + '</td><td class="num muted" style="width:62px">'
+       + pct(v, total) + '</td></tr>';
+  });
+  if (rest > 0) {
+    h += '<tr><td class="muted">그 외 ' + (rows.length - top.length) + '개</td>'
+       + '<td><div class="bar"><i style="width:' + (total > 0 ? (rest / total * 100) : 0).toFixed(1)
+       + '%;background:#4a4a55"></i></div></td><td class="num muted">'
+       + (useKrw ? krw(rest) : usd(rest)) + '</td><td class="num muted">' + pct(rest, total) + '</td></tr>';
+  }
+  return h + '</table>';
+}
+
+async function loadUsage() {
+  markPreset(); markGb();
+  const f = document.getElementById("from").value || "2000-01-01";
+  const t = document.getElementById("to").value || "2999-12-31";
+  const days = periodLabel(f, t);
+  document.getElementById("trend").innerHTML = '<div class="empty">불러오는 중…</div>';
+  const d = await api("/admin/usage?from=" + f + "&to=" + t + "&group_by=" + curGb);
+  const tbl = document.getElementById("usageTable");
+  if (!d.ok) {
+    document.getElementById("kpis").innerHTML = "";
+    document.getElementById("trend").innerHTML = "";
+    tbl.innerHTML = '<div class="err" style="padding:14px 2px">' + esc(d.error || "조회 실패") + '</div>';
+    return;
+  }
+  const rate = d.usd_krw || 0;
+  // 그 날 환율로 이미 SQL 이 환산해 준다. 환율 이력이 아직 없으면(첫 실행) 최신 값으로 메운다.
+  const totalKrw = d.total_cost_krw || (d.total_cost_usd * rate);
+  const useKrw = totalKrw > 0;
+  const rows = (d.rows || []).map(r => ({ ...r, cost_krw: r.cost_krw || (r.cost_usd * rate) }));
+  const dayRows = (d.days || []).map(r => ({ ...r, cost_krw: r.cost_krw || (r.cost_usd * rate) }));
+
+  const perDay = days > 0 ? totalKrw / days : 0;
+  const busiest = dayRows.slice().sort((a, b) => (b.cost_krw || 0) - (a.cost_krw || 0))[0];
+  document.getElementById("kpis").innerHTML =
+      kpi("총 비용", useKrw ? krw(totalKrw) : usd(d.total_cost_usd),
+          useKrw ? usd(d.total_cost_usd) : "환율을 아직 못 받았습니다")
+    + kpi("이미지", nf(d.total_images) + "장",
+          days > 0 ? "하루 평균 " + avg(d.total_images / days) + "장" : "")
+    + kpi("하루 평균 비용", useKrw ? krw(perDay) : usd(d.total_cost_usd / Math.max(days, 1)),
+          busiest ? "가장 많은 날 " + busiest.day + " · " + (useKrw ? krw(busiest.cost_krw) : usd(busiest.cost_usd)) : "")
+    + (d.unpriced_images > 0
+        ? kpi("단가 미설정", nf(d.unpriced_images) + "장", "단가 탭에서 채우면 이 기간 금액이 다시 계산됩니다", true)
+        : kpi("단가 확인", "전부 확인됨", "이 기간의 모든 모델에 단가가 있습니다"));
+
+  document.getElementById("trend").innerHTML = trendSvg(fillDays(f, t, dayRows), useKrw);
+
+  if (!rows.length) {
+    document.getElementById("shareChart").innerHTML = "";
+    tbl.innerHTML = '<div class="empty">이 기간에 기록이 없습니다.</div>';
+    return;
+  }
+  document.getElementById("shareChart").innerHTML = shareBars(rows, totalKrw || d.total_cost_usd, useKrw);
+
+  let h = '<table><tr><th>' + esc(gbName(curGb)) + '</th><th class="num">장수</th>'
+        + '<th class="num">비중</th>' + (useKrw ? '<th class="num">비용(원)</th>' : '')
+        + '<th class="num">비용(USD)</th><th class="num">기간</th></tr>';
+  for (const r of rows) {
+    const v = useKrw ? r.cost_krw : r.cost_usd;
+    h += '<tr><td>' + esc(r.label)
+      + (r.archived ? ' <span class="pill arch">보관</span>' : '')
+      + (r.unpriced > 0 ? ' <span class="pill">단가없음</span>' : '') + '</td>'
+      + '<td class="num">' + nf(r.images) + '</td>'
+      + '<td class="num muted">' + pct(v, useKrw ? totalKrw : d.total_cost_usd) + '</td>'
+      + (useKrw ? '<td class="num">' + krw(r.cost_krw) + '</td>' : '')
+      + '<td class="num muted">' + usd(r.cost_usd) + '</td>'
+      + '<td class="num muted">' + esc(r.first_day === r.last_day ? r.first_day
+          : (String(r.first_day).slice(5) + "~" + String(r.last_day).slice(5))) + '</td></tr>';
+  }
+  h += '<tfoot><tr><td>합계</td><td class="num">' + nf(d.total_images) + '</td><td class="num">100%</td>'
+     + (useKrw ? '<td class="num">' + krw(totalKrw) + '</td>' : '')
+     + '<td class="num">' + usd(d.total_cost_usd) + '</td><td></td></tr></tfoot></table>';
+  tbl.innerHTML = h;
+  document.getElementById("fxLine").textContent = d.usd_krw
+    ? "1 USD = " + nf(Math.round(d.usd_krw)) + "원 (" + d.fx_day + " 기준)" : "";
+}
+function kpi(k, v, s, flag) {
+  return '<div class="kpi' + (flag ? ' flag' : '') + '"><div class="k">' + esc(k) + '</div>'
+       + '<div class="v">' + esc(v) + '</div><div class="s">' + esc(s || "") + '</div></div>';
+}
+
+/* ---- 팀 · 프로젝트 ---- */
+function catTable(items, kind) {
+  const live = items.filter(x => x.active), arch = items.filter(x => !x.active);
+  const off = kind === "team" ? "data-off-team" : "data-off-proj";
+  const on = kind === "team" ? "data-on-team" : "data-on-proj";
+  const del = kind === "team" ? "data-del-team" : "data-del-proj";
+  const mk = (list, btn, cls, withDel) => '<table>' + list.map(x =>
+      '<tr><td>' + esc(x.name) + '</td><td class="muted" style="font-size:11px">' + esc(x.id) + '</td>'
+    + '<td class="num"><button class="ghost" ' + btn + '="' + esc(x.id) + '" data-name="'
+    + esc(x.name) + '">' + cls + '</button>'
+    + (withDel ? ' <button class="ghost" ' + del + '="' + esc(x.id) + '" data-name="'
+                 + esc(x.name) + '">삭제</button>' : '')
+    + '</td></tr>').join("") + '</table>';
+  let h = live.length ? mk(live, off, "보관", false)
+        : '<div class="empty">아직 없습니다. 추가하면 앱에서 바로 보입니다.</div>';
+  if (arch.length) {
+    h += '<div class="sub" style="margin:14px 0 4px">보관됨 ' + arch.length + '개 '
+       + '<span class="muted">&mdash; 앱 목록에는 안 보이지만 지난 비용은 리포트에 남아 있습니다</span></div>'
+       + mk(arch, on, "되살리기", true);
+  }
+  return h;
+}
+async function loadCatalog() {
+  const d = await api("/admin/catalog");
+  document.getElementById("teamList").innerHTML = catTable(d.teams || [], "team");
+  document.getElementById("projList").innerHTML = catTable(d.projects || [], "proj");
+}
 async function addTeam() {
   const name = document.getElementById("tName").value.trim();
   if (!name) return;
@@ -579,49 +893,62 @@ async function addProject() {
   loadCatalog();
 }
 
+/* ---- 단가 · 환율 ---- */
 async function loadPrices() {
   const d = await api("/admin/prices");
   const rows = d.prices || [];
-  let h = '<table><tr><th>모델</th><th>방식</th><th class="num">입력 텍스트/이미지 (1M)</th>'
-        + '<th class="num">출력 (1M)</th><th class="num">장당</th><th class="num">장당(고화소)</th>'
-        + '<th class="num">픽셀 기준</th><th>상태</th><th></th></tr>';
-  for (const p of rows) {
-    const id = "p_" + p.model.replace(/[^a-z0-9]/gi, "_");
+  let h = '<table><tr><th>모델</th><th>적용 시작</th><th>방식</th>'
+        + '<th class="num">입력 텍스트 / 이미지 (1M)</th><th class="num">출력 (1M)</th>'
+        + '<th class="num">장당</th><th class="num">장당(고화소)</th><th class="num">픽셀 기준</th>'
+        + '<th class="num">레퍼런스 장당 / 무료</th><th>상태</th><th></th></tr>';
+  rows.forEach((p, i) => {
+    const id = "p_" + i;
+    const latest = !rows.some(q => q.model === p.model && q.effective_from > p.effective_from);
     h += '<tr><td>' + esc(p.model) + '<div class="muted" style="font-size:11px">' + esc(p.note || "") + '</div></td>'
+      + '<td class="muted">' + esc(p.effective_from)
+      + (latest ? ' <span class="ok" style="font-size:11px">현재</span>' : '') + '</td>'
       + '<td><select id="' + id + '_mode"><option value="token"' + (p.mode === "token" ? " selected" : "") + '>토큰</option>'
       + '<option value="image"' + (p.mode === "image" ? " selected" : "") + '>장수</option></select></td>'
-      + '<td class="num"><input id="' + id + '_it" value="' + p.in_text_per_m + '" size="5"> / '
-      + '<input id="' + id + '_ii" value="' + p.in_image_per_m + '" size="5"></td>'
-      + '<td class="num"><input id="' + id + '_o" value="' + p.out_per_m + '" size="6"></td>'
-      + '<td class="num"><input id="' + id + '_pi" value="' + p.per_image + '" size="6"></td>'
-      + '<td class="num"><input id="' + id + '_ph" value="' + p.per_image_hi + '" size="6"></td>'
+      + '<td class="num"><input id="' + id + '_it" value="' + p.in_text_per_m + '" size="4"> / '
+      + '<input id="' + id + '_ii" value="' + p.in_image_per_m + '" size="4"></td>'
+      + '<td class="num"><input id="' + id + '_o" value="' + p.out_per_m + '" size="5"></td>'
+      + '<td class="num"><input id="' + id + '_pi" value="' + p.per_image + '" size="5"></td>'
+      + '<td class="num"><input id="' + id + '_ph" value="' + p.per_image_hi + '" size="5"></td>'
       + '<td class="num"><input id="' + id + '_px" value="' + p.px_threshold + '" size="8"></td>'
+      + '<td class="num"><input id="' + id + '_ip" value="' + p.in_per_image + '" size="5"> / '
+      + '<input id="' + id + '_if" value="' + p.in_free_count + '" size="2"></td>'
       + '<td>' + (p.verified ? '<span class="ok">확인됨</span>' : '<span class="pill">확인 필요</span>') + '</td>'
-      + '<td><button class="ghost" data-save-price="' + esc(p.model) + '" data-pid="' + id + '">저장</button></td></tr>';
-  }
+      + '<td class="num"><button class="ghost" data-save-price="' + esc(p.model) + '" data-pid="' + id
+      + '" data-eff="' + esc(p.effective_from) + '">이 행 수정</button>'
+      + (latest ? ' <button class="ghost" data-save-price="' + esc(p.model) + '" data-pid="' + id
+                  + '" data-eff="today">오늘부터 새 단가</button>' : '')
+      + '</td></tr>';
+  });
   document.getElementById("priceTable").innerHTML = h + '</table>';
 }
-async function savePrice(model, id) {
+// "이 행 수정" 은 오타 정정, "오늘부터 새 단가" 는 시점을 새로 여는 것이다.
+// 단가가 바뀐 걸 기존 행에 덮어쓰면 지난달 집계까지 새 단가로 다시 계산된다.
+async function savePrice(model, id, eff) {
   const v = k => document.getElementById(id + k).value;
+  const when = eff === "today" ? new Date().toISOString().slice(0, 10) : eff;
+  if (eff === "today" && !confirm(when + " 부터 적용되는 새 단가로 넣습니다. 그 전 기간은 지금 단가 그대로 남습니다.")) return;
   const d = await api("/admin/prices", { method: "POST", body: JSON.stringify({
-    model, mode: v("_mode"), in_text_per_m: v("_it"), in_image_per_m: v("_ii"),
-    out_per_m: v("_o"), per_image: v("_pi"), per_image_hi: v("_ph"),
-    px_threshold: v("_px"), verified: 1 }) });
+    model, effective_from: when, mode: v("_mode"),
+    in_text_per_m: v("_it"), in_image_per_m: v("_ii"), out_per_m: v("_o"),
+    per_image: v("_pi"), per_image_hi: v("_ph"), px_threshold: v("_px"),
+    in_per_image: v("_ip"), in_free_count: v("_if"), verified: 1 }) });
   if (!d.ok) return alert(d.error || "실패");
   loadPrices();
 }
 async function loadFx() {
   const d = await api("/admin/fx");
   document.getElementById("fxNow").textContent = (d.ok && d.usd_krw)
-    ? ("1 USD = " + Number(d.usd_krw).toLocaleString("ko-KR") + "원  (" + d.day + " 기준)")
+    ? ("1 USD = " + nf(Math.round(d.usd_krw)) + "원  (" + d.day + " 기준)")
     : "아직 받아온 환율이 없습니다";
 }
-async function refreshFx() { await api("/admin/fx?refresh=1"); loadFx(); }
+async function refreshFx() { await api("/admin/fx?refresh=1"); loadFx(); loadUsage(); }
 
-const today = new Date().toISOString().slice(0, 10);
-document.getElementById("from").value = today.slice(0, 8) + "01";
-document.getElementById("to").value = today;
-loadUsage();
+applyPreset("thisMonth");
 </script></body></html>`;
 
 /**
@@ -658,13 +985,63 @@ async function latestFx(env) {
 }
 
 
-/** 앱이 실행할 때 받아가는 목록. 서버에서 바꾸면 다음 실행에 바로 반영된다. */
-async function handleCatalog(env) {
+/**
+ * 목록에서 완전히 지운다 — 오타로 만든 이름을 치우는 용도.
+ *
+ * 한 장이라도 비용이 잡힌 적이 있으면 거부한다. 지워버리면 그 행의 이름표가
+ * 사라져 리포트에 슬러그만 남고, 무엇보다 "끝난 프로젝트의 지난 비용" 이라는
+ * 이 집계의 존재 이유가 무너진다. 그런 건 지우는 게 아니라 **보관**하는 것이다.
+ */
+async function dropCatalogRow(env, table, col, id) {
+  const used = await env.USAGE_DB.prepare(
+    `SELECT COUNT(*) AS n FROM usage_events WHERE ${col} = ?`).bind(id).first();
+  if (used && used.n > 0) {
+    return { ok: false, used: used.n,
+             error: "사용 기록이 " + used.n + "건 있어 지울 수 없습니다. 보관으로 내려두세요." };
+  }
+  await env.USAGE_DB.prepare(`DELETE FROM ${table} WHERE id = ?`).bind(id).run();
+  return { ok: true, deleted: id };
+}
+
+/**
+ * 사람이 읽는 순서로 정렬한다.
+ *
+ * SQL 의 `ORDER BY name` 은 문자열 비교라 "10팀" 이 "1팀" 보다 앞에 온다. 숫자가
+ * 섞인 이름을 고르는 화면에서 그건 그냥 고장난 목록으로 보인다. 숫자 덩어리는
+ * 숫자로, 나머지는 코드포인트로 비교한다 — 현대 한글 음절은 코드포인트 순서가
+ * 가나다 순서와 같으므로 별도 로케일 데이터 없이도 맞다.
+ */
+function natCmp(a, b) {
+  const re = /(\d+)|(\D+)/g;
+  const ax = String(a || "").match(re) || [], bx = String(b || "").match(re) || [];
+  for (let i = 0; i < Math.min(ax.length, bx.length); i++) {
+    const an = /^\d/.test(ax[i]), bn = /^\d/.test(bx[i]);
+    if (an && bn) {
+      const d = Number(ax[i]) - Number(bx[i]);
+      if (d) return d;
+    } else if (ax[i] !== bx[i]) {
+      return ax[i] < bx[i] ? -1 : 1;
+    }
+  }
+  return ax.length - bx.length;
+}
+const byName = (x, y) => natCmp(x.name || x.id, y.name || y.id);
+
+/**
+ * 앱이 실행할 때 받아가는 목록. 서버에서 바꾸면 다음 실행에 바로 반영된다.
+ * 앱에는 살아 있는 것만 주고, 관리자 화면은 보관된 것까지 받아 되살릴 수 있다.
+ */
+async function handleCatalog(env, includeArchived) {
+  const w = includeArchived ? "" : " WHERE active=1";
   const teams = await env.USAGE_DB.prepare(
-    "SELECT id, name FROM teams WHERE active=1 ORDER BY name").all();
+    "SELECT id, name, active FROM teams" + w).all();
   const projects = await env.USAGE_DB.prepare(
-    "SELECT id, name, team_id FROM projects WHERE active=1 ORDER BY name").all();
-  return { ok: true, teams: teams.results || [], projects: projects.results || [] };
+    "SELECT id, name, team_id, active FROM projects" + w).all();
+  return {
+    ok: true,
+    teams: (teams.results || []).sort(byName),
+    projects: (projects.results || []).sort(byName),
+  };
 }
 
 /**
@@ -680,12 +1057,15 @@ async function handleUsage(request, env, rec) {
   const events = Array.isArray(body.events) ? body.events.slice(0, 500) : [];
   if (!events.length) return { st: 200, b: { ok: true, accepted: 0 } };
 
+  // out_px / ref_images 는 앱이 처음부터 보내던 값인데 이 칸이 없어 버려지고
+  // 있었다 — 그래서 픽셀 구간제와 레퍼런스 과금이 한 번도 적용되지 않았다.
   const stmt = env.USAGE_DB.prepare(
     `INSERT OR IGNORE INTO usage_events
        (id, ts, day, team_id, project_id, token_id, user, machine,
         provider, model, size, quality, images,
-        in_text_tokens, in_image_tokens, out_tokens, elapsed_ms, app_version, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+        in_text_tokens, in_image_tokens, out_tokens, out_px, ref_images,
+        elapsed_ms, app_version, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   const created = nowIso();
   const batch = [];
   for (const e of events) {
@@ -699,7 +1079,7 @@ async function handleUsage(request, env, rec) {
       String(e.size || "").slice(0, 24), String(e.quality || "").slice(0, 16),
       Number(e.images) || 1,
       Number(e.in_text_tokens) || 0, Number(e.in_image_tokens) || 0,
-      Number(e.out_tokens) || 0,
+      Number(e.out_tokens) || 0, Number(e.out_px) || 0, Number(e.ref_images) || 0,
       e.elapsed_ms == null ? null : Number(e.elapsed_ms),
       String(e.app_version || "").slice(0, 32), created));
   }
@@ -734,6 +1114,51 @@ const GROUPS = {
   model: "e.model", day: "e.day", machine: "e.machine",
 };
 
+/**
+ * 한 행(=이미지 한 장)의 비용식. 집계 쿼리와 일별 쿼리가 **같은 문자열**을 쓴다 —
+ * 두 벌로 적어두면 언젠가 한쪽만 고쳐져 합계와 그래프가 어긋난다.
+ *
+ * mode='image' 는 장당가인데 출력 픽셀이 px_threshold 를 넘으면 고화소 단가를 쓰고
+ * (seedream-5-0-pro: 2.61M px 초과 $0.09), 레퍼런스는 무료 장수를 뺀 만큼만 붙는다.
+ */
+const COST_USD = `
+  COALESCE(
+    CASE WHEN p.mode='image'
+         THEN e.images * (CASE WHEN p.px_threshold > 0 AND e.out_px > p.px_threshold
+                               THEN p.per_image_hi ELSE p.per_image END)
+            + MAX(e.ref_images - p.in_free_count, 0) * p.in_per_image
+         ELSE e.in_text_tokens  * p.in_text_per_m  / 1000000.0
+            + e.in_image_tokens * p.in_image_per_m / 1000000.0
+            + e.out_tokens      * p.out_per_m      / 1000000.0
+    END, 0)`;
+
+/**
+ * 그 이미지가 만들어진 **날짜에 유효했던** 단가 한 행만 고른다.
+ *
+ * 단순히 model 로만 조인하면 단가를 한 번이라도 바꾼 모델은 행이 두 벌로 매칭돼
+ * 비용이 그대로 두 배가 된다. prices 의 PK 가 (model, effective_from) 이므로
+ * 그 날짜 이하 중 가장 최근 것 하나로 못박아야 한다.
+ */
+const PRICE_JOIN = `
+  LEFT JOIN prices p
+    ON p.model = e.model
+   AND p.effective_from = (SELECT MAX(p2.effective_from) FROM prices p2
+                            WHERE p2.model = e.model AND p2.effective_from <= e.day)`;
+
+/**
+ * 환산은 **그 날의 환율**로 한다. 오늘 환율로 과거 전체를 환산하면 지난달 리포트가
+ * 매일 조금씩 달라져서 아무도 그 숫자를 못 믿는다. 그 날 환율이 없으면(주말·공휴일)
+ * 직전 영업일 값을 쓰고, 아예 하나도 없으면 화면이 최신 환율로 대체한다.
+ */
+const FX_JOIN = `
+  LEFT JOIN fx_rates f
+    ON f.day = (SELECT MAX(f2.day) FROM fx_rates f2 WHERE f2.day <= e.day)`;
+
+// 환율 수집을 시작하기 전에 만든 이미지는 그 날 환율이 아예 없다. 0 으로 두면
+// 원화 합계가 조용히 적게 나온다 — 가진 것 중 가장 오래된 환율로 메운다.
+// (오늘 환율로 메우면 지난달 숫자가 매일 달라진다.)
+const KRW_RATE = `COALESCE(f.usd_krw, (SELECT usd_krw FROM fx_rates ORDER BY day LIMIT 1), 0)`;
+
 async function handleAdminUsage(url, env) {
   const from = (url.searchParams.get("from") || "0000-01-01").slice(0, 10);
   const to = (url.searchParams.get("to") || "9999-12-31").slice(0, 10);
@@ -741,44 +1166,59 @@ async function handleAdminUsage(url, env) {
   const col = GROUPS[key];
   if (!col) return { ok: false, error: "bad group_by" };
 
-  // 비용식은 SQL 안에서 단가표와 조인해 만든다. mode='image' 면 장수 × 장당가,
-  // 아니면 토큰 × (단가/1M).
   const sql = `
     SELECT ${col} AS k,
            COUNT(*)            AS rows_n,
            SUM(e.images)       AS images,
            SUM(e.out_tokens)   AS out_tokens,
-           SUM(COALESCE(
-             CASE WHEN p.mode='image'
-                  THEN e.images * p.per_image
-                  ELSE e.in_text_tokens  * p.in_text_per_m  / 1000000.0
-                     + e.in_image_tokens * p.in_image_per_m / 1000000.0
-                     + e.out_tokens      * p.out_per_m      / 1000000.0
-             END, 0))          AS cost_usd,
-           SUM(CASE WHEN p.model IS NULL OR p.verified=0 THEN e.images ELSE 0 END) AS unpriced
+           SUM(${COST_USD})    AS cost_usd,
+           SUM(${COST_USD} * ${KRW_RATE}) AS cost_krw,
+           SUM(CASE WHEN p.model IS NULL OR p.verified=0 THEN e.images ELSE 0 END) AS unpriced,
+           MIN(e.day) AS first_day, MAX(e.day) AS last_day
     FROM usage_events e
-    LEFT JOIN prices p ON p.model = e.model
+    ${PRICE_JOIN}
+    ${FX_JOIN}
     WHERE e.day >= ? AND e.day <= ?
     GROUP BY k
     ORDER BY cost_usd DESC`;
   const r = await env.USAGE_DB.prepare(sql).bind(from, to).all();
   const rows = r.results || [];
+
+  // 그래프용 일별 추이. 같은 비용식을 쓰므로 막대 합계와 카드 합계가 어긋나지 않는다.
+  const dsql = `
+    SELECT e.day AS day, SUM(e.images) AS images,
+           SUM(${COST_USD}) AS cost_usd,
+           SUM(${COST_USD} * ${KRW_RATE}) AS cost_krw
+    FROM usage_events e
+    ${PRICE_JOIN}
+    ${FX_JOIN}
+    WHERE e.day >= ? AND e.day <= ?
+    GROUP BY e.day ORDER BY e.day`;
+  const dr = await env.USAGE_DB.prepare(dsql).bind(from, to).all();
+
   const total = rows.reduce((a, x) => a + (x.cost_usd || 0), 0);
+  const totalKrw = rows.reduce((a, x) => a + (x.cost_krw || 0), 0);
   const imgs = rows.reduce((a, x) => a + (x.images || 0), 0);
   const unpriced = rows.reduce((a, x) => a + (x.unpriced || 0), 0);
-  // 이름을 붙여 돌려준다 — 화면에서 다시 조회하지 않아도 되게.
-  let names = {};
+
+  // 이름과 보관 여부를 붙여 돌려준다. **active 로 거르지 않는다** — 끝난 프로젝트를
+  // 목록에서 내렸다고 그 프로젝트가 쓴 돈까지 안 보이면 집계가 아니라 구멍이다.
+  let names = {}, archived = {};
   if (key === "team" || key === "project") {
     const t = await env.USAGE_DB.prepare(
-      `SELECT id, name FROM ${key === "team" ? "teams" : "projects"}`).all();
-    for (const x of (t.results || [])) names[x.id] = x.name;
+      `SELECT id, name, active FROM ${key === "team" ? "teams" : "projects"}`).all();
+    for (const x of (t.results || [])) { names[x.id] = x.name; archived[x.id] = !x.active; }
   }
   const fx = await latestFx(env);
   return {
     ok: true, group_by: key, from, to,
-    total_cost_usd: total, total_images: imgs, unpriced_images: unpriced,
+    total_cost_usd: total, total_cost_krw: totalKrw,
+    total_images: imgs, unpriced_images: unpriced,
     usd_krw: fx ? fx.usd_krw : 0, fx_day: fx ? fx.day : null,
-    rows: rows.map((x) => ({ ...x, label: names[x.k] || x.k })),
+    days: dr.results || [],
+    rows: rows.map((x) => ({
+      ...x, label: names[x.k] || x.k, archived: Boolean(archived[x.k]),
+    })),
   };
 }
 

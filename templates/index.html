@@ -426,7 +426,13 @@
     </div>
     <div class="bill-row">
       <label class="field-label">프로젝트</label>
-      <select id="billingProject"></select>
+      <select id="billingProject" onchange="_syncBillingApply()"></select>
+    </div>
+    <!-- 지난번에 쓰던 값은 제안만 한다. 미리 골라두면 읽지 않고 확정해 버린다. -->
+    <div class="bill-recall hidden" id="billingRecall">
+      <span class="bill-recall-label">지난번</span>
+      <span id="billingRecallText"></span>
+      <button class="btn-sm" onclick="useLastBilling()">이대로 채우기</button>
     </div>
     <p class="hint" id="billingHint"></p>
     <div class="close-buttons">

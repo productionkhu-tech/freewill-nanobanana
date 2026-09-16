@@ -1584,6 +1584,14 @@ footer {
 .bill-row { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
 .bill-row .field-label { width: 64px; flex: none; margin: 0; }
 .bill-row select { flex: 1; height: 32px; }
+/* 지난번 제안 줄 — 고르는 건 여전히 사용자의 손이다 */
+.bill-recall { display: flex; align-items: center; gap: 8px; margin: 10px 0 0;
+               padding: 8px 10px; background: var(--input-bg);
+               border: 1px solid var(--border); border-radius: 8px; font-size: 12px; }
+.bill-recall-label { color: var(--text3); flex: none; }
+.bill-recall > span:nth-child(2) { flex: 1; overflow: hidden;
+                                   text-overflow: ellipsis; white-space: nowrap; }
+.bill-recall .btn-sm { flex: none; }
 .modal {
   position: fixed;
   inset: 0;
@@ -1893,8 +1901,10 @@ footer {
   cursor: pointer;
   transition: background .15s, transform 70ms;
 }
-.btn-accent-sm:hover { background: var(--accent-h); }
-.btn-accent-sm:active { transform: scale(.96); }
+.btn-accent-sm:hover:not(:disabled) { background: var(--accent-h); }
+.btn-accent-sm:active:not(:disabled) { transform: scale(.96); }
+/* 고를 게 남은 동안은 누를 수 없다는 게 보여야 한다 */
+.btn-accent-sm:disabled { background: var(--surface2); color: var(--text3); cursor: default; }
 
 /* Release-notes modal — clean, friendly styling */
 .rn-dialog {

@@ -3683,39 +3683,59 @@ async function loadBillingCatalog(force) {
   return (d && d.error) || "목록을 불러오지 못했습니다";
 }
 
+// 목록의 첫 칸은 **비어 있어야 한다.** 아무거나 미리 골라져 있으면 읽지 않고
+// 확정해 버리고, 그러면 이 창을 매번 띄우는 의미 자체가 없어진다.
+function _billPlaceholder(text) {
+  const o = document.createElement("option");
+  o.value = ""; o.textContent = text; o.disabled = true; o.selected = true;
+  return o;
+}
+
 function _fillBillingSelects(teamId, projectId) {
   const ts = document.getElementById("billingTeam");
   const ps = document.getElementById("billingProject");
   if (!ts || !ps) return;
   ts.innerHTML = "";
+  ts.appendChild(_billPlaceholder("선택…"));
   (_billCatalog.teams || []).forEach(t => {
     const o = document.createElement("option");
     o.value = t.id; o.textContent = t.name || t.id;
     ts.appendChild(o);
   });
-  if (teamId && _billCatalog.teams.some(t => t.id === teamId)) ts.value = teamId;
-  onBillingTeamChange(projectId);
+  ts.value = (teamId && _billCatalog.teams.some(t => t.id === teamId)) ? teamId : "";
+  onBillingTeamChange(projectId || "", true);
+}
+
+// 둘 다 고르기 전에는 적용이 눌리지 않는다 (Enter 도 마찬가지).
+function _syncBillingApply() {
+  const b = document.getElementById("billingApply");
+  if (b) b.disabled = !_billBothChosen();
 }
 
 // 팀과 프로젝트는 서로 독립이다. 한 건을 여러 팀이 같이 하는 게 정상이라
 // 프로젝트를 팀에 묶으면 실제로 작업한 팀이 아닌 쪽으로 비용이 잡힌다.
-function onBillingTeamChange(preferProject) {
+// force=true 면 preferProject 를 그대로 쓴다(빈 값이면 빈 채로). 창을 새로 채울
+// 때 쓴다 — 이게 없으면 "비워라" 가 "지금 값 유지" 로 읽혀 지난 선택이 남는다.
+// 사용자가 팀을 바꿔서 호출될 때는(force 없음) 고르던 프로젝트를 지켜준다.
+function onBillingTeamChange(preferProject, force) {
   const ps = document.getElementById("billingProject");
   if (!ps) return;
   const list = _billCatalog.projects || [];
-  const keep = preferProject || ps.value;
+  const keep = force ? (preferProject || "") : (preferProject || ps.value);
   ps.innerHTML = "";
+  ps.appendChild(_billPlaceholder("선택…"));
   list.forEach(p => {
     const o = document.createElement("option");
     o.value = p.id; o.textContent = p.name || p.id;
     ps.appendChild(o);
   });
-  if (keep && list.some(p => p.id === keep)) ps.value = keep;
+  ps.value = (keep && list.some(p => p.id === keep)) ? keep : "";
   const hint = document.getElementById("billingHint");
   if (hint) {
     hint.textContent = list.length ? "" :
       "등록된 프로젝트가 없습니다. 관리자 페이지에서 추가해야 생성할 수 있습니다.";
   }
+  _syncBillingApply();
 }
 
 // 창은 **먼저 띄우고** 목록은 뒤따라 받는다. 예전엔 클라우드 왕복이 끝나야
@@ -3726,8 +3746,11 @@ async function openBillingModal() {
   const hint = document.getElementById("billingHint");
   if (hint) hint.textContent = "";
 
+  // 아무것도 고르지 않은 채로 연다. 이 탭이 이미 쓰던 값이 있으면 그것만 되살린다.
   const cur = _billLastState;
-  if (_billCatalog.teams.length) _fillBillingSelects(cur && cur.team_id, cur && cur.project_id);
+  const mine = cur && cur.confirmed ? cur : null;
+  if (_billCatalog.teams.length) _fillBillingSelects(mine && mine.team_id, mine && mine.project_id);
+  _billRecall(null);
   if (m) m.classList.remove("hidden");
   // 최신 목록이 오기 전까지는 못 누르게 막는다. 캐시가 다른 탭 값일 수 있어
   // 여기서 Enter 가 통하면 엉뚱한 프로젝트로 확정돼 버린다.
@@ -3738,11 +3761,13 @@ async function openBillingModal() {
   const warn = await loadBillingCatalog(true);
   const fresh = await api("/api/billing/state");
   _billLastState = fresh;
-  // 이 탭에 값이 없으면 이 PC 가 마지막에 쓴 걸 미리 골라둔다. 확인은 어차피
-  // 매번 받지만, 17개 팀에서 매번 처음부터 찾게 만들 이유는 없다.
-  const preTeam = (fresh && fresh.team_id) || (fresh && fresh.last_team_id) || "";
-  const preProj = (fresh && fresh.project_id) || (fresh && fresh.last_project_id) || "";
-  _fillBillingSelects(preTeam, preProj);
+  // 이 탭이 이미 확정해 둔 값만 되살린다. 그 외에는 비워 둔다 — 미리 골라두면
+  // 읽지 않고 확정해 버려서, 매번 확인받는 의미가 사라진다.
+  const keepTeam = (fresh && fresh.confirmed && fresh.team_id) || "";
+  const keepProj = (fresh && fresh.confirmed && fresh.project_id) || "";
+  _fillBillingSelects(keepTeam, keepProj);
+  // 지난번에 쓰던 건 "제안" 으로만 보여준다. 누르면 그때 채워진다.
+  _billRecall(!keepTeam && fresh && fresh.last_team_id && fresh.last_project_id ? fresh : null);
   _billBusy(false);
   if (hint && !hint.textContent) {
     // 이 탭이 쓰던 팀/프로젝트가 목록에서 빠졌으면 말해준다. 조용히 다른 값이
@@ -3754,25 +3779,56 @@ async function openBillingModal() {
       hint.textContent = "이 탭이 쓰던 " + gone.join("·") + "이(가) 목록에서 빠졌습니다. 다시 골라주세요.";
     } else if (warn) {
       hint.textContent = warn;
-    } else if (preTeam && preProj) {
-      // 앱을 껐다 켜면 확인은 매번 받지만(요구사항), 고른 값 자체는 남아 있다.
-      // 그대로 쓸 거면 Enter 한 번이면 끝이라는 걸 알려준다.
-      hint.textContent = "지난번에 쓰던 설정이 미리 골라져 있습니다. 그대로 쓰려면 Enter.";
     }
   }
   _focusBillingApply();
 }
 
+// 지난번에 쓰던 팀·프로젝트를 한 줄로 제안한다. 미리 골라주지는 않는다 —
+// 누르는 건 사용자의 손이어야 한다. st 가 null 이면 줄을 숨긴다.
+function _billRecall(st) {
+  const row = document.getElementById("billingRecall");
+  if (!row) return;
+  if (!st) { row.classList.add("hidden"); row.dataset.team = ""; row.dataset.proj = ""; return; }
+  row.dataset.team = st.last_team_id;
+  row.dataset.proj = st.last_project_id;
+  const label = document.getElementById("billingRecallText");
+  if (label) {
+    label.textContent = _billTeamName(st.last_team_id) + " · " + _billProjectName(st.last_project_id);
+  }
+  row.classList.remove("hidden");
+}
+
+function useLastBilling() {
+  const row = document.getElementById("billingRecall");
+  if (!row || !row.dataset.team) return;
+  _fillBillingSelects(row.dataset.team, row.dataset.proj);
+  _focusBillingApply();
+}
+
+// 고를 게 남았으면 팀 드롭다운에, 다 골랐으면 적용 버튼에 포커스를 둔다.
 function _focusBillingApply() {
   const b = document.getElementById("billingApply");
-  if (b && !b.disabled) try { b.focus(); } catch (e) {}
+  const ts = document.getElementById("billingTeam");
+  const target = (b && !b.disabled) ? b : ts;
+  if (target) try { target.focus(); } catch (e) {}
 }
 
 function _billBusy(on) {
-  ["billingTeam", "billingProject", "billingApply"].forEach(id => {
+  ["billingTeam", "billingProject"].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.disabled = Boolean(on);
   });
+  const b = document.getElementById("billingApply");
+  // 목록을 받는 동안은 잠그고, 끝나면 "둘 다 골랐는가" 가 다시 판단한다 —
+  // 여기서 무조건 풀면 아무것도 안 고른 채로 적용이 눌린다.
+  if (b) b.disabled = on ? true : !_billBothChosen();
+}
+
+function _billBothChosen() {
+  const ts = document.getElementById("billingTeam");
+  const ps = document.getElementById("billingProject");
+  return Boolean(ts && ts.value && ps && ps.value);
 }
 
 function closeBillingModal() {
@@ -3785,8 +3841,11 @@ function closeBillingModal() {
 document.addEventListener("keydown", (e) => {
   const m = document.getElementById("billingModal");
   if (!m || m.classList.contains("hidden")) return;
-  if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); saveBilling(); }
-  else if (e.key === "Escape") { e.preventDefault(); closeBillingModal(); }
+  // 둘 다 고르기 전에는 Enter 도 통하지 않는다.
+  if (e.key === "Enter" && !e.isComposing) {
+    e.preventDefault();
+    if (_billBothChosen()) saveBilling();
+  } else if (e.key === "Escape") { e.preventDefault(); closeBillingModal(); }
 });
 
 async function saveBilling() {

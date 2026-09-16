@@ -21,3 +21,6 @@ DELETE FROM projects
 DELETE FROM teams
  WHERE (id LIKE 'zztest%' OR name LIKE 'zzTEST%' OR id LIKE '회수테스트%' OR id LIKE '임시테스트%')
    AND id NOT IN (SELECT DISTINCT team_id FROM usage_events);
+
+-- 시트 동기화가 관리하는 행(source='sheet')은 절대 여기서 지우지 않는다 —
+-- 지우면 다음 동기화가 되살리긴 하지만, 그 사이 리포트에서 이름표가 사라진다.

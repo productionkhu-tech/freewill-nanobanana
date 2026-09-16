@@ -321,6 +321,14 @@ async function handleAdmin(request, env, path) {
   if (path === "/admin/catalog") {
     return json(await handleCatalog(env, true));   // 보관된 것까지 (되살리기용)
   }
+  // 구글 시트에서 팀/프로젝트를 끌어온다. 크론이 하루 한 번 돌지만, 시트를
+  // 방금 고치고 바로 반영하고 싶을 때가 있어서 버튼도 둔다.
+  if (path === "/admin/sync") {
+    if (request.method === "POST") return json(await syncSheetsSafe(env));
+    const r = await env.USAGE_DB.prepare(
+      "SELECT at, ok, detail FROM sync_state WHERE id='sheet'").first();
+    return json({ ok: true, last: r || null });
+  }
   // 팀·프로젝트 추가/수정. active=0 은 삭제가 아니라 **보관**이다 — 앱 목록에서만
   // 사라지고 과거 사용량 행과 이름은 그대로 남아 리포트에 계속 나온다.
   // 끝난 프로젝트의 지난 비용이 안 보이면 그건 집계가 아니라 구멍이다.
@@ -427,6 +435,153 @@ async function handleAdmin(request, env, path) {
 const nowIso = () => new Date().toISOString().slice(0, 19);
 const slug = (s) => String(s || "").trim().toLowerCase()
   .replace(/[^a-z0-9가-힣]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
+
+/**
+ * 프로젝트 id 는 **이름이 아니라 건 번호**로 만든다.
+ *
+ * 이름은 바뀐다 ("[26P52]...FW" -> "[26P52]...FW 수정"). id 를 이름 슬러그로
+ * 잡으면 시트에서 한 글자만 고쳐도 다른 프로젝트가 되어버려, 그때까지 쌓인
+ * 비용이 옛 id 에 고아로 남는다. 대괄호 안 번호는 안 바뀌므로 그걸 쓴다.
+ * 번호가 없는 건(TA Test 같은)만 이름 슬러그로 떨어진다.
+ */
+function projectKey(name) {
+  const m = String(name || "").match(/^\s*\[([A-Za-z0-9_\-]{2,20})\]/);
+  return m ? m[1].toLowerCase() : slug(name);
+}
+
+// ----------------------------------------------------------- Google Sheets
+// 팀과 프로젝트 목록의 원본은 사용자가 매일 쓰는 구글 시트다. 관리자 페이지에서
+// 또 한 벌 관리하게 두면 둘이 어긋나고, 어긋나면 비용이 엉뚱한 데 붙는다.
+
+const b64url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+/** 서비스 계정 JWT -> 액세스 토큰. 워커에 구글 SDK 를 넣을 수 없으니 직접 만든다. */
+async function googleToken(env) {
+  const pem = String(env.GS_SA_KEY || "").replace(/\\n/g, "\n");
+  const body = pem.replace(/-----(BEGIN|END) PRIVATE KEY-----/g, "").replace(/\s+/g, "");
+  if (!body || !env.GS_SA_EMAIL) throw new Error("sheet credentials not configured");
+  const der = Uint8Array.from(atob(body), (c) => c.charCodeAt(0));
+  const key = await crypto.subtle.importKey(
+    "pkcs8", der, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
+
+  const now = Math.floor(Date.now() / 1000);
+  const enc = new TextEncoder();
+  const unsigned = b64url(enc.encode(JSON.stringify({ alg: "RS256", typ: "JWT" }))) + "." +
+    b64url(enc.encode(JSON.stringify({
+      iss: env.GS_SA_EMAIL,
+      scope: "https://www.googleapis.com/auth/spreadsheets.readonly",
+      aud: "https://oauth2.googleapis.com/token",
+      iat: now, exp: now + 3600,
+    })));
+  const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, enc.encode(unsigned));
+  const assertion = unsigned + "." + b64url(sig);
+
+  const r = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=" +
+          encodeURIComponent(assertion),
+  });
+  const d = await r.json();
+  if (!d.access_token) throw new Error("google auth failed: " + JSON.stringify(d).slice(0, 160));
+  return d.access_token;
+}
+
+/**
+ * 시트 -> D1 동기화.
+ *
+ * 지우지 않는다. 시트에서 빠지거나 '종료' 로 바뀐 건은 **보관**(active=0)으로
+ * 내려갈 뿐이고, 그 건에 쌓인 사용량과 이름표는 리포트에 그대로 남는다.
+ * 그리고 시트가 만든 행(source='sheet')만 건드린다 — 관리자 페이지에서 손으로
+ * 추가한 건 시트에 없다고 해서 조용히 내려가면 안 된다.
+ */
+async function syncSheets(env) {
+  const token = await googleToken(env);
+  const sid = env.GS_SHEET_ID;
+  if (!sid) throw new Error("GS_SHEET_ID not set");
+  const url = "https://sheets.googleapis.com/v4/spreadsheets/" + sid +
+    "/values:batchGet?ranges=" + encodeURIComponent("Project_Status!A2:C500") +
+    "&ranges=" + encodeURIComponent("config_teams!A2:A200");
+  const r = await fetch(url, { headers: { Authorization: "Bearer " + token } });
+  const d = await r.json();
+  if (!d.valueRanges) throw new Error("sheet read failed: " + JSON.stringify(d).slice(0, 160));
+
+  const projRows = d.valueRanges[0].values || [];
+  const teamRows = d.valueRanges[1].values || [];
+  const now = nowIso();
+  const writes = [];
+
+  // 팀: 이름 한 칸이 전부다. 시트에 있으면 살아 있는 것.
+  const teamIds = [];
+  const teamStmt = env.USAGE_DB.prepare(
+    `INSERT INTO teams (id, name, active, created_at, source) VALUES (?,?,1,?,'sheet')
+     ON CONFLICT(id) DO UPDATE SET name=excluded.name, active=1, source='sheet'`);
+  for (const row of teamRows) {
+    const name = String((row[0] || "")).trim();
+    if (!name) continue;
+    const id = slug(name);
+    if (!id || teamIds.includes(id)) continue;
+    teamIds.push(id);
+    writes.push(teamStmt.bind(id, name.slice(0, 64), now));
+  }
+
+  // 프로젝트: B=이름, C=진행현황. '진행' 만 앱 목록에 보인다.
+  const projIds = [];
+  let live = 0;
+  const projStmt = env.USAGE_DB.prepare(
+    `INSERT INTO projects (id, name, team_id, active, created_at, source)
+     VALUES (?,?,NULL,?,?,'sheet')
+     ON CONFLICT(id) DO UPDATE SET name=excluded.name, active=excluded.active, source='sheet'`);
+  for (const row of projRows) {
+    const name = String((row[1] || "")).trim();
+    if (!name) continue;
+    const id = projectKey(name);
+    if (!id || projIds.includes(id)) continue;
+    const active = String(row[2] || "").trim() === "진행" ? 1 : 0;
+    if (active) live++;
+    projIds.push(id);
+    writes.push(projStmt.bind(id, name.slice(0, 64), active, now));
+  }
+  if (!teamIds.length && !projIds.length) throw new Error("sheet looked empty - refusing to sync");
+
+  // 시트에서 통째로 사라진 건은 보관으로 내린다 (삭제가 아니다).
+  const ph = (n) => new Array(n).fill("?").join(",");
+  if (teamIds.length) {
+    writes.push(env.USAGE_DB.prepare(
+      `UPDATE teams SET active=0 WHERE source='sheet' AND id NOT IN (${ph(teamIds.length)})`)
+      .bind(...teamIds));
+  }
+  if (projIds.length) {
+    writes.push(env.USAGE_DB.prepare(
+      `UPDATE projects SET active=0 WHERE source='sheet' AND id NOT IN (${ph(projIds.length)})`)
+      .bind(...projIds));
+  }
+  await env.USAGE_DB.batch(writes);
+
+  const detail = "팀 " + teamIds.length + " · 프로젝트 " + live + " 진행 / " +
+                 (projIds.length - live) + " 보관";
+  await env.USAGE_DB.prepare(
+    `INSERT INTO sync_state (id, at, ok, detail) VALUES ('sheet',?,1,?)
+     ON CONFLICT(id) DO UPDATE SET at=excluded.at, ok=1, detail=excluded.detail`)
+    .bind(now, detail).run();
+  return { ok: true, at: now, teams: teamIds.length, projects: projIds.length, live, detail };
+}
+
+async function syncSheetsSafe(env) {
+  try {
+    return await syncSheets(env);
+  } catch (e) {
+    const msg = String(e && e.message || e).slice(0, 200);
+    try {
+      await env.USAGE_DB.prepare(
+        `INSERT INTO sync_state (id, at, ok, detail) VALUES ('sheet',?,0,?)
+         ON CONFLICT(id) DO UPDATE SET at=excluded.at, ok=0, detail=excluded.detail`)
+        .bind(nowIso(), msg).run();
+    } catch {}
+    return { ok: false, error: msg };
+  }
+}
 
 // 관리자 페이지. 워커가 직접 서빙하므로 호스팅 비용이 없다.
 // 로그인은 관리자 키 하나 — 계정 시스템을 붙일 이유가 없는 1인용 화면이다.
@@ -549,6 +704,21 @@ svg.chart text{fill:var(--tx2);font-size:10px}
 </div>
 
 <div id="pane-setup" style="display:none">
+  <div class="card">
+    <div class="row" style="justify-content:space-between">
+      <div>
+        <b>구글 시트가 원본입니다</b>
+        <div class="sub" style="margin-top:4px" id="syncLast">불러오는 중…</div>
+      </div>
+      <button class="go" onclick="runSync()" id="syncBtn">지금 동기화</button>
+    </div>
+    <div class="sub" style="margin-top:10px;line-height:1.7">
+      Project_Status 시트의 <b>진행</b>인 건만 앱 목록에 보입니다. <b>종료</b>로 바꾸거나 줄을 지우면
+      다음 동기화 때 보관으로 내려가고, <b>그 건에 쌓인 비용은 리포트에 그대로 남습니다.</b><br>
+      매일 아침 자동으로 한 번 돌고, 시트를 방금 고쳤으면 위 버튼으로 바로 반영할 수 있습니다.
+      아래에서 손으로 추가한 항목(<span class="pill arch">직접</span>)은 동기화가 건드리지 않습니다.
+    </div>
+  </div>
   <div class="split">
     <div class="card">
       <h2>팀</h2>
@@ -619,7 +789,7 @@ function show(which) {
     document.getElementById("pane-" + k).style.display = (k === which) ? "" : "none";
     document.getElementById("tb-" + k).className = (k === which) ? "on" : "";
   });
-  if (which === "setup") loadCatalog();
+  if (which === "setup") { loadCatalog(); loadSync(); }
   if (which === "price") { loadPrices(); loadFx(); }
 }
 
@@ -855,8 +1025,9 @@ function catTable(items, kind) {
   const off = kind === "team" ? "data-off-team" : "data-off-proj";
   const on = kind === "team" ? "data-on-team" : "data-on-proj";
   const del = kind === "team" ? "data-del-team" : "data-del-proj";
+  const tag = x => (x.source === "sheet") ? '' : ' <span class="pill arch">직접</span>';
   const mk = (list, btn, cls, withDel) => '<table>' + list.map(x =>
-      '<tr><td>' + esc(x.name) + '</td><td class="muted" style="font-size:11px">' + esc(x.id) + '</td>'
+      '<tr><td>' + esc(x.name) + tag(x) + '</td><td class="muted" style="font-size:11px">' + esc(x.id) + '</td>'
     + '<td class="num"><button class="ghost" ' + btn + '="' + esc(x.id) + '" data-name="'
     + esc(x.name) + '">' + cls + '</button>'
     + (withDel ? ' <button class="ghost" ' + del + '="' + esc(x.id) + '" data-name="'
@@ -871,6 +1042,25 @@ function catTable(items, kind) {
   }
   return h;
 }
+async function loadSync() {
+  const d = await api("/admin/sync");
+  const el = document.getElementById("syncLast");
+  const l = d && d.last;
+  if (!l) { el.textContent = "아직 동기화한 적이 없습니다."; return; }
+  const when = String(l.at || "").replace("T", " ");
+  el.innerHTML = l.ok
+    ? '마지막 동기화 ' + esc(when) + ' &middot; ' + esc(l.detail || "")
+    : '<span class="err">마지막 시도 ' + esc(when) + ' 실패 &mdash; ' + esc(l.detail || "") + '</span>';
+}
+async function runSync() {
+  const b = document.getElementById("syncBtn");
+  b.disabled = true; b.textContent = "동기화 중…";
+  const d = await api("/admin/sync", { method: "POST", body: "{}" });
+  b.disabled = false; b.textContent = "지금 동기화";
+  if (!d.ok) alert(d.error || "동기화 실패");
+  loadSync(); loadCatalog();
+}
+
 async function loadCatalog() {
   const d = await api("/admin/catalog");
   document.getElementById("teamList").innerHTML = catTable(d.teams || [], "team");
@@ -1034,9 +1224,9 @@ const byName = (x, y) => natCmp(x.name || x.id, y.name || y.id);
 async function handleCatalog(env, includeArchived) {
   const w = includeArchived ? "" : " WHERE active=1";
   const teams = await env.USAGE_DB.prepare(
-    "SELECT id, name, active FROM teams" + w).all();
+    "SELECT id, name, active, source FROM teams" + w).all();
   const projects = await env.USAGE_DB.prepare(
-    "SELECT id, name, team_id, active FROM projects" + w).all();
+    "SELECT id, name, team_id, active, source FROM projects" + w).all();
   return {
     ok: true,
     teams: (teams.results || []).sort(byName),
@@ -1226,6 +1416,9 @@ export default {
   // 하루 한 번 환율을 받아 둔다. 놓친 날은 리포트가 직전 값으로 대체한다.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(fetchFxRate(env));
+    // 시트가 목록의 원본이다. 사용자가 시트에 '종료' 라고 적으면 다음 날 앱
+    // 목록에서 내려가고, 그 건의 지난 비용은 리포트에 그대로 남는다.
+    ctx.waitUntil(syncSheetsSafe(env));
   },
 
   async fetch(request, env, ctx) {

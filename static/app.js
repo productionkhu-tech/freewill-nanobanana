@@ -179,6 +179,8 @@ function _renderReleaseNotes(raw) {
 
 function closeReleaseNotes() {
   document.getElementById("releaseNotesModal").classList.add("hidden");
+  // 안내를 닫고 나서야 귀속을 묻는다 (겹치지 않게 미뤄둔 것)
+  if (_billAfterNotes) { _billAfterNotes = false; promptBillingIfNeeded(); }
 }
 
 // ==========================================
@@ -750,10 +752,18 @@ async function confirmRenameProject() {
 // here would be the thing that leaks between projects.
 // 탭을 열거나 전환했는데 이 탭의 귀속이 아직 확인되지 않았으면 바로 묻는다.
 // 생성 버튼을 누를 때까지 미루면, 프롬프트를 다 쓰고 나서야 막히는 꼴이 된다.
+// 업데이트 안내 팝업이 떠 있으면 그게 닫힌 뒤에 묻는다. 둘 다 화면 한가운데
+// 뜨는 창이라 같이 띄우면 그대로 겹쳐 보인다 — 업데이트 직후 첫 실행에서 매번
+// 걸리는 경로다(안내를 먼저 읽게 두는 게 순서상으로도 맞다).
+let _billAfterNotes = false;
+
 async function promptBillingIfNeeded() {
   try {
     const st = await api("/api/billing/state");
-    if (st && st.ok && !st.confirmed) await openBillingModal();
+    if (!st || !st.ok || st.confirmed) return;
+    const rn = document.getElementById("releaseNotesModal");
+    if (rn && !rn.classList.contains("hidden")) { _billAfterNotes = true; return; }
+    await openBillingModal();
   } catch (e) { /* 목록 서버가 죽어도 앱은 떠야 한다 */ }
 }
 

@@ -39,6 +39,15 @@
   <aside id="sidebar">
     <div class="sidebar-scroll">
 
+      <!-- 이 탭의 비용이 어디로 달리는지. 생성을 막는 값이라 맨 위에 두고,
+           눌러서 바로 바꾼다. 다른 입력들과 같은 모양이라 따로 놀지 않는다. -->
+      <div class="section-title">Billing</div>
+      <button id="billingBar" class="bill-select" onclick="openBillingModal()"
+              title="팀과 프로젝트를 골라야 생성할 수 있다 — 눌러서 선택">
+        <span id="billingBarText">선택 필요</span>
+        <span class="bill-caret" aria-hidden="true"></span>
+      </button>
+
       <!-- Model -->
       <div class="section-title model-title">
         <span>Model</span>
@@ -405,6 +414,28 @@
 </div>
 
 <!-- MODEL PREFS (which models show + starting resolution; app-wide) -->
+<!-- 비용 귀속 선택. 탭마다 따로 달리고, 앱을 켤 때와 새 탭을 열 때 한 번씩 확인받는다. -->
+<div id="billingModal" class="close-modal hidden">
+  <div class="close-dialog">
+    <h2>어느 팀 · 프로젝트 작업인가요?</h2>
+    <p class="close-desc">여기서 만든 이미지의 비용이 선택한 프로젝트로 잡힙니다.<br>
+      탭마다 따로 정할 수 있고, 정하기 전에는 생성이 되지 않습니다.</p>
+    <div class="bill-row">
+      <label class="field-label">팀</label>
+      <select id="billingTeam" onchange="onBillingTeamChange()"></select>
+    </div>
+    <div class="bill-row">
+      <label class="field-label">프로젝트</label>
+      <select id="billingProject"></select>
+    </div>
+    <p class="hint" id="billingHint"></p>
+    <div class="close-buttons">
+      <button class="btn-sm" onclick="closeBillingModal()">나중에</button>
+      <button class="btn-accent-sm" onclick="saveBilling()">이 탭에 적용</button>
+    </div>
+  </div>
+</div>
+
 <div id="modelPrefsModal" class="close-modal hidden">
   <div class="close-dialog mp-dialog">
     <h2>모델 설정</h2>

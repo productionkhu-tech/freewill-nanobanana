@@ -1546,6 +1546,44 @@ footer {
 /* ═══════════════════════════════════════════
    IMAGE VIEWER MODAL
    ═══════════════════════════════════════════ */
+/* 비용 귀속 선택 — 바로 아래 Model 드롭다운과 같은 치수·색이라 한 벌로 보인다. */
+.bill-select {
+  width: 100%;
+  height: 36px;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 12px;
+  font-family: inherit;
+  padding: 0 10px;
+  margin-bottom: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  text-align: left;
+}
+.bill-select:hover { border-color: var(--accent-h); }
+.bill-select > span:first-child {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* 네이티브 select 화살표와 같은 모양으로 직접 그린다 (글리프는 너무 작고 흐리다). */
+.bill-caret {
+  flex: none; width: 7px; height: 7px; margin-right: 3px;
+  border-right: 1.5px solid var(--text2);
+  border-bottom: 1.5px solid var(--text2);
+  transform: translateY(-2px) rotate(45deg);
+}
+/* 아직 안 고른 탭은 생성이 막혀 있다 — 글자색만으로 알린다(박스는 그대로). */
+.bill-select.needs { border-color: var(--accent); }
+.bill-select.needs > span:first-child { color: var(--accent); }
+
+/* 비용 귀속 선택 모달의 한 줄 (라벨 + 드롭다운) */
+.bill-row { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
+.bill-row .field-label { width: 64px; flex: none; margin: 0; }
+.bill-row select { flex: 1; height: 32px; }
 .modal {
   position: fixed;
   inset: 0;

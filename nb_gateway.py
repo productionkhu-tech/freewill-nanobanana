@@ -13,6 +13,7 @@ import json
 import os
 import platform
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -331,3 +332,122 @@ def refresh_provider_key(data_dir, log=None, validate=None):
     say("key updated from the key server (%s)%s"
         % (d.get("key_id", "?"), "" if ok else " - this session only, could not save"))
     return True, "ok"
+
+
+# ==========================================================================
+# 사용량 집계 (팀/프로젝트별 비용)
+# ==========================================================================
+# 게이트웨이는 키만 나눠주고 생성은 앱이 직접 한다(속도 때문에 그렇게 정했다).
+# 그래서 워커는 생성 트래픽을 볼 수 없고, 사용량은 앱이 사후 보고해야 한다.
+#
+# 보고가 생성을 방해하면 안 된다는 게 이 구현의 전부다: 생성 직후에는 로컬
+# 파일에 한 줄 덧붙이기만 하고(마이크로초), 전송은 데몬 스레드가 모아서 한다.
+# 네트워크가 죽어 있으면 줄이 쌓인 채로 남았다가 다음에 올라간다.
+
+SPOOL_FILENAME = "usage_spool.jsonl"
+_spool_lock = threading.Lock()
+
+
+def _spool_path(data_dir):
+    return os.path.join(data_dir, SPOOL_FILENAME)
+
+
+def spool_usage(data_dir, event):
+    """사용량 한 건을 로컬에 적어둔다. 실패해도 절대 위로 던지지 않는다 —
+    집계가 안 되는 것보다 생성이 막히는 게 훨씬 나쁘다."""
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        line = json.dumps(event, ensure_ascii=False)
+        with _spool_lock:
+            with open(_spool_path(data_dir), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def _read_spool(data_dir, limit=200):
+    try:
+        with _spool_lock:
+            with open(_spool_path(data_dir), "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+    except Exception:
+        return [], 0
+    events = []
+    for ln in lines[:limit]:
+        try:
+            events.append(json.loads(ln))
+        except Exception:
+            pass          # 깨진 줄은 버린다 (아래에서 같이 소비 처리된다)
+    return events, min(len(lines), limit)
+
+
+def _drop_spool_head(data_dir, n):
+    """전송에 성공한 앞쪽 n줄을 덜어낸다. 원자적으로 교체해서, 도중에 죽어도
+    파일이 반쯤 잘린 상태로 남지 않게 한다."""
+    p = _spool_path(data_dir)
+    try:
+        with _spool_lock:
+            with open(p, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            rest = lines[n:]
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                if rest:
+                    f.write("\n".join(rest) + "\n")
+            os.replace(tmp, p)
+        return True
+    except Exception:
+        return False
+
+
+def fetch_catalog(data_dir, app_version="", log=None):
+    """팀/프로젝트 목록. 서버에서 바꾸면 다음 조회에 바로 반영된다.
+    Returns (catalog_dict, error_message)."""
+    url = gateway_url(data_dir)
+    if not url:
+        return None, "게이트웨이 주소를 찾지 못했습니다"
+    token, _ = get_token(data_dir, app_version=app_version, log=log)
+    if not token:
+        return None, "이 PC가 아직 게이트웨이에 등록되지 않았습니다"
+    try:
+        req = urllib.request.Request(
+            url + "/catalog",
+            headers={"User-Agent": USER_AGENT, "Authorization": "Bearer " + token})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            d = json.loads(r.read().decode("utf-8", "replace") or "{}")
+    except urllib.error.HTTPError as e:
+        return None, "목록을 받지 못했습니다 (HTTP %d)" % e.code
+    except Exception as e:
+        return None, "목록 서버에 연결하지 못했습니다 (%s)" % str(e)[:60]
+    if not d.get("ok"):
+        return None, d.get("error") or "목록을 받지 못했습니다"
+    return d, None
+
+
+def flush_usage(data_dir, app_version="", log=None, batch=200):
+    """쌓인 사용량을 한 번 올린다. 올린 만큼만 지운다.
+
+    이벤트 id 는 앱이 만들고 서버가 INSERT OR IGNORE 로 받으므로, 전송은
+    됐는데 응답을 못 받아 재전송하는 경우에도 중복이 쌓이지 않는다.
+    Returns (sent_count, error_message_or_None)."""
+    events, taken = _read_spool(data_dir, batch)
+    if not taken:
+        return 0, None
+    url = gateway_url(data_dir)
+    if not url:
+        return 0, "no gateway"
+    token = load_token(data_dir, url)
+    if not token:
+        return 0, "not enrolled"
+    try:
+        status, d = _post(url + "/usage", {"events": events}, timeout=25,
+                          headers={"Authorization": "Bearer " + token})
+    except urllib.error.HTTPError as e:
+        return 0, "HTTP %d" % e.code
+    except Exception as e:
+        return 0, str(e)[:60]
+    if status != 200 or not d.get("ok"):
+        return 0, str(d.get("error") or status)[:60]
+    _drop_spool_head(data_dir, taken)
+    return taken, None

@@ -13,6 +13,7 @@ import math
 import re
 import subprocess
 import tempfile
+import uuid
 
 import time
 import random
@@ -315,6 +316,47 @@ def _seedream_prompt(prompt):
     import re as _re
     return _re.sub(r"\[\s*Image\s*(\d+)\s*\]",
                    lambda m: "image %s" % m.group(1), prompt or "", flags=_re.IGNORECASE)
+
+
+def _extract_usage(provider, result_obj, pil=None):
+    """프로바이더 응답에서 과금 근거를 뽑는다. 모양이 셋 다 달라 한 군데 모았다.
+
+    OpenAI  : usage.input_tokens / output_tokens (+ details 로 text/image 분리)
+    Seedream: usage.generated_images (장수 과금) + output_tokens
+    Gemini  : usage_metadata.prompt_token_count / candidates_token_count
+    어느 쪽이든 없으면 0 으로 둔다 — 비용 추정이 틀리는 건 고칠 수 있지만,
+    여기서 예외가 나 생성이 실패하는 건 되돌릴 수 없다."""
+    u = {"in_text_tokens": 0, "in_image_tokens": 0, "out_tokens": 0, "images": 1,
+         "out_px": 0}
+    try:
+        if pil is not None and getattr(pil, "size", None):
+            u["out_px"] = int(pil.size[0]) * int(pil.size[1])
+    except Exception:
+        pass
+    try:
+        if provider in ("vertex", "studio"):
+            m = getattr(result_obj, "usage_metadata", None)
+            if m is not None:
+                u["in_text_tokens"] = int(getattr(m, "prompt_token_count", 0) or 0)
+                u["out_tokens"] = int(getattr(m, "candidates_token_count", 0) or 0)
+            return u
+        raw = getattr(result_obj, "usage", None)
+        if raw is None:
+            return u
+        get = (lambda o, k: o.get(k) if isinstance(o, dict) else getattr(o, k, None))
+        u["out_tokens"] = int(get(raw, "output_tokens") or 0)
+        gen = get(raw, "generated_images")
+        if gen:
+            u["images"] = int(gen)
+        ind = get(raw, "input_tokens_details")
+        if ind is not None:
+            u["in_text_tokens"] = int(get(ind, "text_tokens") or 0)
+            u["in_image_tokens"] = int(get(ind, "image_tokens") or 0)
+        else:
+            u["in_text_tokens"] = int(get(raw, "input_tokens") or 0)
+    except Exception:
+        pass
+    return u
 
 
 def _model_file_prefix(model):
@@ -705,6 +747,15 @@ class AppState:
         # GPT Image 2 "Custom" aspect — raw user-entered pixels (pre-correction).
         self.custom_w = 1024
         self.custom_h = 1024
+        # 비용 귀속: 이 탭에서 만든 이미지가 어느 팀/프로젝트로 잡히는지.
+        # 탭마다 다르게 둘 수 있어야 한다 — 세 탭으로 서로 다른 건을 동시에
+        # 작업하면 한 번 고른 값으로 전부 뭉뚱그려지기 때문.
+        self.billing_team_id = ""
+        self.billing_project_id = ""
+        # 확인은 세션 한정이라 일부러 저장하지 않는다. 앱을 새로 켤 때마다
+        # (그리고 새 탭을 열 때마다) 한 번은 눈으로 확인하고 넘어가게 하는 게
+        # 요구사항이고, 그 사이 작업 중에는 다시 묻지 않는다.
+        self.billing_confirmed = False
         # GPT Image 2.5 전용 — 배경을 투명하게 받을지. 프로젝트별 설정이라
         # 탭마다 다르게 둘 수 있고, 프로젝트 파일에 함께 저장된다.
         self.openai_bg_transparent = False
@@ -1848,6 +1899,8 @@ class AppState:
                 "custom_w": self.custom_w,
                 "custom_h": self.custom_h,
                 "openai_bg_transparent": self.openai_bg_transparent,
+                "billing_team_id": self.billing_team_id,
+                "billing_project_id": self.billing_project_id,
                 "count": str(self.count),
                 "output_dir": self.output_dir,
                 "naming": self.get_naming_settings(),
@@ -1934,6 +1987,11 @@ class AppState:
         self.custom_w = _safe_int(ui.get("custom_w"), self.custom_w, lo=16, hi=99999)
         self.custom_h = _safe_int(ui.get("custom_h"), self.custom_h, lo=16, hi=99999)
         self.openai_bg_transparent = bool(ui.get("openai_bg_transparent", False))
+        # 저장된 귀속은 되살리되 '확인' 은 되살리지 않는다. 미리 채워두면
+        # 다시 고를 필요는 없고 확인 한 번이면 끝난다.
+        self.billing_team_id = str(ui.get("billing_team_id", "") or "")
+        self.billing_project_id = str(ui.get("billing_project_id", "") or "")
+        self.billing_confirmed = False
         # Tolerant parse — older projects sometimes have count="" which would
         # raise ValueError and abort load mid-way, losing the whole session.
         try:
@@ -2200,7 +2258,8 @@ class AppState:
                 pil = _to_display_image(Image.open(io.BytesIO(base64.b64decode(b64))))
                 return {"status": "success", "index": idx, "seed": seed,
                         "image": pil, "elapsed": time.time() - start,
-                        "api_used": "openai"}
+                        "api_used": "openai",
+                        "usage": _extract_usage("openai", result, pil)}
             except Exception as e:
                 err = str(e)
                 if err == "Cancelled":
@@ -2289,7 +2348,8 @@ class AppState:
                             "error": "Seedream returned no b64_json", "elapsed": time.time() - start}
                 pil = _to_display_image(Image.open(io.BytesIO(base64.b64decode(b64))))
                 return {"status": "success", "index": idx, "seed": seed,
-                        "image": pil, "elapsed": time.time() - start, "api_used": "seedream"}
+                        "image": pil, "elapsed": time.time() - start, "api_used": "seedream",
+                        "usage": _extract_usage("seedream", result, pil)}
             except Exception as e:
                 err = str(e)
                 if err == "Cancelled":
@@ -2350,7 +2410,8 @@ class AppState:
                 pil = self.extract_image_from_response(resp)
                 if pil is not None:
                     return {"status": "success", "index": idx, "seed": seed,
-                            "image": pil, "elapsed": elapsed, "api_used": api_used}
+                            "image": pil, "elapsed": elapsed, "api_used": api_used,
+                            "usage": _extract_usage(api_used, resp, pil)}
 
                 # Log WHY the primary provider returned no image
                 self.diagnose_empty_response(resp, self.get_provider_label(api_used))
@@ -2370,7 +2431,8 @@ class AppState:
                     pil2 = self.extract_image_from_response(resp2)
                     if pil2:
                         return {"status": "success", "index": idx, "seed": seed,
-                                "image": pil2, "elapsed": time.time()-start, "api_used": fu}
+                                "image": pil2, "elapsed": time.time()-start, "api_used": fu,
+                                "usage": _extract_usage(fu, resp2, pil2)}
                     # Log why the fallback also failed
                     self.diagnose_empty_response(resp2, fl)
 
@@ -2404,6 +2466,43 @@ class AppState:
                         "error": err[:120], "elapsed": elapsed}
 
         return {"status": "cancelled", "index": idx, "seed": seed}
+
+    def _spool_usage_row(self, job, result, filepath, elapsed, api_used, model):
+        """이미지 한 장의 과금 근거를 로컬 spool 에 적는다.
+
+        귀속은 job 스냅샷에서 읽는다 — 생성이 도는 동안 사용자가 탭의 팀/
+        프로젝트를 바꿔도, 이미 큐에 들어간 배치는 넣을 때의 귀속을 유지해야
+        한다. 여기서 나는 예외는 전부 삼킨다: 집계 한 줄 때문에 다 만든
+        이미지를 잃을 수는 없다."""
+        try:
+            team = job.get("billing_team_id") or ""
+            proj = job.get("billing_project_id") or ""
+            if not team or not proj:
+                return
+            u = result.get("usage") or {}
+            ev = {
+                "id": uuid.uuid4().hex,
+                # UTC 로 적는다 — 70대의 로컬 시계가 제각각이라 집계 기준이
+                # 흔들리면 안 된다.
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                "team_id": team,
+                "project_id": proj,
+                "provider": api_used or "",
+                "model": model or "",
+                "size": str(job.get("img_cfg", {}).get("size") or ""),
+                "quality": str(job.get("quality") or ""),
+                "images": int(u.get("images") or 1),
+                "in_text_tokens": int(u.get("in_text_tokens") or 0),
+                "in_image_tokens": int(u.get("in_image_tokens") or 0),
+                "out_tokens": int(u.get("out_tokens") or 0),
+                "out_px": int(u.get("out_px") or 0),
+                "ref_images": len([x for x in (job.get("ref_paths") or []) if x]),
+                "elapsed_ms": int(round((elapsed or 0) * 1000)),
+                "app_version": _read_version(),
+            }
+            _nbgw.spool_usage(_user_data_dir(), ev)
+        except Exception:
+            pass
 
     def _maybe_autosave(self, min_interval=15.0):
         """Best-effort project save during long batches. Throttled to avoid
@@ -2595,6 +2694,10 @@ class AppState:
                                               aspect=aspect, resolution=resolution,
                                               generated_at=gen_at,
                                               generation_settings=gen_settings)
+                        # 비용 귀속 한 줄. 파일에 덧붙이기만 하고 전송은
+                        # 백그라운드가 맡는다 — 여기서 네트워크를 타면 생성
+                        # 루프가 그만큼 느려진다.
+                        self._spool_usage_row(job, result, fp, elapsed, api_used, model)
                         # Finished in a tab the user isn't looking at -> count
                         # it for that tab's badge (cleared when they switch to
                         # it). Keeps background work visible without stealing
@@ -4193,6 +4296,88 @@ def load_setup():
     return jsonify({"ok": True})
 
 
+# --- 비용 귀속 (팀/프로젝트) -------------------------------------------------
+# 목록은 서버가 쥐고 있다. 자유 입력이면 "디자인팀" 과 "디자인" 이 따로 집계돼
+# 리포트가 못 쓰게 되고, 앱마다 목록을 박아두면 팀이 바뀔 때 70대를 다시 깔아야
+# 한다. 서버 목록을 그때그때 받아오는 게 둘 다 피하는 유일한 길이다.
+_catalog_cache = {"at": 0.0, "data": None}
+
+
+@app.route("/api/billing/catalog")
+def billing_catalog():
+    force = request.args.get("refresh") == "1"
+    now = time.time()
+    # 5분 캐시. 모달을 열 때마다 네트워크를 타면 느리고, 그렇다고 영구 캐시면
+    # "실시간 반영" 이 아니게 된다.
+    if not force and _catalog_cache["data"] and now - _catalog_cache["at"] < 300:
+        return jsonify({"ok": True, "cached": True, **_catalog_cache["data"]})
+    d, err = _nbgw.fetch_catalog(_user_data_dir(), app_version=_read_version(),
+                                 log=state.log)
+    if err:
+        # 캐시가 있으면 그거라도 준다 — 잠깐 끊겼다고 생성을 막을 이유는 없다.
+        if _catalog_cache["data"]:
+            return jsonify({"ok": True, "stale": True, "warning": err,
+                            **_catalog_cache["data"]})
+        return jsonify({"ok": False, "error": err})
+    payload = {"teams": d.get("teams", []), "projects": d.get("projects", [])}
+    _catalog_cache["at"] = now
+    _catalog_cache["data"] = payload
+    return jsonify({"ok": True, **payload})
+
+
+@app.route("/api/billing/state")
+def billing_state():
+    return jsonify({
+        "ok": True,
+        "team_id": state.billing_team_id,
+        "project_id": state.billing_project_id,
+        "confirmed": bool(state.billing_confirmed),
+    })
+
+
+@app.route("/api/billing/set", methods=["POST"])
+def billing_set():
+    d = request.get_json(silent=True) or {}
+    team = str(d.get("team_id") or "").strip()
+    proj = str(d.get("project_id") or "").strip()
+    if not team or not proj:
+        return jsonify({"ok": False, "error": "팀과 프로젝트를 모두 선택해 주세요"})
+    changed = (team != state.billing_team_id or proj != state.billing_project_id)
+    state.billing_team_id = team
+    state.billing_project_id = proj
+    state.billing_confirmed = True
+    if changed:
+        state.project_dirty = True
+    return jsonify({"ok": True})
+
+
+def _billing_still_valid(team_id, project_id):
+    """고른 팀/프로젝트가 아직 목록에 살아 있는가.
+
+    한 번 확인하면 끝이 아니다 — 관리자가 종료된 건을 빼면, 그걸 잡고 있던
+    사람은 계속 그 프로젝트로 비용을 쌓게 된다. 그래서 생성할 때마다 확인한다.
+
+    목록을 못 받아오면 **통과시킨다.** 네트워크가 잠깐 끊겼다고 생성을 막으면
+    집계를 지키려다 정작 일을 못 하게 만드는 셈이다.
+    Returns (ok, missing_label)."""
+    now = time.time()
+    data = _catalog_cache.get("data")
+    if not data or now - _catalog_cache.get("at", 0) >= 300:
+        d, err = _nbgw.fetch_catalog(_user_data_dir(), app_version=_read_version())
+        if d:
+            data = {"teams": d.get("teams", []), "projects": d.get("projects", [])}
+            _catalog_cache["at"] = now
+            _catalog_cache["data"] = data
+    if not data:
+        return True, ""          # 확인할 방법이 없으면 막지 않는다
+    gone = []
+    if not any(t.get("id") == team_id for t in data.get("teams", [])):
+        gone.append("팀")
+    if not any(x.get("id") == project_id for x in data.get("projects", [])):
+        gone.append("프로젝트")
+    return (not gone), "·".join(gone)
+
+
 # --- Generation ---
 @app.route("/api/generate", methods=["POST"])
 def start_generate():
@@ -4209,6 +4394,19 @@ def start_generate():
     else:
         if not state.client_vertex and not state.client_studio:
             return jsonify({"ok": False, "error": "No API connected"})
+
+    # 비용 귀속이 확인되지 않은 탭은 생성하지 않는다. 이 검사가 없으면
+    # 어디에 달아야 할지 모르는 이미지가 쌓이고, 나중에 소급할 방법이 없다.
+    if not (state.billing_confirmed and state.billing_team_id and state.billing_project_id):
+        return jsonify({"ok": False, "error": "팀과 프로젝트를 먼저 선택해 주세요",
+                        "needs_billing": True})
+    # 고른 뒤에 관리자가 그 건을 내렸을 수 있다. 이미 돌고 있는 배치는 건드리지
+    # 않되(제출 시점에만 검사한다), 다음 생성부터는 다시 고르게 한다.
+    _ok, _gone = _billing_still_valid(state.billing_team_id, state.billing_project_id)
+    if not _ok:
+        state.billing_confirmed = False
+        return jsonify({"ok": False, "needs_billing": True,
+                        "error": "선택한 %s이(가) 목록에서 내려갔습니다. 다시 선택해 주세요" % _gone})
 
     prompt = state.compose_prompt()
     if not prompt:
@@ -4391,6 +4589,8 @@ def start_generate():
                 "custom_w": custom_w,
                 "custom_h": custom_h,
                 "openai_bg_transparent": bool(img_cfg.get("background") == "transparent"),
+                "billing_team_id": state.billing_team_id,
+                "billing_project_id": state.billing_project_id,
                 "img_cfg": dict(img_cfg),
                 "naming": dict(naming),
                 "ref_payloads": ref_payloads,
@@ -4516,6 +4716,10 @@ def _project_summary(p):
         "total": p.queue_count,
         "images": images,
         "unseen_done": p.unseen_done,
+        # 탭에 "어디로 달리는 중인지" 를 띄우기 위한 값. 확인 전이면 빈 값이라
+        # 탭만 봐도 설정이 필요한 탭을 알 수 있다.
+        "billing_project_id": p.billing_project_id if p.billing_confirmed else "",
+        "billing_team_id": p.billing_team_id if p.billing_confirmed else "",
         # "saved" means the USER saved it under a name. An autosave file is a
         # crash net, not a save the user made — closing such a tab should still
         # offer to save it properly.
@@ -5674,12 +5878,33 @@ def _restore_session():
         state.log(f"Opened {restored} project(s) at startup")
 
 
+def _start_usage_flusher():
+    """쌓인 사용량을 주기적으로 올린다.
+
+    생성 경로와 완전히 분리된 데몬 스레드다. 네트워크가 죽어 있으면 spool 에
+    그대로 남았다가 다음 차례에 올라가고, 앱을 꺼도 파일이라 사라지지 않는다.
+    한 번에 200건까지만 보내 큰 백로그가 한 방에 몰리지 않게 한다."""
+    def _loop():
+        time.sleep(20)          # 부팅 직후엔 다른 일이 더 급하다
+        while True:
+            try:
+                sent, err = _nbgw.flush_usage(_user_data_dir(),
+                                              app_version=_read_version())
+                if sent:
+                    state.log("usage: %d row(s) uploaded" % sent)
+            except Exception:
+                pass            # 집계 전송은 어떤 경우에도 앱을 흔들지 않는다
+            time.sleep(30)
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 def init_app():
     state.init_api()
     try:
         _restore_session()
     except Exception as e:
         state.log(f"session restore failed: {str(e)[:80]}")
+    _start_usage_flusher()
 
 
 def cleanup():

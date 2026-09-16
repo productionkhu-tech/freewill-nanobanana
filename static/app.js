@@ -45,6 +45,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     await refreshProjects();
     if (activePid !== before) await reloadActiveProject();
   }, 8000);
+  // 탭 라벨을 프로젝트 '이름' 으로 보여주려면 목록이 먼저 있어야 한다.
+  loadBillingCatalog(false).then(() => refreshProjects());
   await loadModelPrefs();      // 드롭다운을 채우기 전에 숨김/기본화질부터
   await loadSettings();
   loadVersion();
@@ -65,6 +67,11 @@ document.addEventListener("DOMContentLoaded", async () => {
     const d = await api("/api/delete-confirm-state");
     _skipDeleteConfirm = !!d.skip;
   } catch (e) { /* ignore */ }
+  // 앱을 켤 때 한 번은 귀속을 확인받는다. 탭 전환 경로(reloadActiveProject)와
+  // 달리 최초 로드는 그 함수를 타지 않아서 여기서 따로 불러야 한다.
+  // 업데이트 안내 팝업보다 뒤에 둬서 둘이 겹치지 않게 한다.
+  await refreshBillingBar();
+  promptBillingIfNeeded();
 });
 
 // Enter = primary action, Escape = cancel. The save / close-save modals
@@ -609,7 +616,11 @@ function _updateProjectTab(tab, p) {
   tab._p = p;
   tab.classList.toggle("active", p.pid === activePid);
   const title = (p.path || p.name) + (p.dirty ? "  (저장 안 됨)" : "");
-  if (tab.title !== title) tab.title = title;
+  // 라벨로 탭을 어지럽히는 대신 툴팁으로 알린다 — 사이드바에 크게 떠 있다.
+  const _bill = p.billing_project_id
+    ? "\n비용 귀속: " + _billTeamName(p.billing_team_id) + " · " + _billProjectName(p.billing_project_id)
+    : "\n비용 귀속 미설정 — 이 탭은 생성이 막혀 있습니다";
+  if (tab.title !== title + _bill) tab.title = title + _bill;
 
   const dot = tab.querySelector(".pt-gen");
   dot.style.display = p.generating ? "" : "none";
@@ -737,6 +748,15 @@ async function confirmRenameProject() {
 
 // Re-read EVERY project-scoped surface from the server. Anything not reloaded
 // here would be the thing that leaks between projects.
+// 탭을 열거나 전환했는데 이 탭의 귀속이 아직 확인되지 않았으면 바로 묻는다.
+// 생성 버튼을 누를 때까지 미루면, 프롬프트를 다 쓰고 나서야 막히는 꼴이 된다.
+async function promptBillingIfNeeded() {
+  try {
+    const st = await api("/api/billing/state");
+    if (st && st.ok && !st.confirmed) await openBillingModal();
+  } catch (e) { /* 목록 서버가 죽어도 앱은 떠야 한다 */ }
+}
+
 async function reloadActiveProject() {
   await loadSettings();      // model/aspect/resolution/prompts/naming/output dir
   await refreshRefs();       // reference slots
@@ -746,6 +766,8 @@ async function reloadActiveProject() {
   _previewPath = null;
   updateSelectionUI();
   await pollLogs();
+  await refreshBillingBar();
+  promptBillingIfNeeded();
 }
 
 async function switchProject(pid) {
@@ -3611,6 +3633,129 @@ async function showPromptPopup(prompt, filename) {
 // ==========================================
 // Generation
 // ==========================================
+// ==========================================
+// 비용 귀속 (팀 / 프로젝트)
+// ==========================================
+// 목록은 서버가 쥔다. 앱마다 박아두면 팀이 바뀔 때 70대를 다시 깔아야 하고,
+// 자유 입력이면 "디자인팀" 과 "디자인" 이 따로 집계돼 리포트를 못 쓴다.
+let _billCatalog = { teams: [], projects: [] };
+
+function _billProjectName(id) {
+  if (!id) return "";
+  const p = (_billCatalog.projects || []).find(x => x.id === id);
+  return p ? (p.name || p.id) : id;
+}
+function _billTeamName(id) {
+  if (!id) return "";
+  const t = (_billCatalog.teams || []).find(x => x.id === id);
+  return t ? (t.name || t.id) : id;
+}
+
+// 사이드바 맨 위의 "이 탭은 어디로 달리는지" 표시. 고르기 전에는 강조색으로
+// 남아 생성이 막혀 있다는 사실을 알린다.
+async function refreshBillingBar() {
+  const bar = document.getElementById("billingBar");
+  const txt = document.getElementById("billingBarText");
+  if (!bar || !txt) return;
+  let st = null;
+  try { st = await api("/api/billing/state"); } catch (e) { /* 표시일 뿐이다 */ }
+  if (!_billCatalog.teams.length) { try { await loadBillingCatalog(false); } catch (e) {} }
+  const set = st && st.confirmed && st.team_id && st.project_id;
+  bar.classList.toggle("needs", !set);
+  txt.textContent = set
+    ? (_billTeamName(st.team_id) + " · " + _billProjectName(st.project_id))
+    : "선택 필요";
+  // 사이드바가 좁아 긴 프로젝트명은 잘린다 — 전체 값은 툴팁에서 보여준다.
+  bar.title = set
+    ? (txt.textContent + "\n이 탭에서 만든 이미지의 비용이 여기로 잡힌다 — 눌러서 변경")
+    : "팀과 프로젝트를 골라야 생성할 수 있다 — 눌러서 선택";
+}
+
+async function loadBillingCatalog(force) {
+  const d = await api("/api/billing/catalog" + (force ? "?refresh=1" : ""));
+  if (d && d.ok) {
+    _billCatalog = { teams: d.teams || [], projects: d.projects || [] };
+    return d.warning || null;
+  }
+  return (d && d.error) || "목록을 불러오지 못했습니다";
+}
+
+function _fillBillingSelects(teamId, projectId) {
+  const ts = document.getElementById("billingTeam");
+  const ps = document.getElementById("billingProject");
+  if (!ts || !ps) return;
+  ts.innerHTML = "";
+  (_billCatalog.teams || []).forEach(t => {
+    const o = document.createElement("option");
+    o.value = t.id; o.textContent = t.name || t.id;
+    ts.appendChild(o);
+  });
+  if (teamId && _billCatalog.teams.some(t => t.id === teamId)) ts.value = teamId;
+  onBillingTeamChange(projectId);
+}
+
+// 팀과 프로젝트는 서로 독립이다. 한 건을 여러 팀이 같이 하는 게 정상이라
+// 프로젝트를 팀에 묶으면 실제로 작업한 팀이 아닌 쪽으로 비용이 잡힌다.
+function onBillingTeamChange(preferProject) {
+  const ps = document.getElementById("billingProject");
+  if (!ps) return;
+  const list = _billCatalog.projects || [];
+  const keep = preferProject || ps.value;
+  ps.innerHTML = "";
+  list.forEach(p => {
+    const o = document.createElement("option");
+    o.value = p.id; o.textContent = p.name || p.id;
+    ps.appendChild(o);
+  });
+  if (keep && list.some(p => p.id === keep)) ps.value = keep;
+  const hint = document.getElementById("billingHint");
+  if (hint) {
+    hint.textContent = list.length ? "" :
+      "등록된 프로젝트가 없습니다. 관리자 페이지에서 추가해야 생성할 수 있습니다.";
+  }
+}
+
+async function openBillingModal() {
+  // 고르는 순간에는 캐시가 아니라 최신 목록을 본다. 관리자가 방금 뺀 건이
+  // 목록에 남아 있으면 그대로 골라버리고, 방금 추가한 건은 안 보인다.
+  const warn = await loadBillingCatalog(true);
+  const cur = await api("/api/billing/state");
+  _fillBillingSelects(cur && cur.team_id, cur && cur.project_id);
+  const hint = document.getElementById("billingHint");
+  if (hint && !hint.textContent) {
+    // 이 탭이 쓰던 팀/프로젝트가 목록에서 빠졌으면 말해준다. 조용히 다른 값이
+    // 선택돼 엉뚱한 곳에 비용이 달리는 게 최악이다.
+    const gone = [];
+    if (cur && cur.team_id && !(_billCatalog.teams || []).some(t => t.id === cur.team_id)) gone.push("팀");
+    if (cur && cur.project_id && !(_billCatalog.projects || []).some(p => p.id === cur.project_id)) gone.push("프로젝트");
+    if (gone.length) {
+      hint.textContent = "이 탭이 쓰던 " + gone.join("·") + "이(가) 목록에서 빠졌습니다. 다시 골라주세요.";
+    } else if (warn) {
+      hint.textContent = warn;
+    }
+  }
+  const m = document.getElementById("billingModal");
+  if (m) m.classList.remove("hidden");
+}
+
+function closeBillingModal() {
+  const m = document.getElementById("billingModal");
+  if (m) m.classList.add("hidden");
+}
+
+async function saveBilling() {
+  const team = document.getElementById("billingTeam").value;
+  const proj = document.getElementById("billingProject").value;
+  if (!team || !proj) { showToast("팀과 프로젝트를 모두 고르세요", "warn"); return; }
+  const d = await api("/api/billing/set", { method: "POST", body: { team_id: team, project_id: proj } });
+  if (!d.ok) { showToast(d.error || "설정 실패", "error"); return; }
+  closeBillingModal();
+  await refreshBillingBar();
+  await refreshProjects();        // 탭에 붙는 표시 갱신
+  showToast("이 탭의 비용 귀속을 설정했습니다", "success");
+}
+
+
 async function generate() {
   // Last-chance sync: a user can type "@image1" and hit Enter without ever
   // blurring the box. Re-sync mentions to slot state now — before
@@ -3620,6 +3765,9 @@ async function generate() {
   await saveSettings();
   const d = await api("/api/generate", { method: "POST" });
   if (!d.ok) {
+    // 귀속 미설정은 '오류' 가 아니라 '해야 할 일' 이다 — 토스트로 흘리지 말고
+    // 바로 고를 수 있게 띄운다.
+    if (d.needs_billing) { refreshBillingBar(); openBillingModal(); return; }
     showToast(d.error || "Cannot generate", "error");
     return;
   }

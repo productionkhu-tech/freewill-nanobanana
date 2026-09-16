@@ -321,6 +321,37 @@ async function handleAdmin(request, env, path) {
   if (path === "/admin/catalog") {
     return json(await handleCatalog(env, true));   // 보관된 것까지 (되살리기용)
   }
+  /**
+   * "지금 잘 돌아가고 있나" 한 줄.
+   *
+   * 집계가 조용히 멈추는 경우가 진짜 문제다 — 화면엔 숫자가 그대로 떠 있어서
+   * 며칠 지나서야 알아챈다. 그래서 (1) 시트 동기화가 마지막으로 돈 시각과
+   * (2) 사용량이 마지막으로 들어온 시각을 같이 보여준다.
+   * 시각 비교는 서버 시간(now)을 같이 내려 클라이언트 시계와 무관하게 한다.
+   */
+  if (path === "/admin/health") {
+    const now = nowIso();
+    const today = now.slice(0, 10);
+    const sync = await env.USAGE_DB.prepare(
+      "SELECT at, ok, detail, changed_at FROM sync_state WHERE id='sheet'").first();
+    // day 인덱스로 최근 며칠만 훑는다. created_at 에는 인덱스가 없어서
+    // 전체 정렬을 걸면 행이 쌓일수록 조회 비용이 그대로 커진다.
+    const recent = await env.USAGE_DB.prepare(
+      `SELECT MAX(created_at) AS last_at FROM usage_events
+        WHERE day >= date('now','-7 day')`).first();
+    const td = await env.USAGE_DB.prepare(
+      `SELECT COUNT(*) AS rows_n, COALESCE(SUM(images),0) AS images
+         FROM usage_events WHERE day = ?`).bind(today).first();
+    const fx = await latestFx(env);
+    return json({
+      ok: true, now,
+      sync: sync || null,
+      usage: { last_at: (recent && recent.last_at) || null,
+               today_images: (td && td.images) || 0,
+               today_rows: (td && td.rows_n) || 0 },
+      fx: fx ? { day: fx.day, usd_krw: fx.usd_krw } : null,
+    });
+  }
   // 구글 시트에서 팀/프로젝트를 끌어온다. 크론이 하루 한 번 돌지만, 시트를
   // 방금 고치고 바로 반영하고 싶을 때가 있어서 버튼도 둔다.
   if (path === "/admin/sync") {
@@ -689,6 +720,15 @@ svg.chart .bb{fill:var(--acc);opacity:.85}
 svg.chart .bb:hover{opacity:1;fill:var(--acc2)}
 svg.chart text{fill:var(--tx2);font-size:10px}
 .legend{color:var(--tx2);font-size:11px;margin-top:6px}
+/* 지금 잘 돌고 있나 — 숫자는 멈춰도 그대로 떠 있어서 따로 알려줘야 한다 */
+.health{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.hs{display:flex;align-items:center;gap:8px;background:var(--surf);border:1px solid var(--line);
+    border-radius:999px;padding:6px 14px;font-size:12px}
+.hs b{font-weight:600}
+.hs .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);flex:none}
+.hs.warn{border-color:#5a4a12}.hs.warn .dot{background:var(--warn)}
+.hs.bad{border-color:#5a2020}.hs.bad .dot{background:var(--err)}
+.hs .when{color:var(--tx2)}
 .split{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 /* 단가표는 칸이 많다 — 접어놓으면 읽을 수 없으니 가로로 밀어서 본다. */
 #priceTable{overflow-x:auto}
@@ -726,6 +766,8 @@ svg.chart text{fill:var(--tx2);font-size:10px}
       </div>
     </div>
   </div>
+
+  <div class="health" id="health"></div>
 
   <div class="period"><span class="range" id="periodText">—</span><span class="len" id="periodLen"></span></div>
   <div class="kpis" id="kpis"></div>
@@ -992,8 +1034,52 @@ function shareBars(rows, total, useKrw) {
   return h + '</table>';
 }
 
+// "3분 전" 같은 상대 표기. 서버가 내려준 now 를 기준으로 재서 이 PC 시계가
+// 틀어져 있어도 "음수 전" 같은 숫자가 안 나온다.
+function agoMin(now, then) {
+  if (!then) return null;
+  const a = Date.parse(String(now).replace(" ", "T") + "Z");
+  const b = Date.parse(String(then).replace(" ", "T") + "Z");
+  if (!isFinite(a) || !isFinite(b)) return null;
+  return Math.max(0, Math.round((a - b) / 60000));
+}
+function agoText(m) {
+  if (m === null) return "기록 없음";
+  if (m < 1) return "방금";
+  if (m < 60) return m + "분 전";
+  if (m < 1440) return Math.floor(m / 60) + "시간 전";
+  return Math.floor(m / 1440) + "일 전";
+}
+function hs(cls, label, value, when) {
+  return '<div class="hs ' + cls + '"><span class="dot"></span><b>' + esc(label) + '</b> '
+       + esc(value) + (when ? ' <span class="when">' + esc(when) + '</span>' : '') + '</div>';
+}
+
+async function loadHealth() {
+  const el = document.getElementById("health");
+  const d = await api("/admin/health");
+  if (!d.ok) { el.innerHTML = hs("bad", "상태", "확인할 수 없습니다"); return; }
+
+  // 동기화는 1분 크론이다. 10분 넘게 소식이 없으면 멈춘 것으로 본다.
+  const sy = d.sync || {};
+  const sm = agoMin(d.now, sy.at);
+  const syncCls = !sy.at ? "bad" : (!sy.ok ? "bad" : (sm > 10 ? "warn" : ""));
+  const syncTxt = !sy.at ? "돈 적 없음" : (sy.ok ? "정상" : "실패");
+
+  // 사용량은 밤에 0 인 게 정상이라 '없음' 을 빨갛게 하지 않는다. 시각만 보여준다.
+  const um = agoMin(d.now, d.usage.last_at);
+
+  el.innerHTML =
+      hs(syncCls, "시트 동기화", syncTxt, agoText(sm) + " 확인")
+    + hs("", "사용량 수집", "마지막 기록", agoText(um))
+    + hs("", "오늘", nf(d.usage.today_images) + "장", "")
+    + hs(d.fx ? "" : "warn", "환율", d.fx ? (nf(Math.round(d.fx.usd_krw)) + "원") : "없음",
+         d.fx ? d.fx.day : "");
+}
+
 async function loadUsage() {
   markPreset(); markGb();
+  loadHealth();
   const f = document.getElementById("from").value || "2000-01-01";
   const t = document.getElementById("to").value || "2999-12-31";
   const days = periodLabel(f, t);

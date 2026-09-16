@@ -324,9 +324,14 @@ async function handleAdmin(request, env, path) {
   // 구글 시트에서 팀/프로젝트를 끌어온다. 크론이 하루 한 번 돌지만, 시트를
   // 방금 고치고 바로 반영하고 싶을 때가 있어서 버튼도 둔다.
   if (path === "/admin/sync") {
-    if (request.method === "POST") return json(await syncSheetsSafe(env));
+    if (request.method === "POST") {
+      // 버튼으로 부른 건 force — 내용이 그대로여도 목록을 시트대로 다시 맞춘다.
+      let b = {};
+      try { b = await request.json(); } catch {}
+      return json(await syncSheetsSafe(env, b.force !== false));
+    }
     const r = await env.USAGE_DB.prepare(
-      "SELECT at, ok, detail FROM sync_state WHERE id='sheet'").first();
+      "SELECT at, ok, detail, changed_at FROM sync_state WHERE id='sheet'").first();
     return json({ ok: true, last: r || null });
   }
   // 팀·프로젝트 추가/수정. active=0 은 삭제가 아니라 **보관**이다 — 앱 목록에서만
@@ -456,8 +461,26 @@ function projectKey(name) {
 const b64url = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes)))
   .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
-/** 서비스 계정 JWT -> 액세스 토큰. 워커에 구글 SDK 를 넣을 수 없으니 직접 만든다. */
+/**
+ * 서비스 계정 JWT -> 액세스 토큰. 워커에 구글 SDK 를 넣을 수 없으니 직접 만든다.
+ * 토큰은 1시간짜리라 KV 에 담아 재사용한다 — 1분마다 도는 동기화가 매번 새로
+ * 받으면 그만큼 느리고 구글 쪽 호출도 60배가 된다.
+ */
 async function googleToken(env) {
+  try {
+    const c = await env.NB_TOKENS.get("gs:token", "json");
+    if (c && c.exp > Date.now() / 1000 + 120) return c.token;
+  } catch {}
+  const tok = await googleTokenFresh(env);
+  try {
+    await env.NB_TOKENS.put("gs:token",
+      JSON.stringify({ token: tok, exp: Math.floor(Date.now() / 1000) + 3300 }),
+      { expirationTtl: 3300 });
+  } catch {}
+  return tok;
+}
+
+async function googleTokenFresh(env) {
   const pem = String(env.GS_SA_KEY || "").replace(/\\n/g, "\n");
   const body = pem.replace(/-----(BEGIN|END) PRIVATE KEY-----/g, "").replace(/\s+/g, "");
   if (!body || !env.GS_SA_EMAIL) throw new Error("sheet credentials not configured");
@@ -496,7 +519,7 @@ async function googleToken(env) {
  * 그리고 시트가 만든 행(source='sheet')만 건드린다 — 관리자 페이지에서 손으로
  * 추가한 건 시트에 없다고 해서 조용히 내려가면 안 된다.
  */
-async function syncSheets(env) {
+async function syncSheets(env, force) {
   const token = await googleToken(env);
   const sid = env.GS_SHEET_ID;
   if (!sid) throw new Error("GS_SHEET_ID not set");
@@ -510,6 +533,22 @@ async function syncSheets(env) {
   const projRows = d.valueRanges[0].values || [];
   const teamRows = d.valueRanges[1].values || [];
   const now = nowIso();
+
+  // 시트가 그대로면 D1 에 아무것도 쓰지 않는다. 1분마다 38행씩 덮어쓰면
+  // 하루 5만 건이라 무료 쓰기 한도를 그냥 태운다 — 바뀐 날만 쓰면 사실상 0 이다.
+  const stamp = (await sha256Hex(JSON.stringify([teamRows, projRows]))).slice(0, 32);
+  const prev = await env.USAGE_DB.prepare(
+    "SELECT hash, detail, changed_at FROM sync_state WHERE id='sheet'").first();
+  // 크론은 안 바뀌었으면 넘어가지만, 사람이 버튼을 누른 경우엔 항상 맞춘다.
+  // 시트가 그대로여도 D1 쪽이 틀어져 있을 수 있고(손으로 잘못 보관했다거나),
+  // 그걸 되돌릴 방법이 해시 건너뛰기 때문에 없어지면 안 된다.
+  if (!force && prev && prev.hash === stamp) {
+    await env.USAGE_DB.prepare(
+      "UPDATE sync_state SET at=?, ok=1 WHERE id='sheet'").bind(now).run();
+    return { ok: true, at: now, unchanged: true, detail: prev.detail || "",
+             changed_at: prev.changed_at || null };
+  }
+
   const writes = [];
 
   // 팀: 이름 한 칸이 전부다. 시트에 있으면 살아 있는 것.
@@ -562,15 +601,18 @@ async function syncSheets(env) {
   const detail = "팀 " + teamIds.length + " · 프로젝트 " + live + " 진행 / " +
                  (projIds.length - live) + " 보관";
   await env.USAGE_DB.prepare(
-    `INSERT INTO sync_state (id, at, ok, detail) VALUES ('sheet',?,1,?)
-     ON CONFLICT(id) DO UPDATE SET at=excluded.at, ok=1, detail=excluded.detail`)
-    .bind(now, detail).run();
-  return { ok: true, at: now, teams: teamIds.length, projects: projIds.length, live, detail };
+    `INSERT INTO sync_state (id, at, ok, detail, hash, changed_at)
+     VALUES ('sheet',?,1,?,?,?)
+     ON CONFLICT(id) DO UPDATE SET at=excluded.at, ok=1, detail=excluded.detail,
+                                   hash=excluded.hash, changed_at=excluded.changed_at`)
+    .bind(now, detail, stamp, now).run();
+  return { ok: true, at: now, changed_at: now, teams: teamIds.length,
+           projects: projIds.length, live, detail };
 }
 
-async function syncSheetsSafe(env) {
+async function syncSheetsSafe(env, force) {
   try {
-    return await syncSheets(env);
+    return await syncSheets(env, force);
   } catch (e) {
     const msg = String(e && e.message || e).slice(0, 200);
     try {
@@ -715,7 +757,8 @@ svg.chart text{fill:var(--tx2);font-size:10px}
     <div class="sub" style="margin-top:10px;line-height:1.7">
       Project_Status 시트의 <b>진행</b>인 건만 앱 목록에 보입니다. <b>종료</b>로 바꾸거나 줄을 지우면
       다음 동기화 때 보관으로 내려가고, <b>그 건에 쌓인 비용은 리포트에 그대로 남습니다.</b><br>
-      매일 아침 자동으로 한 번 돌고, 시트를 방금 고쳤으면 위 버튼으로 바로 반영할 수 있습니다.
+      <b>1분마다</b> 자동으로 확인하므로 일과 중에 시트를 고치셔도 곧 반영됩니다. 급하면 위 버튼으로 즉시.
+      읽기 전용으로만 연결돼 있어 이쪽에서 시트를 고치는 일은 없습니다.
       아래에서 손으로 추가한 항목(<span class="pill arch">직접</span>)은 동기화가 건드리지 않습니다.
     </div>
   </div>
@@ -1048,9 +1091,14 @@ async function loadSync() {
   const l = d && d.last;
   if (!l) { el.textContent = "아직 동기화한 적이 없습니다."; return; }
   const when = String(l.at || "").replace("T", " ");
-  el.innerHTML = l.ok
-    ? '마지막 동기화 ' + esc(when) + ' &middot; ' + esc(l.detail || "")
-    : '<span class="err">마지막 시도 ' + esc(when) + ' 실패 &mdash; ' + esc(l.detail || "") + '</span>';
+  const chg = String(l.changed_at || "").replace("T", " ");
+  if (!l.ok) {
+    el.innerHTML = '<span class="err">마지막 시도 ' + esc(when) + ' 실패 &mdash; '
+                 + esc(l.detail || "") + '</span>';
+    return;
+  }
+  el.innerHTML = '마지막 확인 ' + esc(when) + ' &middot; ' + esc(l.detail || "")
+    + (chg ? '<br><span class="muted">마지막 변경 ' + esc(chg) + '</span>' : '');
 }
 async function runSync() {
   const b = document.getElementById("syncBtn");
@@ -1414,11 +1462,24 @@ async function handleAdminUsage(url, env) {
 
 export default {
   // 하루 한 번 환율을 받아 둔다. 놓친 날은 리포트가 직전 값으로 대체한다.
+  /**
+   * 1분마다 도는 크론 하나로 두 가지를 한다 (무료 플랜 크론 한도가 계정당 5개고
+   * 이미 다 써서 두 번째를 못 붙인다).
+   *
+   * 시트 동기화: 매분. 일과 중에 프로젝트를 '종료' 로 바꾸면 1분 안에 앱 목록에서
+   *   내려가야 한다. 내용이 그대로면 D1 에 아무것도 쓰지 않는다.
+   * 환율: 오늘 치가 없을 때만. 시각을 못 박으면 그 1분을 놓친 날은 통째로 빈다 —
+   *   "없으면 받는다" 로 두면 저절로 따라잡는다.
+   */
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(fetchFxRate(env));
-    // 시트가 목록의 원본이다. 사용자가 시트에 '종료' 라고 적으면 다음 날 앱
-    // 목록에서 내려가고, 그 건의 지난 비용은 리포트에 그대로 남는다.
     ctx.waitUntil(syncSheetsSafe(env));
+    ctx.waitUntil((async () => {
+      try {
+        const cur = await latestFx(env);
+        const today = new Date().toISOString().slice(0, 10);
+        if (!cur || cur.day < today) await fetchFxRate(env);
+      } catch {}
+    })());
   },
 
   async fetch(request, env, ctx) {

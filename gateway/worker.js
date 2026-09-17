@@ -685,7 +685,7 @@ async function syncSheetsSafe(env, force) {
 // 로그인은 관리자 키 하나 — 계정 시스템을 붙일 이유가 없는 1인용 화면이다.
 const ADMIN_HTML = `<!DOCTYPE html><html lang="ko"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NanoBanana 사용량</title><link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231e1e23'/%3E%3Crect x='7' y='17' width='4.5' height='9' rx='1.5' fill='%23D4A574'/%3E%3Crect x='13.8' y='12' width='4.5' height='14' rx='1.5' fill='%23D4A574'/%3E%3Crect x='20.6' y='6' width='4.5' height='20' rx='1.5' fill='%23E8C9A0'/%3E%3C/svg%3E"><style>
+<title>이미지 API 사용량</title><link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231e1e23'/%3E%3Crect x='7' y='17' width='4.5' height='9' rx='1.5' fill='%23D4A574'/%3E%3Crect x='13.8' y='12' width='4.5' height='14' rx='1.5' fill='%23D4A574'/%3E%3Crect x='20.6' y='6' width='4.5' height='20' rx='1.5' fill='%23E8C9A0'/%3E%3C/svg%3E"><style>
 :root{--bg:#16161a;--surf:#1e1e23;--surf2:#25252b;--line:#2e2e36;--tx:#e9e9ee;--tx2:#9a9aa4;
       --acc:#D4A574;--acc2:#E8C9A0;--warn:#FFD60A;--ok:#7ee08a;--err:#ff8a8a}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -772,7 +772,7 @@ svg.chart text{fill:var(--tx2);font-size:10px}
 @media(max-width:860px){.split{grid-template-columns:1fr}}
 </style></head><body>
 
-<div class="top"><h1>NanoBanana 사용량</h1><span class="sub" id="fxLine"></span></div>
+<div class="top"><h1>이미지 API 사용량</h1><span class="sub" id="fxLine"></span></div>
 <div class="sub">이미지 한 장마다 팀·프로젝트로 비용이 잡힙니다. 금액은 저장하지 않고, 조회할 때 그 날짜의 단가와 환율을 곱합니다.</div>
 
 <div class="tabs">
@@ -959,7 +959,10 @@ function periodLabel(f, t) {
 }
 
 /* ---- 묶기 ---- */
-const GBS = [["project", "프로젝트"], ["team", "팀"], ["user", "사람"],
+// "사람" 은 뺐다. 윈도우 계정명이라 대부분 그냥 "user" 여서 누가 만들었는지 구분이
+// 안 되고(실측: 871장 중 866장이 user/User/USER), 구분되는 척하는 눈금이 제일 나쁘다.
+// PC 이름은 본인 이름으로 지어둔 사람이 많아 그나마 사람에 가깝다.
+const GBS = [["project", "프로젝트"], ["team", "팀"],
              ["model", "모델"], ["machine", "PC"], ["day", "날짜"]];
 let curGb = "project";
 document.getElementById("gbChips").innerHTML = GBS.map(g =>

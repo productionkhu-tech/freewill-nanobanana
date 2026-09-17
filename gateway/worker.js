@@ -279,6 +279,23 @@ async function handleProxy(request, env, ctx, path) {
 }
 
 // --------------------------------------------------------------------- admin
+/**
+ * 팀·프로젝트를 **바꾸는** 동작에만 걸리는 2차 잠금.
+ *
+ * 관리자 키 하나로 조회와 변경을 같이 열어두면, 화면을 띄워둔 채 자리를 비운
+ * 사이에 목록이 바뀔 수 있다. 목록이 바뀌면 누가 무엇을 고를 수 있는지가 바뀌고,
+ * 그건 집계 전체에 영향을 준다. 조회는 그대로 두고 쓰기만 한 번 더 묻는다.
+ *
+ * 화면에서만 막으면 소용없다 — 관리자 키를 아는 사람은 요청을 직접 보낼 수 있다.
+ * 그래서 서버가 판단한다. SETUP_KEY 가 없으면 잠긴 것으로 본다(열어두지 않는다).
+ */
+function setupOk(request, env) {
+  const got = request.headers.get("X-Setup-Key") || "";
+  return Boolean(env.SETUP_KEY) && timingSafeEqual(got, env.SETUP_KEY);
+}
+
+const NEED_SETUP = { ok: false, need_setup: true, error: "팀·프로젝트 변경 비밀번호가 필요합니다" };
+
 async function handleAdmin(request, env, path) {
   if (!(await adminOk(request, env))) {
     return json({ ok: false, error: "admin key required" }, 403);
@@ -318,6 +335,11 @@ async function handleAdmin(request, env, path) {
   if (path === "/admin/usage") {
     return json(await handleAdminUsage(new URL(request.url), env));
   }
+  // 입력한 비밀번호가 맞는지만 본다. 틀린 걸 나중에 버튼 눌렀을 때 알게 하면
+  // 무엇이 문제인지(키인지 비번인지) 구분이 안 된다.
+  if (path === "/admin/setup-check" && request.method === "POST") {
+    return setupOk(request, env) ? json({ ok: true }) : json(NEED_SETUP, 403);
+  }
   if (path === "/admin/catalog") {
     return json(await handleCatalog(env, true));   // 보관된 것까지 (되살리기용)
   }
@@ -356,6 +378,7 @@ async function handleAdmin(request, env, path) {
   // 방금 고치고 바로 반영하고 싶을 때가 있어서 버튼도 둔다.
   if (path === "/admin/sync") {
     if (request.method === "POST") {
+      if (!setupOk(request, env)) return json(NEED_SETUP, 403);
       // 버튼으로 부른 건 force — 내용이 그대로여도 목록을 시트대로 다시 맞춘다.
       let b = {};
       try { b = await request.json(); } catch {}
@@ -369,6 +392,7 @@ async function handleAdmin(request, env, path) {
   // 사라지고 과거 사용량 행과 이름은 그대로 남아 리포트에 계속 나온다.
   // 끝난 프로젝트의 지난 비용이 안 보이면 그건 집계가 아니라 구멍이다.
   if (path === "/admin/team" && request.method === "POST") {
+    if (!setupOk(request, env)) return json(NEED_SETUP, 403);
     let b; try { b = await request.json(); } catch { return json({ ok: false, error: "bad request" }, 400); }
     const id = slug(b.id || b.name);
     if (!id) return json({ ok: false, error: "name required" }, 400);
@@ -380,6 +404,7 @@ async function handleAdmin(request, env, path) {
     return json({ ok: true, id });
   }
   if (path === "/admin/project" && request.method === "POST") {
+    if (!setupOk(request, env)) return json(NEED_SETUP, 403);
     let b; try { b = await request.json(); } catch { return json({ ok: false, error: "bad request" }, 400); }
     const id = slug(b.id || b.name);
     if (!id) return json({ ok: false, error: "name required" }, 400);
@@ -788,6 +813,7 @@ svg.chart text{fill:var(--tx2);font-size:10px}
 </div>
 
 <div id="pane-setup" style="display:none">
+  <div class="card" id="lockBar"></div>
   <div class="card">
     <div class="row" style="justify-content:space-between">
       <div>
@@ -846,7 +872,16 @@ svg.chart text{fill:var(--tx2);font-size:10px}
 const KEY_LS = "nb_admin_key";
 let KEY = localStorage.getItem(KEY_LS) || "";
 if (!KEY) { KEY = prompt("관리자 키") || ""; if (KEY) localStorage.setItem(KEY_LS, KEY); }
-const H = () => ({ "X-Admin-Key": KEY, "Content-Type": "application/json" });
+// 팀·프로젝트 변경용 2차 비밀번호. sessionStorage 라 창을 닫으면 다시 묻는다 —
+// localStorage 에 두면 "한 번 더 확인" 이 사실상 한 번으로 끝난다.
+const SETUP_LS = "nb_setup_key";
+let SETUP = sessionStorage.getItem(SETUP_LS) || "";
+const H = () => {
+  const h = { "X-Admin-Key": KEY, "Content-Type": "application/json" };
+  if (SETUP) h["X-Setup-Key"] = SETUP;
+  return h;
+};
+const locked = () => !SETUP;
 
 const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -864,8 +899,14 @@ async function api(path, opt) {
   const r = await fetch(path, { headers: H(), ...(opt || {}) });
   const d = await r.json().catch(() => ({}));
   if (r.status === 403) {
-    localStorage.removeItem(KEY_LS);
-    alert("관리자 키가 틀렸습니다. 새로고침 후 다시 입력하세요.");
+    // 같은 403 이라도 관리자 키 문제와 2차 비밀번호 문제는 다른 일이다.
+    // 구분하지 않으면 비번 틀린 사람이 관리자 키까지 날리게 된다.
+    if (d && d.need_setup) {
+      SETUP = ""; sessionStorage.removeItem(SETUP_LS); renderLock();
+    } else {
+      localStorage.removeItem(KEY_LS);
+      alert("관리자 키가 틀렸습니다. 새로고침 후 다시 입력하세요.");
+    }
   }
   return d;
 }
@@ -874,7 +915,7 @@ function show(which) {
     document.getElementById("pane-" + k).style.display = (k === which) ? "" : "none";
     document.getElementById("tb-" + k).className = (k === which) ? "on" : "";
   });
-  if (which === "setup") { loadCatalog(); loadSync(); }
+  if (which === "setup") { renderLock(); loadCatalog(); loadSync(); }
   if (which === "price") { loadPrices(); loadFx(); }
 }
 
@@ -1195,10 +1236,51 @@ async function runSync() {
   loadSync(); loadCatalog();
 }
 
+/* ---- 변경 잠금 ---- */
+function renderLock() {
+  const el = document.getElementById("lockBar");
+  if (!el) return;
+  el.innerHTML = locked()
+    ? '<div class="row" style="justify-content:space-between">'
+      + '<div><b>변경이 잠겨 있습니다</b><div class="sub" style="margin-top:4px">'
+      + '목록은 볼 수 있습니다. 추가·보관·되살리기·삭제·동기화는 비밀번호를 한 번 더 넣어야 합니다.</div></div>'
+      + '<button class="go" onclick="unlockSetup()">잠금 해제</button></div>'
+    : '<div class="row" style="justify-content:space-between">'
+      + '<div><b class="ok">변경할 수 있습니다</b><div class="sub" style="margin-top:4px">'
+      + '이 창을 닫으면 다시 잠깁니다.</div></div>'
+      + '<button class="ghost" onclick="lockSetup()">다시 잠그기</button></div>';
+  // 잠겨 있으면 버튼을 눌러도 안 되게 미리 막는다 — 눌러보고 실패하는 것보다 낫다.
+  document.querySelectorAll("#pane-setup button[data-off-team],#pane-setup button[data-on-team],"
+    + "#pane-setup button[data-off-proj],#pane-setup button[data-on-proj],"
+    + "#pane-setup button[data-del-team],#pane-setup button[data-del-proj]")
+    .forEach(b => { b.disabled = locked(); });
+  ["tName", "pName", "syncBtn"].forEach(id => {
+    const x = document.getElementById(id);
+    if (x) x.disabled = locked();
+  });
+  document.querySelectorAll("#pane-setup .go").forEach(b => {
+    if (b.textContent === "추가") b.disabled = locked();
+  });
+}
+async function unlockSetup() {
+  const v = (prompt("팀·프로젝트 변경 비밀번호") || "").trim();
+  if (!v) return;
+  SETUP = v;
+  const d = await api("/admin/setup-check", { method: "POST", body: "{}" });
+  if (!d.ok) { SETUP = ""; sessionStorage.removeItem(SETUP_LS); renderLock();
+               return alert("비밀번호가 맞지 않습니다."); }
+  sessionStorage.setItem(SETUP_LS, v);
+  renderLock();
+}
+function lockSetup() {
+  SETUP = ""; sessionStorage.removeItem(SETUP_LS); renderLock();
+}
+
 async function loadCatalog() {
   const d = await api("/admin/catalog");
   document.getElementById("teamList").innerHTML = catTable(d.teams || [], "team");
   document.getElementById("projList").innerHTML = catTable(d.projects || [], "proj");
+  renderLock();          // 버튼이 새로 그려졌으니 잠금 상태를 다시 입힌다
 }
 async function addTeam() {
   const name = document.getElementById("tName").value.trim();

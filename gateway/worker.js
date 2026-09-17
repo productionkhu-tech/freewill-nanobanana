@@ -790,6 +790,10 @@ svg.chart text{fill:var(--tx2);font-size:10px}
         <button class="go" onclick="loadUsage()">조회</button>
       </div>
     </div>
+    <div class="row" style="margin-top:10px;gap:10px">
+      <span class="muted" style="font-size:12px">프로젝트 상태</span>
+      <div class="chips" id="statusChips"></div>
+    </div>
   </div>
 
   <div class="health" id="health"></div>
@@ -962,6 +966,17 @@ function periodLabel(f, t) {
 // "사람" 은 뺐다. 윈도우 계정명이라 대부분 그냥 "user" 여서 누가 만들었는지 구분이
 // 안 되고(실측: 871장 중 866장이 user/User/USER), 구분되는 척하는 눈금이 제일 나쁘다.
 // PC 이름은 본인 이름으로 지어둔 사람이 많아 그나마 사람에 가깝다.
+// 전체 / 진행 / 종료. 표시만 접는 게 아니라 합계와 그래프까지 같이 걸린다.
+const STATUSES = [["all", "전체"], ["live", "진행 중"], ["archived", "종료"]];
+let curStatus = "all";
+document.getElementById("statusChips").innerHTML = STATUSES.map(x =>
+  '<button data-status="' + x[0] + '">' + x[1] + '</button>').join("");
+function markStatus() {
+  document.querySelectorAll("#statusChips button").forEach(b =>
+    b.className = (b.dataset.status === curStatus) ? "on" : "");
+}
+const statusName = k => (STATUSES.find(x => x[0] === k) || ["", ""])[1];
+
 const GBS = [["project", "프로젝트"], ["team", "팀"],
              ["model", "모델"], ["machine", "PC"], ["day", "날짜"]];
 let curGb = "project";
@@ -978,6 +993,7 @@ document.addEventListener("click", async (e) => {
   if (!b) return;
   if (b.dataset.preset) { applyPreset(b.dataset.preset); return; }
   if (b.dataset.gb) { curGb = b.dataset.gb; markGb(); loadUsage(); return; }
+  if (b.dataset.status) { curStatus = b.dataset.status; markStatus(); loadUsage(); return; }
   if (b.dataset.offTeam) {
     await api("/admin/team", { method: "POST", body: JSON.stringify(
       { id: b.dataset.offTeam, name: b.dataset.name, active: false }) });
@@ -1122,13 +1138,21 @@ async function loadHealth() {
 }
 
 async function loadUsage() {
-  markPreset(); markGb();
+  markPreset(); markGb(); markStatus();
   loadHealth();
   const f = document.getElementById("from").value || "2000-01-01";
   const t = document.getElementById("to").value || "2999-12-31";
   const days = periodLabel(f, t);
+  // 지금 무엇을 보고 있는지 기간 옆에 붙인다 — 화면을 캡처해 공유할 때
+  // "진행 중만 본 숫자" 인지 "전체" 인지가 안 보이면 오해를 부른다.
+  const lenEl = document.getElementById("periodLen");
+  if (curStatus !== "all") {
+    lenEl.textContent = (lenEl.textContent ? lenEl.textContent + " " : "")
+      + "· " + statusName(curStatus) + "인 건만";
+  }
   document.getElementById("trend").innerHTML = '<div class="empty">불러오는 중…</div>';
-  const d = await api("/admin/usage?from=" + f + "&to=" + t + "&group_by=" + curGb);
+  const d = await api("/admin/usage?from=" + f + "&to=" + t + "&group_by=" + curGb
+                    + "&status=" + curStatus);
   const tbl = document.getElementById("usageTable");
   if (!d.ok) {
     document.getElementById("kpis").innerHTML = "";
@@ -1575,6 +1599,23 @@ async function handleAdminUsage(url, env) {
   const col = GROUPS[key];
   if (!col) return { ok: false, error: "bad group_by" };
 
+  /**
+   * 진행 중인 건만 / 끝난 건만 보기.
+   *
+   * 행을 거르는 것이지 표시만 접는 게 아니다 — 합계도 그래프도 같이 걸려야
+   * "이번 달 진행 건에 얼마 썼나" 라는 질문에 답이 된다.
+   *
+   * 끝난 건 = "살아 있는 목록에 없는 것" 으로 잡는다. active=0 인 것만 세면
+   * 목록에서 아예 지워진 프로젝트의 지난 행이 어느 쪽에도 안 잡혀서
+   * 진행 + 종료 가 전체보다 작아진다. 두 눈금을 나란히 놓고 보는 화면에서
+   * 그 차이는 바로 "숫자가 안 맞는다" 로 읽힌다.
+   */
+  const status = url.searchParams.get("status") || "all";
+  const LIVE = "e.project_id IN (SELECT id FROM projects WHERE active=1)";
+  const statusSql = status === "live" ? " AND " + LIVE
+                  : status === "archived" ? " AND NOT " + LIVE
+                  : "";
+
   const sql = `
     SELECT ${col} AS k,
            COUNT(*)            AS rows_n,
@@ -1587,7 +1628,7 @@ async function handleAdminUsage(url, env) {
     FROM usage_events e
     ${PRICE_JOIN}
     ${FX_JOIN}
-    WHERE e.day >= ? AND e.day <= ?
+    WHERE e.day >= ? AND e.day <= ?${statusSql}
     GROUP BY k
     ORDER BY cost_usd DESC`;
   const r = await env.USAGE_DB.prepare(sql).bind(from, to).all();
@@ -1601,7 +1642,7 @@ async function handleAdminUsage(url, env) {
     FROM usage_events e
     ${PRICE_JOIN}
     ${FX_JOIN}
-    WHERE e.day >= ? AND e.day <= ?
+    WHERE e.day >= ? AND e.day <= ?${statusSql}
     GROUP BY e.day ORDER BY e.day`;
   const dr = await env.USAGE_DB.prepare(dsql).bind(from, to).all();
 
@@ -1620,7 +1661,7 @@ async function handleAdminUsage(url, env) {
   }
   const fx = await latestFx(env);
   return {
-    ok: true, group_by: key, from, to,
+    ok: true, group_by: key, from, to, status,
     total_cost_usd: total, total_cost_krw: totalKrw,
     total_images: imgs, unpriced_images: unpriced,
     usd_krw: fx ? fx.usd_krw : 0, fx_day: fx ? fx.day : null,

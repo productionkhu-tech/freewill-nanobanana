@@ -620,8 +620,8 @@ function _updateProjectTab(tab, p) {
   const title = (p.path || p.name) + (p.dirty ? "  (저장 안 됨)" : "");
   // 라벨로 탭을 어지럽히는 대신 툴팁으로 알린다 — 사이드바에 크게 떠 있다.
   const _bill = p.billing_project_id
-    ? "\n비용 귀속: " + _billTeamName(p.billing_team_id) + " · " + _billProjectName(p.billing_project_id)
-    : "\n비용 귀속 미설정 — 이 탭은 생성이 막혀 있습니다";
+    ? "\n" + _billTeamName(p.billing_team_id) + " · " + _billProjectName(p.billing_project_id)
+    : "\n팀·프로젝트 미설정 — 이 탭은 생성이 막혀 있습니다";
   if (tab.title !== title + _bill) tab.title = title + _bill;
 
   const dot = tab.querySelector(".pt-gen");
@@ -3680,7 +3680,7 @@ async function refreshBillingBar() {
     : "선택 필요";
   // 사이드바가 좁아 긴 프로젝트명은 잘린다 — 전체 값은 툴팁에서 보여준다.
   bar.title = set
-    ? (txt.textContent + "\n이 탭에서 만든 이미지의 비용이 여기로 잡힌다 — 눌러서 변경")
+    ? (txt.textContent + "\n눌러서 변경")
     : "팀과 프로젝트를 골라야 생성할 수 있다 — 눌러서 선택";
 }
 
@@ -3867,7 +3867,7 @@ async function saveBilling() {
   closeBillingModal();
   await refreshBillingBar();
   await refreshProjects();        // 탭에 붙는 표시 갱신
-  showToast("이 탭의 비용 귀속을 설정했습니다", "success");
+  showToast("이 탭을 " + _billTeamName(team) + " · " + _billProjectName(proj) + " 로 설정했습니다", "success");
 }
 
 

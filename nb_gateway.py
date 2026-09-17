@@ -162,7 +162,7 @@ def enroll(data_dir, url, app_version="", log=None):
 
     tk = ticket()
     if not tk:
-        return None, "gateway: no ticket on this machine"
+        return None, "gateway: no ticket on this machine"    # WHY_NO_TICKET
     body = {
         "ticket": tk,
         "user": os.environ.get("USERNAME") or os.environ.get("USER") or "unknown",
@@ -197,6 +197,29 @@ def enroll(data_dir, url, app_version="", log=None):
     return tok, "ok"
 
 
+# 등록이 왜 안 됐는지는 화면까지 가야 한다. 예전엔 로그에만 남겨서, 쓰는 사람은
+# "등록되지 않았습니다" 만 보고 무엇을 해야 할지 알 수 없었다 (2026-09-17 현장 제보).
+_LAST_TOKEN_REASON = {"msg": ""}
+
+
+def token_failure_reason():
+    """마지막 토큰 획득 실패를 사용자가 읽을 말로. 없으면 빈 문자열."""
+    return _LAST_TOKEN_REASON["msg"]
+
+
+def _humanize_enroll(msg):
+    m = msg or ""
+    if "no ticket" in m:
+        return "이 PC에 OpenAI 키가 없어 등록하지 못했습니다 — 키 설치 파일을 한 번 실행해 주세요"
+    if "ticket not accepted" in m or "403" in m:
+        return "등록이 거부되었습니다 — 키가 오래된 것일 수 있습니다. 관리자에게 알려주세요"
+    if "unreachable" in m:
+        return "등록 서버에 연결하지 못했습니다 — 잠시 뒤 다시 시도해 주세요"
+    if "too many attempts" in m or "429" in m:
+        return "등록 시도가 너무 잦아 잠시 막혔습니다 — 10분 뒤 다시 시도해 주세요"
+    return "등록하지 못했습니다 (%s)" % m.replace("gateway: ", "")[:80]
+
+
 def get_token(data_dir, app_version="", log=None):
     """Token to use for this run, or None to fall back to the direct key.
 
@@ -204,13 +227,17 @@ def get_token(data_dir, app_version="", log=None):
     down must not stop an app that already has its token."""
     url = gateway_url(data_dir)
     if not url:
+        _LAST_TOKEN_REASON["msg"] = "게이트웨이 주소를 찾지 못했습니다"
         return None, ""
     tok = load_token(data_dir, url)
     if tok:
+        _LAST_TOKEN_REASON["msg"] = ""
         return tok, url
     tok, msg = enroll(data_dir, url, app_version=app_version, log=log)
     if tok:
+        _LAST_TOKEN_REASON["msg"] = ""
         return tok, url
+    _LAST_TOKEN_REASON["msg"] = _humanize_enroll(msg)
     if log:
         log(msg)
     return None, url
@@ -409,7 +436,8 @@ def fetch_catalog(data_dir, app_version="", log=None):
         return None, "게이트웨이 주소를 찾지 못했습니다"
     token, _ = get_token(data_dir, app_version=app_version, log=log)
     if not token:
-        return None, "이 PC가 아직 게이트웨이에 등록되지 않았습니다"
+        why = token_failure_reason()
+        return None, why or "이 PC가 아직 게이트웨이에 등록되지 않았습니다"
     try:
         req = urllib.request.Request(
             url + "/catalog",

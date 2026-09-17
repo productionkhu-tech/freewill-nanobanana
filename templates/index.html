@@ -434,6 +434,11 @@
       <button class="btn-sm" onclick="useLastBilling()">이대로 채우기</button>
     </div>
     <p class="hint" id="billingHint"></p>
+    <!-- 목록을 못 받았을 때만 보인다. 예전엔 닫았다 다시 여는 것 말고는
+         사용자가 할 수 있는 게 없었다. -->
+    <div id="billingRetry" class="hidden" style="margin:6px 0 0">
+      <button class="btn-sm" onclick="retryBillingCatalog()">목록 다시 불러오기</button>
+    </div>
     <div class="close-buttons">
       <button class="btn-sm" onclick="closeBillingModal()">나중에</button>
       <button class="btn-accent-sm" id="billingApply" onclick="saveBilling()">이 탭에 적용</button>

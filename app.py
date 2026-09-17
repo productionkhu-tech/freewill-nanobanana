@@ -4313,6 +4313,38 @@ def load_setup():
 # 리포트가 못 쓰게 되고, 앱마다 목록을 박아두면 팀이 바뀔 때 70대를 다시 깔아야
 # 한다. 서버 목록을 그때그때 받아오는 게 둘 다 피하는 유일한 길이다.
 _catalog_cache = {"at": 0.0, "data": None}
+CATALOG_CACHE_FILE = "catalog_cache.json"
+
+
+def _catalog_cache_path():
+    return os.path.join(_user_data_dir(), CATALOG_CACHE_FILE)
+
+
+def _load_catalog_disk():
+    """마지막으로 잘 받았던 목록을 디스크에서 되살린다.
+
+    메모리 캐시만 두면 앱을 켠 직후 목록 서버가 한 번 삐끗했을 때 드롭다운이
+    통째로 비어 **아무것도 고를 수 없고, 못 고르면 생성도 막힌다.** 목록은 거의
+    안 바뀌는 값이라 지난 목록이라도 있는 편이 빈 화면보다 훨씬 낫다."""
+    try:
+        with open(_catalog_cache_path(), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict) and isinstance(d.get("teams"), list)                 and isinstance(d.get("projects"), list):
+            return {"teams": d["teams"], "projects": d["projects"]}, d.get("at") or ""
+    except Exception:
+        pass
+    return None, ""
+
+
+def _save_catalog_disk(payload):
+    try:
+        tmp = _catalog_cache_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"at": time.strftime("%Y-%m-%d %H:%M"), **payload}, f,
+                      ensure_ascii=False)
+        os.replace(tmp, _catalog_cache_path())
+    except Exception:
+        pass
 
 
 @app.route("/api/billing/catalog")
@@ -4326,14 +4358,25 @@ def billing_catalog():
     d, err = _nbgw.fetch_catalog(_user_data_dir(), app_version=_read_version(),
                                  log=state.log)
     if err:
-        # 캐시가 있으면 그거라도 준다 — 잠깐 끊겼다고 생성을 막을 이유는 없다.
-        if _catalog_cache["data"]:
-            return jsonify({"ok": True, "stale": True, "warning": err,
-                            **_catalog_cache["data"]})
+        state.log("billing catalog failed: %s" % str(err)[:120])
+        stale = _catalog_cache["data"]
+        saved_at = ""
+        if not stale:
+            stale, saved_at = _load_catalog_disk()
+            if stale:
+                _catalog_cache["data"] = stale      # 이번 실행 동안은 이걸 쓴다
+        if stale:
+            # 이유는 그대로 알려준다 — 조용히 지난 목록을 쓰면 왜 새 프로젝트가
+            # 안 보이는지 아무도 모른다.
+            return jsonify({"ok": True, "stale": True,
+                            "warning": "%s — %s 목록을 씁니다" % (
+                                err, ("저장해 둔 " + saved_at) if saved_at else "직전"),
+                            **stale})
         return jsonify({"ok": False, "error": err})
     payload = {"teams": d.get("teams", []), "projects": d.get("projects", [])}
     _catalog_cache["at"] = now
     _catalog_cache["data"] = payload
+    _save_catalog_disk(payload)
     return jsonify({"ok": True, **payload})
 
 

@@ -3740,11 +3740,9 @@ function onBillingTeamChange(preferProject, force) {
     ps.appendChild(o);
   });
   ps.value = (keep && list.some(p => p.id === keep)) ? keep : "";
-  const hint = document.getElementById("billingHint");
-  if (hint) {
-    hint.textContent = list.length ? "" :
-      "등록된 프로젝트가 없습니다. 관리자 페이지에서 추가해야 생성할 수 있습니다.";
-  }
+  // 목록이 왜 비었는지(못 받아온 건지, 진짜 없는 건지)는 여기서 알 수 없다.
+  // 안내는 조회 결과를 아는 openBillingModal 이 쓴다 — 예전엔 여기서 먼저
+  // "등록된 프로젝트가 없습니다" 를 박아버려서 진짜 오류 메시지가 가려졌다.
   _syncBillingApply();
 }
 
@@ -3779,17 +3777,32 @@ async function openBillingModal() {
   // 지난번에 쓰던 건 "제안" 으로만 보여준다. 누르면 그때 채워진다.
   _billRecall(!keepTeam && fresh && fresh.last_team_id && fresh.last_project_id ? fresh : null);
   _billBusy(false);
-  if (hint && !hint.textContent) {
+  if (hint) {
     // 이 탭이 쓰던 팀/프로젝트가 목록에서 빠졌으면 말해준다. 조용히 다른 값이
     // 선택돼 엉뚱한 곳에 비용이 달리는 게 최악이다.
     const gone = [];
     if (fresh && fresh.team_id && !(_billCatalog.teams || []).some(t => t.id === fresh.team_id)) gone.push("팀");
     if (fresh && fresh.project_id && !(_billCatalog.projects || []).some(p => p.id === fresh.project_id)) gone.push("프로젝트");
-    if (gone.length) {
-      hint.textContent = "이 탭이 쓰던 " + gone.join("·") + "이(가) 목록에서 빠졌습니다. 다시 골라주세요.";
-    } else if (warn) {
+    const empty = !(_billCatalog.projects || []).length || !(_billCatalog.teams || []).length;
+    // 순서가 중요하다: 못 받아왔으면 그 사실이 먼저다. 빈 목록을 보고
+    // "등록된 게 없나 보다" 로 안내하면 쓰는 사람이 영영 원인을 못 찾는다.
+    if (warn) {
       hint.textContent = warn;
+      hint.classList.toggle("hint-warn", empty);
+    } else if (empty) {
+      hint.textContent = "등록된 팀·프로젝트가 없습니다. 관리자 페이지에서 추가해야 생성할 수 있습니다.";
+      hint.classList.add("hint-warn");
+    } else if (gone.length) {
+      hint.textContent = "이 탭이 쓰던 " + gone.join("·") + "이(가) 목록에서 빠졌습니다. 다시 골라주세요.";
+      hint.classList.remove("hint-warn");
+    } else {
+      hint.textContent = "";
+      hint.classList.remove("hint-warn");
     }
+    // 못 받아왔을 때만 다시 시도 버튼을 띄운다 — 닫았다 여는 것 말고는
+    // 사용자가 할 수 있는 게 없었다.
+    const retry = document.getElementById("billingRetry");
+    if (retry) retry.classList.toggle("hidden", !(warn && empty));
   }
   _focusBillingApply();
 }
@@ -3817,6 +3830,13 @@ function useLastBilling() {
 }
 
 // 고를 게 남았으면 팀 드롭다운에, 다 골랐으면 적용 버튼에 포커스를 둔다.
+// 다시 시도 = 창을 닫았다 여는 것과 같다. 목록을 강제로 다시 받는다.
+async function retryBillingCatalog() {
+  const hint = document.getElementById("billingHint");
+  if (hint) { hint.textContent = "목록을 다시 불러오는 중…"; hint.classList.remove("hint-warn"); }
+  await openBillingModal();
+}
+
 function _focusBillingApply() {
   const b = document.getElementById("billingApply");
   const ts = document.getElementById("billingTeam");

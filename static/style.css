@@ -1585,6 +1585,9 @@ footer {
 .bill-row .field-label { width: 64px; flex: none; margin: 0; }
 .bill-row select { flex: 1; height: 32px; }
 /* 지난번 제안 줄 — 고르는 건 여전히 사용자의 손이다 */
+/* .hidden 과 같은 상세도(클래스 하나)라 나중에 오는 display:flex 가 이긴다.
+   그래서 숨길 때를 명시해 준다 — 안 써놓으면 "지난번" 줄이 내용 없이 늘 떠 있다. */
+.bill-recall.hidden { display: none; }
 .bill-recall { display: flex; align-items: center; gap: 8px; margin: 10px 0 0;
                padding: 8px 10px; background: var(--input-bg);
                border: 1px solid var(--border); border-radius: 8px; font-size: 12px; }

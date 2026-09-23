@@ -420,8 +420,10 @@ async function handleAdmin(request, env, path) {
       // 보이는데 사용량은 별칭을 따라 PJ 쪽으로만 들어가, 이 줄은 영원히 0 이 된다.
       let a = null;
       try {
+        // 이미 같은 id 의 행이 있으면(번호를 다시 쓴 새 건) 그 행을 고치는 것이라 막지 않는다.
         a = await env.USAGE_DB.prepare(
-          "SELECT project_id FROM project_aliases WHERE alias=?").bind(id).first();
+          `SELECT project_id FROM project_aliases
+            WHERE alias=? AND alias NOT IN (SELECT id FROM projects)`).bind(id).first();
       } catch {}
       if (a) {
         return json({ ok: false, error: "이 번호는 이미 시트의 " + a.project_id +
@@ -532,6 +534,26 @@ function projectKey(name) {
 // 시트 H열의 프로젝트 ID. 이게 있으면 위의 건 번호보다 우선한다 (syncSheets 참고).
 // 대문자라 slug() 를 거치면 다른 id 가 되므로, 이미 있는 행을 가리킬 때도 그대로 쓴다.
 const PJ_RE = /^PJ-[A-Z0-9]{4,20}$/;
+
+/**
+ * 옛 id -> PJ id 별칭표. **그 옛 id 로 된 프로젝트 행이 지금 있으면 빼고** 준다.
+ *
+ * 이관 뒤에 옛 번호를 다른 프로젝트가 다시 쓸 수 있다 ([26P40] 을 [26P10] 으로 고친
+ * 뒤 진짜 26P40 이 PJ 없이 시트에 올라오는 경우). 그 id 는 이제 새 프로젝트의 것이다.
+ * 별칭을 계속 따르면 새 건의 사용량이 옛 프로젝트로 새서 섞인다.
+ * 동기화·목록·사용량 수집이 모두 이 한 곳을 쓴다 — 규칙이 갈라지면 안 된다.
+ */
+async function liveAliases(env) {
+  const out = {};
+  try {
+    for (const a of ((await env.USAGE_DB.prepare(
+        `SELECT alias, project_id FROM project_aliases
+          WHERE alias NOT IN (SELECT id FROM projects)`).all()).results || [])) {
+      out[a.alias] = a.project_id;
+    }
+  } catch {}
+  return out;
+}
 
 // ----------------------------------------------------------- Google Sheets
 // 팀과 프로젝트 목록의 원본은 사용자가 매일 쓰는 구글 시트다. 관리자 페이지에서
@@ -655,19 +677,13 @@ async function syncSheets(env, force) {
    * 옮긴 옛 id 는 별칭으로 남긴다. 아직 옛 id 를 들고 있는 앱이 보내는 사용량도
    * 이 별칭을 거쳐 새 id 로 들어온다.
    */
-  // 옛 id 로 볼 수 있는 것: 프로젝트 행이 있거나 사용 기록이 남아 있는 id.
-  const known = new Set(((await env.USAGE_DB.prepare(
-    "SELECT id FROM projects UNION SELECT project_id FROM usage_events").all()).results || [])
-    .map((x) => x.id));
+  // D1 에 있는 프로젝트 행과 그 이름. 옛 id 는 이름까지 맞아야 가져온다 (아래 참고).
+  const rowName = new Map(((await env.USAGE_DB.prepare("SELECT id, name FROM projects").all())
+    .results || []).map((x) => [x.id, String(x.name || "").trim()]));
   // 한 번 옮긴 번호는 계속 PJ id 를 가리킨다. H열이 실수로 비어도 그 건이
   // 옛 id 로 되돌아가 두 줄로 갈라지면 안 된다.
-  const aliasOf = {};
-  try {
-    for (const a of ((await env.USAGE_DB.prepare(
-        "SELECT alias, project_id FROM project_aliases").all()).results || [])) {
-      aliasOf[a.alias] = a.project_id;
-    }
-  } catch {}
+  const aliasOf = await liveAliases(env);
+  const sheetPj = new Set(projRows.map((r) => String(r[7] || "").trim()).filter((x) => PJ_RE.test(x)));
 
   // PJ 가 있는 행을 먼저 본다 — 같은 id 로 겹치면 시트가 고정 키를 준 행이 이긴다.
   const hasPjRow = (row) => PJ_RE.test(String(row[7] || "").trim());
@@ -682,17 +698,31 @@ async function syncSheets(env, force) {
     if (!name) continue;
     const pj = String((row[7] || "")).trim();
     const hasPj = PJ_RE.test(pj);
-    const id = hasPj ? pj : (aliasOf[projectKey(name)] || projectKey(name));
+    // H열이 빈 행은 그 번호를 옮겨 간 PJ 로 잇는다 — 단 그 PJ 가 시트 어디에도 없을
+    // 때만(= 이 행의 H 가 지워진 것). PJ 가 다른 행에 멀쩡히 있으면 옛 번호를 새
+    // 프로젝트가 다시 쓴 것이다. 이으면 두 행이 한 id 로 겹쳐 새 건이 목록에서 사라진다.
+    const key = projectKey(name);
+    const via = aliasOf[key];
+    const id = hasPj ? pj : ((via && !sheetPj.has(via)) ? via : key);
     if (!id || projIds.includes(id)) continue;
     const active = String(row[2] || "").trim() === "진행" ? 1 : 0;
     if (active) live++;
     projIds.push(id);
     projRowsOut.push([id, name.slice(0, 64), active]);
     if (!hasPj) continue;
-    const prevNames = String(row[8] || "").split("|").map((x) => x.trim()).filter(Boolean);
-    for (const n of [name, ...prevNames]) {
+    /*
+     * 옛 id 후보는 지금 이름과 I열 이전 이름들의 건 번호·슬러그인데, **그 id 의 D1 행
+     * 이름이 이 이름들 중 하나일 때만** 이 프로젝트의 과거로 본다. 번호만 보면
+     * [26P40] 을 [26P10] 으로 고쳤을 때, 예전에 26P10 을 쓰다 시트에서 빠진 다른
+     * 프로젝트의 기록까지 끌려와 섞인다. 번호는 고쳐지고 재사용되지만 이름까지 같은
+     * 건 같은 프로젝트뿐이다. 못 알아보면 옮기지 않는다 — 갈라진 건 나중에 합칠 수
+     * 있어도, 섞인 건 어느 장이 누구 것이었는지 되돌릴 방법이 없다.
+     */
+    const names = [name, ...String(row[8] || "").split("|").map((x) => x.trim()).filter(Boolean)]
+      .map((n) => n.slice(0, 64));
+    for (const n of names) {
       for (const k of [projectKey(n), slug(n)]) {
-        if (!k || k === id || !known.has(k)) continue;
+        if (!k || k === id || !rowName.has(k) || !names.includes(rowName.get(k))) continue;
         if (!claims.has(k)) claims.set(k, new Set());
         claims.get(k).add(id);
       }
@@ -1600,13 +1630,7 @@ async function handleCatalog(env, includeArchived) {
   // 앱이 탭에 저장해 둔 옛 id 를 새 id 로 바꿔 읽을 수 있게 별칭표를 같이 준다.
   // 이게 없으면 이관 직후 그 탭은 "목록에서 내려갔습니다" 로 막힌다 — 사실은
   // 이름표만 바뀐 같은 프로젝트인데.
-  let aliases = {};
-  try {
-    for (const a of ((await env.USAGE_DB.prepare(
-        "SELECT alias, project_id FROM project_aliases").all()).results || [])) {
-      aliases[a.alias] = a.project_id;
-    }
-  } catch {}
+  const aliases = await liveAliases(env);
   return {
     ok: true,
     teams: (teams.results || []).sort(byName),
@@ -1641,13 +1665,7 @@ async function handleUsage(request, env, rec) {
   const batch = [];
   // 옛 프로젝트 id -> 시트 PJ id. 앱의 탭이나 아직 못 보낸 spool 은 이관 전 id 를
   // 들고 있을 수 있다. 그대로 받으면 이관한 프로젝트가 다시 두 줄로 갈라진다.
-  const alias = {};
-  try {
-    for (const a of ((await env.USAGE_DB.prepare(
-        "SELECT alias, project_id FROM project_aliases").all()).results || [])) {
-      alias[a.alias] = a.project_id;
-    }
-  } catch {}
+  const alias = await liveAliases(env);
   for (const e of events) {
     if (e && e.project_id && alias[e.project_id]) e.project_id = alias[e.project_id];
     const ts = String(e.ts || created).slice(0, 19);

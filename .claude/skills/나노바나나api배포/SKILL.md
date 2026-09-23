@@ -36,6 +36,8 @@ Copy-Item ".\app.py",".\launcher.py",".\updater.py",".\VERSION" "C:\NanoBanana_b
 Copy-Item ".\static\app.js",".\static\style.css" "C:\NanoBanana_build\src\static\" -Force
 Copy-Item ".\templates\index.html",".\templates\viewer.html",".\templates\prompt_popup.html" "C:\NanoBanana_build\src\templates\" -Force
 # 클린 빌드 (캐시 재사용 금지 — Remove-Item은 훅 오해 방지를 위해 개별 명령으로)
+# ⚠ 사용자가 쓰는 앱(예: Desktop\앱 백업\nanobanana)이 떠 있으면 아래 줄은 건너뛴다 — 빌드는
+#   그 파일을 건드리지 않고, 끄면 진행 중인 작업이 날아간다. 꺼야 하는 단계(§5)는 사용자에게 부탁한다.
 Get-Process NanoBanana -ErrorAction SilentlyContinue | Stop-Process -Force -Confirm:$false
 Remove-Item "C:\NanoBanana_build\src\build" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "C:\NanoBanana_build\src\dist" -Recurse -Force -ErrorAction SilentlyContinue
@@ -197,9 +199,18 @@ print("E2E RESULT:", "PASS" if (nv == NEW_VER and h == NEW_SHA) else "FAIL")
 ```
 
 PASS 후 정리: NanoBanana 프로세스 kill + `C:\NanoBanana_build\e2e` 삭제.
+onefile EXE 는 **프로세스가 둘**(부트로더 + 본체)이다. `Popen` 으로 받은 PID 만 죽이면 본체가
+5656 을 잡고 남는다 → `taskkill /T /F /PID <pid>` 또는 경로(`...\e2e\*`)로 골라 전부 끌 것.
+사용자 앱이 떠 있어 5656 이 막혀 있으면 **끄지 말고 사용자에게 잠깐 꺼 달라고 부탁한다.**
 
-**부팅 자동 체크 확인** (팝업 경로): 새 빌드를 켜고 `GET /api/logs`에 몇 초 내
-`Update available: ...` 또는 `Already on latest version` 로그가 찍히는지 확인.
+**핸즈프리 판정이 더 강하다**: 위 스크립트는 apply-update 를 직접 부르지만, 구버전을 켜 놓고
+**아무것도 부르지 않은 채** `/api/version` 만 지켜봐도 된다(부팅 체크 → 이벤트 → 화면 자동 적용 →
+스왑까지 전부 탄다). 2026-09-24 에 1703→2401 16초, 2301→2401 11초로 확인.
+
+**부팅 자동 체크 확인** (팝업 경로): 새 빌드를 켜고 `GET /api/logs?all=1`에 몇 초 내
+`Update available: ...` / `Already on latest version` / `Local ... >= remote ... (no update)` 로그가
+찍히는지 확인. **`all=1` 필수** — 로그는 탭별로 걸러서 주는데 부팅 체크는 부팅 중 다른 탭 이름으로
+찍힐 수 있어서, 안 붙이면 체크가 안 돈 것처럼 보인다 (2026-09-24 실제로 헷갈림).
 ⚠️ `/api/events`를 직접 폴링하면 이벤트를 가로채 앱 화면의 팝업이 사라진다 — 진단 목적이 아니면 로그로만 볼 것.
 ⚠️ `/api/check-update`는 호출자에게만 JSON을 주고 화면엔 아무것도 안 띄운다 (원격으로 팝업 못 띄움).
 
@@ -228,3 +239,5 @@ Start-Process ".\dist\NanoBanana\NanoBanana.exe"
 | PyInstaller 캐시 | 매 빌드 전 build/dist 삭제 (--clean 포함해도 폴더 삭제 먼저) |
 | 6/12~7/20-01 구버전 사용자 | 부팅 팝업 없는 빌드 — 푸터 버전 클릭 1회 안내 필요 (수동 체크는 전 버전 동작) |
 | Program Files 설치 사용자 | 자동 업데이트 불가 (UAC) — 일반 폴더로 이동 안내 |
+| `git push origin` 이 자격 증명 창에서 무한 대기 | `git push "https://x-access-token:${GH_TOKEN}@github.com/productionkhu-tech/freewill-nanobanana.git" main <tag>` (출력은 `sed "s#${GH_TOKEN}#***#g"` 로 토큰 가림) |
+| 날짜를 넘겨 공개 | 버전은 **공개하는 날** 기준. 빌드 후 자정을 넘기면 VERSION 을 새 날짜 01 로 고쳐 다시 빌드 (2026-09-24: 2302 → 2401) |

@@ -259,6 +259,7 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 | Google AI Studio | 동일 모델군 | `NANOBANANA_STUDIO_KEY` |
 | OpenAI | gpt-image-2 · gpt-image-2.5-sunburst / -flare | `OPENAI_API_KEY` |
 | BytePlus | seedream-5-0-pro / 4-5 | `ARK_API_KEY` |
+| Higgsfield | higgsfield-soul-v2 (**숨김**, 아래) | `HF_KEY` (`KEY_ID:KEY_SECRET`) |
 
 - Gemini는 10 RPM → 앱이 8 RPM으로 스로틀. **결제 미연결 시 Studio 429(limit:0) + Vertex 403(BILLING_DISABLED)**
 - **GPT Image 2.5 (2026-09-08)**: sunburst(편집 정밀도) / flare(빠른 생성). 크기 규칙은 gpt-image-2와
@@ -272,6 +273,12 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   저장물의 reve-create를 기본 모델로 폴백 (개명 맵 `_MODEL_RENAMES`와 다름 — prefs 키는 건드리지 않음).
   과거 Reve 생성물의 갤러리 배지/라벨은 그대로 표시
 - Seedream 5.0 Pro 커스텀 크기 상한은 `2048²×1.1025 = 4,624,220px` (그냥 2048²로 두면 통과할 크기가 잘림)
+- **Higgsfield Soul 2 는 코드만 실려 있고 꺼져 있다** (v2026-09-2301~). 스위치는 `app.py` 의
+  `SOUL_ENABLED` **하나** — 서버 모델 목록·생성·키 읽기·부팅 로그와, 페이지의 Soul 상태 점·전용 칸
+  (Jinja `soul_enabled`), 프론트 드롭다운(`nb-soul` 메타를 읽어 `MODEL_SPECS` 에서 뺀다)이 전부 이
+  값을 따른다. 프론트에 따로 스위치를 두지 말 것 — 반쪽만 켜진다. 켜기 전 조건: API 플랫폼
+  (open.higgsfield.ai) 크레딧 충전(앱 크레딧과 별개, 없으면 403 `not_enough_credits`) → 실제 1장 생성
+  확인 → D1 단가 행 `verified=1`. 720p/1080p·레퍼런스 없음·1장/4장, 비동기 큐(POST 후 status_url 폴링)
 
 ### 6.2 맥 (소스 실행)
 - `NanoBanana.command` 더블클릭 → `server_mac.py` → Flask를 기본 브라우저로

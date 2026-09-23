@@ -931,6 +931,12 @@ async function loadSettings() {
   const _bgc = document.getElementById("bgTransparentChk");
   if (_bgc) _bgc.checked = !!d.openai_bg_transparent;
   _syncBgHint();
+  // Soul 값도 프로젝트와 함께 다닌다 — 탭을 오가거나 프로젝트를 다시 열었을 때
+  // 스타일이 조용히 비면 같은 프롬프트로 다른 그림이 나온다.
+  const _sid = document.getElementById("soulStyleId");
+  if (_sid) _sid.value = d.soul_style_id || "";
+  const _sen = document.getElementById("soulEnhanceChk");
+  if (_sen) _sen.checked = !!d.soul_enhance_prompt;
   // H7: applyModelSpec() above already populated AND selected each dropdown
   // (loaded value, else this model's default). Raw-setting .value here would
   // bypass that fallback and blank out any value the model no longer offers
@@ -1122,6 +1128,19 @@ const MODEL_SPECS = {
     hint: "GPT Image 2.5 Heavy — editing precision. Starts at max quality.",
     refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
   },
+  // Higgsfield Soul 2 — 다른 셋과 다른 점이 많아 스펙에도 그대로 드러난다.
+  // 720p/1080p 뿐이고 레퍼런스를 못 넣으며, 장수는 1 또는 4 만 받는다.
+  "higgsfield-soul-v2": {
+    aspects: ["1:1","4:3","3:4","16:9","9:16","3:2","2:3"],
+    resolutions: ["720p","1080p"],
+    counts: ["1","4"],
+    showQuality: false,
+    showSoul: true,
+    noRefs: true,
+    defaultAspect: "16:9", defaultResolution: "1080p",
+    hint: "Higgsfield Soul 2 — 1080p까지. 레퍼런스 이미지는 쓰지 않습니다.",
+    refHint: "이 모델은 레퍼런스를 받지 않습니다. 슬롯은 그대로 두고 무시됩니다.",
+  },
 };
 // (Reve 2.1 removed 2026-09-01 — Reve shut down its API service. Old projects
 // that still say reve-create are remapped server-side to the default model;
@@ -1139,6 +1158,11 @@ const MODEL_SPECS = {
 // settings modal automatically: visible, starting on its highest quality.
 // A second hand-kept list here would be exactly the place a new model gets
 // forgotten.
+// Soul 2 는 실호출 검증 전까지 숨긴다. 스위치는 서버 한 곳(app.py SOUL_ENABLED)이고,
+// 화면은 페이지에 실린 값만 따른다 — 여기서 빼면 드롭다운·모델 설정 창에서 같이 빠진다.
+if ((document.querySelector('meta[name="nb-soul"]') || {}).content !== "1") {
+  delete MODEL_SPECS["higgsfield-soul-v2"];
+}
 const MODEL_ORDER = Object.keys(MODEL_SPECS);
 const MODEL_LABELS = {
   "seedream-5-0-pro-260628": "seedream-5-0-pro",
@@ -1146,6 +1170,7 @@ const MODEL_LABELS = {
   "gpt-image-2": "gpt-image-2 (OpenAI)",
   "gpt-image-2.5-flare": "gpt-image-2.5 Flare (Fast)",
   "gpt-image-2.5-sunburst": "gpt-image-2.5 Sunburst (Heavy)",
+  "higgsfield-soul-v2": "Soul 2 (Higgsfield)",
 };
 let _modelPrefs = { hidden: [], default_res: {} };
 
@@ -1228,6 +1253,7 @@ const _MODEL_SHORT = {
   "gpt-image-2.5-sunburst": "GPT Image 2.5 Sunburst",
   "seedream-5-0-pro-260628": "Seedream 5 Pro",
   "seedream-4-5-251128": "Seedream 4.5",
+  "higgsfield-soul-v2": "Soul 2",
   "reve-create": "Reve 2.1",
 };
 function _shortModel(m) {
@@ -1284,6 +1310,16 @@ function _syncBgHint() {
   hint.style.display = (rowVisible && chk.checked) ? "" : "none";
 }
 
+function onSoulStyleInput(v) {
+  clearTimeout(onSoulStyleInput._t);
+  onSoulStyleInput._t = setTimeout(() => {
+    api("/api/settings", { method: "POST", body: { soul_style_id: v } });
+  }, 400);
+}
+function onSoulEnhanceChange(on) {
+  api("/api/settings", { method: "POST", body: { soul_enhance_prompt: !!on } });
+}
+
 function applyModelSpec(model, preserved) {
   const spec = getModelSpec(model);
   // H8: migrate the wrong "0.5K" token (shipped v1201/02) back to "512px".
@@ -1316,6 +1352,13 @@ function applyModelSpec(model, preserved) {
       api("/api/settings", { method: "POST", body: { openai_bg_transparent: false } });
     }
   }
+  // Soul 전용 칸. 다른 모델로 갔을 때 숫값이 살아있어도 서버가 무시하므로
+  // (img_cfg 를 모델별로 다시 짓는다) 값을 지우진 않는다 — 돌아오면 그대로 있어야 한다.
+  const soulRow = document.getElementById("soulRow");
+  if (soulRow) soulRow.style.display = spec.showSoul ? "" : "none";
+  // 레퍼런스를 안 받는 모델이면 그 사실을 ref 안내에 명시한다.
+  const refArea = document.getElementById("refArea");
+  if (refArea) refArea.classList.toggle("refs-ignored", Boolean(spec.noRefs));
   _syncBgHint();
   const hintEl = document.getElementById("modelHint");
   if (hintEl) hintEl.textContent = spec.hint;
@@ -3648,12 +3691,20 @@ async function showPromptPopup(prompt, filename) {
 // ==========================================
 // 목록은 서버가 쥔다. 앱마다 박아두면 팀이 바뀔 때 70대를 다시 깔아야 하고,
 // 자유 입력이면 "디자인팀" 과 "디자인" 이 따로 집계돼 리포트를 못 쓴다.
-let _billCatalog = { teams: [], projects: [] };
+let _billCatalog = { teams: [], projects: [], aliases: {} };
 // 창을 즉시 띄우기 위한 직전 상태. 없으면 한 번은 서버에 물어본다.
 let _billLastState = null;
 
+// 시트에 프로젝트 ID(PJ-…)가 붙으며 옛 id 가 새 id 로 이관됐을 수 있다.
+// 탭에 저장된 옛 id 도 같은 프로젝트로 알아봐야 이름이 제대로 뜨고 미리 골라진다.
+function _billCanonProject(id) {
+  // 목록에 그 id 가 그대로 있으면 그게 답이다 (옛 번호를 새 프로젝트가 다시 쓴 경우).
+  if ((_billCatalog.projects || []).some(p => p.id === id)) return id;
+  return ((_billCatalog.aliases || {})[id]) || id;
+}
 function _billProjectName(id) {
   if (!id) return "";
+  id = _billCanonProject(id);
   const p = (_billCatalog.projects || []).find(x => x.id === id);
   return p ? (p.name || p.id) : id;
 }
@@ -3687,7 +3738,7 @@ async function refreshBillingBar() {
 async function loadBillingCatalog(force) {
   const d = await api("/api/billing/catalog" + (force ? "?refresh=1" : ""));
   if (d && d.ok) {
-    _billCatalog = { teams: d.teams || [], projects: d.projects || [] };
+    _billCatalog = { teams: d.teams || [], projects: d.projects || [], aliases: d.aliases || {} };
     return d.warning || null;
   }
   return (d && d.error) || "목록을 불러오지 못했습니다";
@@ -3731,7 +3782,7 @@ function onBillingTeamChange(preferProject, force) {
   const ps = document.getElementById("billingProject");
   if (!ps) return;
   const list = _billCatalog.projects || [];
-  const keep = force ? (preferProject || "") : (preferProject || ps.value);
+  const keep = _billCanonProject(force ? (preferProject || "") : (preferProject || ps.value));
   ps.innerHTML = "";
   ps.appendChild(_billPlaceholder("선택…"));
   list.forEach(p => {
@@ -3782,7 +3833,9 @@ async function openBillingModal() {
     // 선택돼 엉뚱한 곳에 비용이 달리는 게 최악이다.
     const gone = [];
     if (fresh && fresh.team_id && !(_billCatalog.teams || []).some(t => t.id === fresh.team_id)) gone.push("팀");
-    if (fresh && fresh.project_id && !(_billCatalog.projects || []).some(p => p.id === fresh.project_id)) gone.push("프로젝트");
+    // 이관된 옛 id 는 빠진 게 아니라 이름표만 바뀐 같은 프로젝트다.
+    const freshProj = fresh && _billCanonProject(fresh.project_id);
+    if (freshProj && !(_billCatalog.projects || []).some(p => p.id === freshProj)) gone.push("프로젝트");
     const empty = !(_billCatalog.projects || []).length || !(_billCatalog.teams || []).length;
     // 순서가 중요하다: 못 받아왔으면 그 사실이 먼저다. 빈 목록을 보고
     // "등록된 게 없나 보다" 로 안내하면 쓰는 사람이 영영 원인을 못 찾는다.
@@ -4158,6 +4211,8 @@ async function refreshApiStatus() {
   }
   const seedreamDot = document.getElementById("seedreamDot");
   if (seedreamDot) seedreamDot.className = "dot " + (d.seedream || "disconnected");
+  const soulDot = document.getElementById("soulDot");
+  if (soulDot) soulDot.className = "dot " + (d.soul || "disconnected");
   _anyGenerating = !!d.any_generating;
   // Status is always the ACTIVE project's, so the placeholder count follows the
   // tab on screen: a background batch never steals or clears them.

@@ -212,6 +212,48 @@ def _gemini_image_size_ok(model, size):
 # ==========================================
 SEEDREAM_BASE_URL = "https://ark.ap-southeast.bytepluses.com/api/v3"
 SEEDREAM_MODEL_IDS = ("seedream-5-0-pro-260628", "seedream-4-5-251128")
+
+# ---------------------------------------------------------------- Higgsfield Soul
+# 앞의 셋과 모양이 다르다. Soul 은 **비동기 큐**다: POST 로 제출하면 request_id 와
+# status_url 이 오고, 완료될 때까지 폴링한 뒤 images[].url 에서 받아온다. 그래서
+# SDK 없이 urllib 로 직접 친다 — 이거 하나 때문에 의존성을 늘릴 이유가 없다.
+#
+# 제약(문서 기준): 해상도는 720p/1080p 뿐이고 **레퍼런스 이미지를 못 넣는다**.
+# 그래서 이 모델을 고르면 ref 슬롯은 무시된다(지우지는 않는다 — 다른 모델로
+# 돌아갔을 때 그대로 있어야 한다).
+SOUL_MODEL_ID = "higgsfield-soul-v2"
+SOUL_MODEL_IDS = (SOUL_MODEL_ID,)
+SOUL_ENDPOINT = "https://api.higgsfield.ai/higgsfield-ai/soul/v2/standard"
+SOUL_RESOLUTIONS = ("720p", "1080p")
+SOUL_ASPECTS = ("1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3")
+SOUL_POLL_INTERVAL = 2.0
+SOUL_POLL_TIMEOUT = 300.0
+# 실호출로 검증하기 전(API 크레딧 충전 전)에는 숨긴다. 코드는 그대로 두고 이 값 하나로
+# 모델 목록 · 상단 상태 점 · Soul 전용 칸 · 생성 · 부팅 로그가 같이 꺼진다.
+# 화면은 페이지에 실린 이 값만 따른다(nb-soul 메타) — 스위치를 두 곳에 두면 한쪽만 켜진다.
+SOUL_ENABLED = False
+
+
+def _soul_key():
+    """KEY_ID:KEY_SECRET 한 줄. 다른 프로바이더와 같은 방식으로 환경변수에서 읽는다."""
+    return (os.environ.get("HF_KEY", "") or os.environ.get("HF_CREDENTIALS", "")).strip()
+
+
+def _soul_post(url, body, key, timeout=60):
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(
+        url, data=data, method="POST" if data is not None else "GET",
+        headers={"Authorization": "Key " + key, "Content-Type": "application/json",
+                 "User-Agent": "NanoBanana"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace") or "{}")
+
+
+def _soul_get(url, key, timeout=30):
+    req = urllib.request.Request(
+        url, headers={"Authorization": "Key " + key, "User-Agent": "NanoBanana"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace") or "{}")
 # output_format: pro accepts png/jpeg; 4-5 is jpeg-only (param unsupported -> omit)
 _SEEDREAM_OUTPUT_FORMAT = {
     "seedream-5-0-pro-260628": "png",
@@ -334,6 +376,10 @@ def _extract_usage(provider, result_obj, pil=None):
     except Exception:
         pass
     try:
+        # Soul 은 usage 를 안 돌려준다(응답이 URL 하나다). 장수는 1,
+        # 픽셀은 위에서 PIL 로 재었으니 그걸로 충분하다 — 장당 과금이라 토큰이 필요 없다.
+        if provider == "soul":
+            return u
         if provider in ("vertex", "studio"):
             m = getattr(result_obj, "usage_metadata", None)
             if m is not None:
@@ -467,7 +513,7 @@ _ALL_MODEL_IDS = (
     "gpt-image-2",
     "gpt-image-2.5-sunburst",
     "gpt-image-2.5-flare",
-)
+) + ((SOUL_MODEL_ID,) if SOUL_ENABLED else ())
 _RES_TOKENS = {"512px", "1K", "2K", "4K", "auto"}
 
 
@@ -619,6 +665,7 @@ class _Shared:
         self.client_studio = None
         self.client_openai = None
         self.client_seedream = None
+        self.soul_key = ""            # Higgsfield: 클라이언트 객체가 없다(REST 직접 호출)
         # Rate limit: UI hint says "10 RPM auto-throttled to ~8 RPM". That's
         # 1 request every 7.5s per provider. Previously this was 0.5s (120
         # RPM) — we'd hit 429s constantly.
@@ -628,12 +675,14 @@ class _Shared:
         self.openai_rate_limiter = RateLimiter(interval=1.5)
         # Seedream (BytePlus) allows 500 RPM; a light interval keeps us safe.
         self.seedream_rate_limiter = RateLimiter(interval=0.3)
+        self.soul_rate_limiter = RateLimiter(interval=0.5)
 
         # API status
         self.vertex_status = "disconnected"
         self.studio_status = "disconnected"
         self.openai_status = "disconnected"
         self.seedream_status = "disconnected"
+        self.soul_status = "disconnected"
         self.vertex_credentials_path = None
         self.vertex_session_disabled = False
         # Plain-language reason behind the OpenAI dot. A red dot with no
@@ -767,6 +816,9 @@ class AppState:
         # GPT Image 2.5 전용 — 배경을 투명하게 받을지. 프로젝트별 설정이라
         # 탭마다 다르게 둘 수 있고, 프로젝트 파일에 함께 저장된다.
         self.openai_bg_transparent = False
+        # Soul 전용. 탭마다 따로 간다 — 한 창에 여러 건을 띄워놓고 일하므로.
+        self.soul_style_id = ""
+        self.soul_enhance_prompt = False
         self.fixed_prompt = ""
         self.prompt_sections = [""]
         self.naming_enabled = False
@@ -1020,6 +1072,25 @@ class AppState:
         else:
             self.log("Seedream: ARK_API_KEY not configured (skipped)")
             self.seedream_status = "disconnected"
+
+        # Higgsfield Soul - REST only, no SDK. The key is "KEY_ID:KEY_SECRET"
+        # and goes in as "Authorization: Key ...". Nothing to construct here, so
+        # a present key is all "connected" can mean until the first request.
+        # 숨겨 둔 동안은 키도 안 읽고 로그도 남기지 않는다 — 모르는 이름이 로그에 뜨면
+        # 쓰는 사람만 헷갈린다.
+        soul_key = _soul_key() if SOUL_ENABLED else ""
+        if not SOUL_ENABLED:
+            self.soul_status = "disconnected"
+        elif soul_key and ":" in soul_key:
+            self.soul_key = soul_key
+            self.log("Higgsfield Soul connected")
+            self.soul_status = "connected"
+        elif soul_key:
+            self.log("Higgsfield Soul: HF_KEY must look like KEY_ID:KEY_SECRET")
+            self.soul_status = "error"
+        else:
+            self.log("Higgsfield Soul: HF_KEY not configured (skipped)")
+            self.soul_status = "disconnected"
 
     def _openai_selftest(self):
         """앱 부팅 직후 OpenAI 연결을 1회 점검. models.list()는 무과금.
@@ -1911,6 +1982,8 @@ class AppState:
                 "custom_w": self.custom_w,
                 "custom_h": self.custom_h,
                 "openai_bg_transparent": self.openai_bg_transparent,
+                "soul_style_id": self.soul_style_id,
+                "soul_enhance_prompt": self.soul_enhance_prompt,
                 "billing_team_id": self.billing_team_id,
                 "billing_project_id": self.billing_project_id,
                 "count": str(self.count),
@@ -1999,6 +2072,8 @@ class AppState:
         self.custom_w = _safe_int(ui.get("custom_w"), self.custom_w, lo=16, hi=99999)
         self.custom_h = _safe_int(ui.get("custom_h"), self.custom_h, lo=16, hi=99999)
         self.openai_bg_transparent = bool(ui.get("openai_bg_transparent", False))
+        self.soul_style_id = str(ui.get("soul_style_id", "") or "")
+        self.soul_enhance_prompt = bool(ui.get("soul_enhance_prompt", False))
         # 저장된 귀속은 되살리되 '확인' 은 되살리지 않는다. 미리 채워두면
         # 다시 고를 필요는 없고 확인 한 번이면 끝난다.
         self.billing_team_id = str(ui.get("billing_team_id", "") or "")
@@ -2300,6 +2375,98 @@ class AppState:
                         "error": detail[:300], "elapsed": elapsed}
         return {"status": "cancelled", "index": idx, "seed": seed}
 
+    def _generate_one_image_soul(self, job, prompt, ref_payloads, model, img_cfg):
+        """Higgsfield Soul 2. 비동기 큐라 제출 -> 폴링 -> URL 다운로드 순서다.
+
+        이 모델은 레퍼런스 이미지를 받지 않는다. 조용히 무시하면 "레퍼런스를
+        넣었는데 왜 반영이 안 되지" 로 이어지므로 로그에 한 줄 남긴다.
+        """
+        idx = job["index"]
+        total = job["total"]
+        seed = job["seed"]
+        label = "Soul"
+        res = img_cfg.get("resolution", "1080p")
+        asp = img_cfg.get("aspect_ratio", "16:9")
+        self.log(f"[{idx+1}/{total}] Queued on {label} ({res}, {asp})")
+        if not self.soul_key:
+            return {"status": "failed", "index": idx, "seed": seed,
+                    "error": "Higgsfield not connected (set HF_KEY)", "elapsed": 0.0}
+        if any(p is not None for p in (ref_payloads or [])):
+            self.log(f"{label}: reference images are not supported by this model - ignored")
+
+        body = {
+            "prompt": prompt,
+            "resolution": res,
+            "aspect_ratio": asp,
+            "batch_size": 1,
+            # 기본값이 true 라 명시적으로 끔다. 서버가 프롬프트를 고쳐 쓰면
+            # Fixed Prompt 를 정교하게 짜 의미가 없어진다. 켜고 싶으면 사용자가 켜야 한다.
+            "enhance_prompt": bool(img_cfg.get("enhance_prompt")),
+        }
+        if seed:
+            # API 범위가 1..1000000 이라 우리 시드를 그 안으로 접어넣는다.
+            body["seed"] = (abs(int(seed)) % 1000000) + 1
+        sid = (img_cfg.get("style_id") or "").strip()
+        if sid:
+            body["style_id"] = sid
+
+        max_retries = 3
+        start = time.time()
+        for attempt in range(max_retries):
+            if self.cancel_flag:
+                return {"status": "cancelled", "index": idx, "seed": seed}
+            limiter = self.soul_rate_limiter
+            if limiter and not limiter.acquire(should_cancel=lambda: self.cancel_flag):
+                return {"status": "cancelled", "index": idx, "seed": seed}
+            try:
+                self.log(f"{label} requesting...")
+                t = time.time()
+                sub = _soul_post(SOUL_ENDPOINT, body, self.soul_key)
+                status = (sub.get("status") or "").lower()
+                status_url = sub.get("status_url") or ""
+                rid = sub.get("request_id") or ""
+                # 끝난 상태가 아니면 끝날 때까지 물어본다.
+                deadline = time.time() + SOUL_POLL_TIMEOUT
+                while status in ("queued", "in_progress") and status_url:
+                    if self.cancel_flag:
+                        return {"status": "cancelled", "index": idx, "seed": seed}
+                    if not self.sleep_with_cancel(SOUL_POLL_INTERVAL):
+                        return {"status": "cancelled", "index": idx, "seed": seed}
+                    if time.time() > deadline:
+                        return {"status": "failed", "index": idx, "seed": seed,
+                                "error": "Soul timed out after %ds" % int(SOUL_POLL_TIMEOUT),
+                                "elapsed": time.time() - start}
+                    sub = _soul_get(status_url, self.soul_key)
+                    status = (sub.get("status") or "").lower()
+                if status == "nsfw":
+                    return {"status": "failed", "index": idx, "seed": seed,
+                            "error": "Soul refused the prompt (nsfw)", "elapsed": time.time() - start}
+                if status != "completed":
+                    err = sub.get("error") or status or "unknown"
+                    raise RuntimeError("Soul %s (%s)" % (status or "failed", str(err)[:120]))
+                imgs = sub.get("images") or []
+                url = (imgs[0] or {}).get("url") if imgs else ""
+                if not url:
+                    raise RuntimeError("Soul returned no image url")
+                req = urllib.request.Request(url, headers={"User-Agent": "NanoBanana"})
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    raw = r.read()
+                self.log(f"{label} OK ({time.time()-t:.1f}s, {rid[:8]})")
+                pil = _to_display_image(Image.open(io.BytesIO(raw)))
+                return {"status": "success", "index": idx, "seed": seed,
+                        "image": pil, "elapsed": time.time() - start,
+                        "api_used": "soul",
+                        "usage": _extract_usage("soul", None, pil)}
+            except Exception as e:
+                msg = str(e)[:160]
+                if attempt < max_retries - 1:
+                    self.log(f"{label} retry {attempt+1}: {msg}")
+                    if not self.sleep_with_cancel(5):
+                        return {"status": "cancelled", "index": idx, "seed": seed}
+                    continue
+                return {"status": "failed", "index": idx, "seed": seed,
+                        "error": msg, "elapsed": time.time() - start}
+
     def _generate_one_image_seedream(self, job, prompt, ref_payloads, model, img_cfg):
         idx = job["index"]
         total = job["total"]
@@ -2384,6 +2551,8 @@ class AppState:
             return self._generate_one_image_openai(job, prompt, ref_payloads, model, img_cfg)
         if model in SEEDREAM_MODEL_IDS:
             return self._generate_one_image_seedream(job, prompt, ref_payloads, model, img_cfg)
+        if model in SOUL_MODEL_IDS:
+            return self._generate_one_image_soul(job, prompt, ref_payloads, model, img_cfg)
         idx = job["index"]
         total = job["total"]
         seed = job["seed"]
@@ -2696,6 +2865,8 @@ class AppState:
                             "model": model, "aspect": aspect, "resolution": resolution,
                             "quality": job.get("quality", "high"),
                             "openai_bg_transparent": bool(job.get("openai_bg_transparent")),
+                            "soul_style_id": job.get("soul_style_id", ""),
+                            "soul_enhance_prompt": bool(job.get("soul_enhance_prompt")),
                             "custom_w": job.get("custom_w"), "custom_h": job.get("custom_h"),
                             "count": saved_count, "output_dir": job["output_dir"],
                             "naming": naming,
@@ -2803,8 +2974,9 @@ app.config["MAX_CONTENT_LENGTH"] = 300 * 1024 * 1024
 _SHARED_ATTRS = (
     "client_vertex", "client_studio", "client_openai", "client_seedream",
     "vertex_rate_limiter", "studio_rate_limiter", "openai_rate_limiter",
-    "seedream_rate_limiter",
+    "seedream_rate_limiter", "soul_rate_limiter",
     "vertex_status", "studio_status", "openai_status", "seedream_status",
+    "soul_key", "soul_status",
     "vertex_credentials_path", "vertex_session_disabled",
     "openai_detail",
     "logs", "log_lock", "progress_events", "progress_lock",
@@ -3092,7 +3264,7 @@ def _no_cache_static(resp):
 
 
 def _render_html(template_name):
-    html = render_template(template_name)
+    html = render_template(template_name, soul_enabled=SOUL_ENABLED)
     html = html.replace("__VERSION__", _read_version() + "." + _BUILD_ID)
     html = html.replace("__CSRF_TOKEN__", CSRF_TOKEN)
     resp = Response(html)
@@ -3278,6 +3450,7 @@ def api_status():
         "studio": state.studio_status,
         "openai": state.openai_status,
         "seedream": state.seedream_status,
+        "soul": state.soul_status,
         "is_generating": state.is_generating,
         # Whether ANY tab is busy — the auto-updater and the close flow must
         # look at this, not at the visible tab alone.
@@ -3306,6 +3479,8 @@ def get_settings():
         "custom_w": state.custom_w,
         "custom_h": state.custom_h,
         "openai_bg_transparent": state.openai_bg_transparent,
+        "soul_style_id": state.soul_style_id,
+        "soul_enhance_prompt": state.soul_enhance_prompt,
         "count": state.count,
         "output_dir": state.output_dir,
         "fixed_prompt": state.fixed_prompt,
@@ -3326,6 +3501,7 @@ def _settings_fingerprint(proj):
     return (
         proj.model, proj.aspect, proj.resolution, proj.quality,
         proj.custom_w, proj.custom_h, proj.openai_bg_transparent, proj.count,
+        proj.soul_style_id, proj.soul_enhance_prompt,
         proj.output_dir, proj.fixed_prompt, tuple(proj.prompt_sections or []),
         proj.naming_enabled, proj.naming_prefix, proj.naming_delimiter,
         proj.naming_index_prefix, proj.naming_padding, proj.gallery_columns,
@@ -3377,6 +3553,10 @@ def update_settings():
         state.naming_enabled = bool(d.get("naming_enabled"))
     if "openai_bg_transparent" in d:
         state.openai_bg_transparent = bool(d.get("openai_bg_transparent"))
+    if "soul_style_id" in d:
+        state.soul_style_id = str(d.get("soul_style_id") or "").strip()[:64]
+    if "soul_enhance_prompt" in d:
+        state.soul_enhance_prompt = bool(d.get("soul_enhance_prompt"))
     if "naming_padding" in d:
         state.naming_padding = _safe_int(d.get("naming_padding"), state.naming_padding, lo=1, hi=5)
     if "prompt_sections" in d:
@@ -4246,6 +4426,8 @@ def load_setup():
     state.custom_w = _safe_int(saved.get("custom_w"), state.custom_w, lo=16, hi=99999)
     state.custom_h = _safe_int(saved.get("custom_h"), state.custom_h, lo=16, hi=99999)
     state.openai_bg_transparent = bool(saved.get("openai_bg_transparent", False))
+    state.soul_style_id = str(saved.get("soul_style_id", "") or "")
+    state.soul_enhance_prompt = bool(saved.get("soul_enhance_prompt", False))
     state.count = int(saved.get("count", 1))
     state.output_dir = saved.get("output_dir", state.output_dir)
 
@@ -4330,7 +4512,8 @@ def _load_catalog_disk():
         with open(_catalog_cache_path(), "r", encoding="utf-8") as f:
             d = json.load(f)
         if isinstance(d, dict) and isinstance(d.get("teams"), list)                 and isinstance(d.get("projects"), list):
-            return {"teams": d["teams"], "projects": d["projects"]}, d.get("at") or ""
+            return {"teams": d["teams"], "projects": d["projects"],
+                    "aliases": d.get("aliases") or {}}, d.get("at") or ""
     except Exception:
         pass
     return None, ""
@@ -4373,7 +4556,8 @@ def billing_catalog():
                                 err, ("저장해 둔 " + saved_at) if saved_at else "직전"),
                             **stale})
         return jsonify({"ok": False, "error": err})
-    payload = {"teams": d.get("teams", []), "projects": d.get("projects", [])}
+    payload = {"teams": d.get("teams", []), "projects": d.get("projects", []),
+               "aliases": d.get("aliases") or {}}
     _catalog_cache["at"] = now
     _catalog_cache["data"] = payload
     _save_catalog_disk(payload)
@@ -4428,17 +4612,25 @@ def _billing_still_valid(team_id, project_id):
     if not data or now - _catalog_cache.get("at", 0) >= 300:
         d, err = _nbgw.fetch_catalog(_user_data_dir(), app_version=_read_version())
         if d:
-            data = {"teams": d.get("teams", []), "projects": d.get("projects", [])}
+            data = {"teams": d.get("teams", []), "projects": d.get("projects", []),
+                    "aliases": d.get("aliases") or {}}
             _catalog_cache["at"] = now
             _catalog_cache["data"] = data
     if not data:
-        return True, ""          # 확인할 방법이 없으면 막지 않는다
+        return True, "", project_id    # 확인할 방법이 없으면 막지 않는다
+    # 시트에서 프로젝트 ID(PJ-…)를 붙이며 옛 id 가 새 id 로 이관됐을 수 있다.
+    # 그건 "내려간" 게 아니라 같은 프로젝트의 이름표가 바뀐 것이므로 조용히 따라간다.
+    # 단, 목록에 그 id 가 그대로 있으면 그게 답이다 — 옛 번호를 새 프로젝트가 다시 쓴
+    # 경우라, 별칭(특히 디스크에 남은 지난 목록의 별칭)을 따르면 옛 프로젝트로 샌다.
+    ids = {x.get("id") for x in data.get("projects", [])}
+    canon = project_id if project_id in ids else (
+        (data.get("aliases") or {}).get(project_id) or project_id)
     gone = []
     if not any(t.get("id") == team_id for t in data.get("teams", [])):
         gone.append("팀")
-    if not any(x.get("id") == project_id for x in data.get("projects", [])):
+    if not any(x.get("id") == canon for x in data.get("projects", [])):
         gone.append("프로젝트")
-    return (not gone), "·".join(gone)
+    return (not gone), "·".join(gone), canon
 
 
 # --- Generation ---
@@ -4447,8 +4639,14 @@ def start_generate():
     model = state.model
     is_openai = model in OPENAI_MODEL_IDS
     is_seedream = model in SEEDREAM_MODEL_IDS
+    is_soul = model in SOUL_MODEL_IDS
 
-    if is_openai:
+    if is_soul:
+        if not SOUL_ENABLED:
+            return jsonify({"ok": False, "error": "Soul 2 is not available in this version"})
+        if not state.soul_key:
+            return jsonify({"ok": False, "error": "Higgsfield not connected — set HF_KEY"})
+    elif is_openai:
         if not state.client_openai:
             return jsonify({"ok": False, "error": "OpenAI not connected — set OPENAI_API_KEY"})
     elif is_seedream:
@@ -4465,7 +4663,13 @@ def start_generate():
                         "needs_billing": True})
     # 고른 뒤에 관리자가 그 건을 내렸을 수 있다. 이미 돌고 있는 배치는 건드리지
     # 않되(제출 시점에만 검사한다), 다음 생성부터는 다시 고르게 한다.
-    _ok, _gone = _billing_still_valid(state.billing_team_id, state.billing_project_id)
+    _ok, _gone, _canon = _billing_still_valid(state.billing_team_id, state.billing_project_id)
+    if _ok and _canon != state.billing_project_id:
+        # 이 탭은 이관 전 id 를 들고 있었다. 새 id 로 바꿔 둬야 이번 배치의 사용량과
+        # 다음 저장이 새 id 로 간다 (워커도 별칭을 거르지만 여기서 먼저 맞춘다).
+        state.log("billing: project id updated after sheet rename %s" % ascii(_canon))
+        state.billing_project_id = _canon
+        state.project_dirty = True
     if not _ok:
         state.billing_confirmed = False
         return jsonify({"ok": False, "needs_billing": True,
@@ -4517,7 +4721,17 @@ def start_generate():
         state.ref_image_to_bytes(r) if r is not None else None
         for r in ref_snapshots
     ]
-    if is_openai:
+    if is_soul:
+        # Soul 은 픽셀을 안 받고 등급(720p/1080p)과 비율만 받는다.
+        # 목록에 없는 값이 남아 있으면(모델 전환 잔재) 기본값으로 돌린다 —
+        # 그대로 보내면 400 으로 떨어진다.
+        img_cfg = {
+            "resolution": resolution if resolution in SOUL_RESOLUTIONS else "1080p",
+            "aspect_ratio": aspect if aspect in SOUL_ASPECTS else "16:9",
+            "enhance_prompt": bool(state.soul_enhance_prompt),
+            "style_id": state.soul_style_id or "",
+        }
+    elif is_openai:
         # H4: measure the first FILLED slot's real dimensions for Auto. PIL
         # .size is an O(1) header read (no pixel decode); guarded for 0-dim.
         anchor = next((r for r in ref_snapshots if r is not None), None)
@@ -4652,6 +4866,8 @@ def start_generate():
                 "custom_w": custom_w,
                 "custom_h": custom_h,
                 "openai_bg_transparent": bool(img_cfg.get("background") == "transparent"),
+                "soul_style_id": img_cfg.get("style_id") or "",
+                "soul_enhance_prompt": bool(img_cfg.get("enhance_prompt")),
                 "billing_team_id": state.billing_team_id,
                 "billing_project_id": state.billing_project_id,
                 "img_cfg": dict(img_cfg),

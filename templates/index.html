@@ -7,6 +7,7 @@
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
 <meta name="nb-csrf" content="__CSRF_TOKEN__">
+<meta name="nb-soul" content="{{ '1' if soul_enabled else '0' }}">
 <title>NanoBanana</title>
 <link rel="stylesheet" href="/static/style.css?v=__VERSION__">
 </head>
@@ -21,6 +22,7 @@
       <span id="studioDot" class="dot"></span><span class="status-label">Studio</span>
       <span id="openaiDot" class="dot"></span><span class="status-label">OpenAI</span>
       <span id="seedreamDot" class="dot"></span><span class="status-label">Seedream</span>
+      {% if soul_enabled %}<span id="soulDot" class="dot"></span><span class="status-label">Soul</span>{% endif %}
     </div>
     <button id="topGenBtn" class="btn-accent" onclick="generate()">Generate</button>
     <button id="alwaysOnTopBtn" class="pin-btn" onclick="toggleAlwaysOnTop()" title="Always on top">&#128204;</button>
@@ -148,6 +150,21 @@
           </select>
         </div>
       </div>
+
+      <!-- Higgsfield Soul 2 only (app.py SOUL_ENABLED 가 켜졌을 때만 그린다) -->
+      {% if soul_enabled %}
+      <div id="soulRow" style="display:none">
+        <label class="field-label">Soul Style ID</label>
+        <input type="text" id="soulStyleId" placeholder="스타일 UUID (비워두면 기본)"
+               oninput="onSoulStyleInput(this.value)">
+        <p class="hint">Higgsfield 앱에서 스타일을 고른 뒤 그 UUID를 붙여넣으세요. 목록을 받아오는 API는 없습니다.</p>
+        <label class="bg-check" title="켜면 서버가 프롬프트를 고쳐 씁니다">
+          <input type="checkbox" id="soulEnhanceChk" onchange="onSoulEnhanceChange(this.checked)">
+          프롬프트 자동 보정
+        </label>
+        <p class="hint">켜면 <b>서버가 프롬프트를 다시 씁니다.</b> Fixed Prompt를 정교하게 쓰셨다면 꺼두세요.</p>
+      </div>
+      {% endif %}
 
       <!-- GPT Image 2.5 only: ask the model for a cut-out (alpha PNG) -->
       <div id="bgTransparentRow" style="display:none">

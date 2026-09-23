@@ -406,7 +406,11 @@ async function handleAdmin(request, env, path) {
   if (path === "/admin/project" && request.method === "POST") {
     if (!setupOk(request, env)) return json(NEED_SETUP, 403);
     let b; try { b = await request.json(); } catch { return json({ ok: false, error: "bad request" }, 400); }
-    const id = slug(b.id || b.name);
+    // 손으로 추가할 때도 **시트 동기화와 같은 규칙**으로 id 를 만든다 — 건 번호.
+    // 예전엔 여기만 이름 슬러그를 써서, 같은 [26P53] 건이 손으로 넣은 것
+    // (26p53-어쩌고)과 시트에서 온 것(26p53) 두 줄로 갈라져 비용이 쪼개졌다.
+    // 이미 있는 행을 가리킬 때(보관·되살리기·삭제)는 받은 id 를 그대로 쓴다.
+    const id = b.id ? slug(b.id) : projectKey(b.name);
     if (!id) return json({ ok: false, error: "name required" }, 400);
     if (b.delete) return json(await dropCatalogRow(env, "projects", "project_id", id));
     // 팀은 선택이다. 한 건을 여러 팀이 같이 하는 게 정상이라, 프로젝트에 팀을

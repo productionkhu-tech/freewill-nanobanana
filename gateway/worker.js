@@ -410,9 +410,24 @@ async function handleAdmin(request, env, path) {
     // 예전엔 여기만 이름 슬러그를 써서, 같은 [26P53] 건이 손으로 넣은 것
     // (26p53-어쩌고)과 시트에서 온 것(26p53) 두 줄로 갈라져 비용이 쪼개졌다.
     // 이미 있는 행을 가리킬 때(보관·되살리기·삭제)는 받은 id 를 그대로 쓴다.
-    const id = b.id ? slug(b.id) : projectKey(b.name);
+    // PJ id 는 대문자라 slug 를 거치면 pj-… 라는 없는 행이 새로 생긴다.
+    const rawId = String(b.id || "").trim();
+    const id = rawId ? (PJ_RE.test(rawId) ? rawId : slug(rawId)) : projectKey(b.name);
     if (!id) return json({ ok: false, error: "name required" }, 400);
     if (b.delete) return json(await dropCatalogRow(env, "projects", "project_id", id));
+    if (!rawId) {
+      // 이 번호는 이미 시트의 PJ id 로 옮겨졌다. 여기서 새로 만들면 목록엔 두 줄이
+      // 보이는데 사용량은 별칭을 따라 PJ 쪽으로만 들어가, 이 줄은 영원히 0 이 된다.
+      let a = null;
+      try {
+        a = await env.USAGE_DB.prepare(
+          "SELECT project_id FROM project_aliases WHERE alias=?").bind(id).first();
+      } catch {}
+      if (a) {
+        return json({ ok: false, error: "이 번호는 이미 시트의 " + a.project_id +
+                      " 프로젝트로 옮겨졌습니다. 시트에서 관리해 주세요." }, 409);
+      }
+    }
     // 팀은 선택이다. 한 건을 여러 팀이 같이 하는 게 정상이라, 프로젝트에 팀을
     // 하나 박으면 실제로 작업한 팀이 아닌 쪽으로 비용이 잡힌다.
     const teamId = b.team_id ? slug(b.team_id) : null;
@@ -514,6 +529,10 @@ function projectKey(name) {
   return m ? m[1].toLowerCase() : slug(name);
 }
 
+// 시트 H열의 프로젝트 ID. 이게 있으면 위의 건 번호보다 우선한다 (syncSheets 참고).
+// 대문자라 slug() 를 거치면 다른 id 가 되므로, 이미 있는 행을 가리킬 때도 그대로 쓴다.
+const PJ_RE = /^PJ-[A-Z0-9]{4,20}$/;
+
 // ----------------------------------------------------------- Google Sheets
 // 팀과 프로젝트 목록의 원본은 사용자가 매일 쓰는 구글 시트다. 관리자 페이지에서
 // 또 한 벌 관리하게 두면 둘이 어긋나고, 어긋나면 비용이 엉뚱한 데 붙는다.
@@ -584,7 +603,7 @@ async function syncSheets(env, force) {
   const sid = env.GS_SHEET_ID;
   if (!sid) throw new Error("GS_SHEET_ID not set");
   const url = "https://sheets.googleapis.com/v4/spreadsheets/" + sid +
-    "/values:batchGet?ranges=" + encodeURIComponent("Project_Status!A2:C500") +
+    "/values:batchGet?ranges=" + encodeURIComponent("Project_Status!A2:I500") +
     "&ranges=" + encodeURIComponent("config_teams!A2:A200");
   const r = await fetch(url, { headers: { Authorization: "Bearer " + token } });
   const d = await r.json();
@@ -609,57 +628,155 @@ async function syncSheets(env, force) {
              changed_at: prev.changed_at || null };
   }
 
-  const writes = [];
-
   // 팀: 이름 한 칸이 전부다. 시트에 있으면 살아 있는 것.
   const teamIds = [];
-  const teamStmt = env.USAGE_DB.prepare(
-    `INSERT INTO teams (id, name, active, created_at, source) VALUES (?,?,1,?,'sheet')
-     ON CONFLICT(id) DO UPDATE SET name=excluded.name, active=1, source='sheet'`);
+  const teamRowsOut = [];             // [id, name]
   for (const row of teamRows) {
     const name = String((row[0] || "")).trim();
     if (!name) continue;
     const id = slug(name);
     if (!id || teamIds.includes(id)) continue;
     teamIds.push(id);
-    writes.push(teamStmt.bind(id, name.slice(0, 64), now));
+    teamRowsOut.push([id, name.slice(0, 64)]);
   }
 
-  // 프로젝트: B=이름, C=진행현황. '진행' 만 앱 목록에 보인다.
+  /*
+   * 프로젝트 id 는 **시트의 프로젝트 ID(H열, PJ-…)** 가 있으면 그걸 쓴다.
+   *
+   * 이름에서 id 를 뽑는 방식은 이름이 바뀌면 갈라진다. 건 번호가 있으면 버티지만
+   * "26TF04 AFX_UNT TEST" 처럼 대괄호가 없거나 "TA Test" 처럼 번호가 아예 없으면
+   * 이름 한 글자에 id 가 흔들렸다. 시트가 고정 키를 주기 시작했으니 그걸 따른다.
+   *
+   * 넘어가는 순간이 중요하다. 예전 id(26p50, 26tf04-afx-unt-test …)로 쌓인 기록을
+   * PJ id 로 **옮겨야** 한 프로젝트가 두 줄로 갈라지지 않는다. 옛 id 후보는
+   * 지금 이름과 I열 이전 이름들("|" 로 여러 개)에서 뽑는다. 한 옛 id 를 두 행이
+   * 동시에 주장하면(이름이 엇갈린 경우) **옮기지 않는다** — 섞이는 것보다 그대로
+   * 두는 게 낫고, 결과에 충돌로 남겨 사람이 보게 한다.
+   * 옮긴 옛 id 는 별칭으로 남긴다. 아직 옛 id 를 들고 있는 앱이 보내는 사용량도
+   * 이 별칭을 거쳐 새 id 로 들어온다.
+   */
+  // 옛 id 로 볼 수 있는 것: 프로젝트 행이 있거나 사용 기록이 남아 있는 id.
+  const known = new Set(((await env.USAGE_DB.prepare(
+    "SELECT id FROM projects UNION SELECT project_id FROM usage_events").all()).results || [])
+    .map((x) => x.id));
+  // 한 번 옮긴 번호는 계속 PJ id 를 가리킨다. H열이 실수로 비어도 그 건이
+  // 옛 id 로 되돌아가 두 줄로 갈라지면 안 된다.
+  const aliasOf = {};
+  try {
+    for (const a of ((await env.USAGE_DB.prepare(
+        "SELECT alias, project_id FROM project_aliases").all()).results || [])) {
+      aliasOf[a.alias] = a.project_id;
+    }
+  } catch {}
+
+  // PJ 가 있는 행을 먼저 본다 — 같은 id 로 겹치면 시트가 고정 키를 준 행이 이긴다.
+  const hasPjRow = (row) => PJ_RE.test(String(row[7] || "").trim());
+  const ordered = [...projRows].sort((a, b) => hasPjRow(b) - hasPjRow(a));
+
   const projIds = [];
   let live = 0;
-  const projStmt = env.USAGE_DB.prepare(
-    `INSERT INTO projects (id, name, team_id, active, created_at, source)
-     VALUES (?,?,NULL,?,?,'sheet')
-     ON CONFLICT(id) DO UPDATE SET name=excluded.name, active=excluded.active, source='sheet'`);
-  for (const row of projRows) {
+  const projRowsOut = [];             // [id, name, active]
+  const claims = new Map();           // 옛 id -> Set(PJ id)
+  for (const row of ordered) {
     const name = String((row[1] || "")).trim();
     if (!name) continue;
-    const id = projectKey(name);
+    const pj = String((row[7] || "")).trim();
+    const hasPj = PJ_RE.test(pj);
+    const id = hasPj ? pj : (aliasOf[projectKey(name)] || projectKey(name));
     if (!id || projIds.includes(id)) continue;
     const active = String(row[2] || "").trim() === "진행" ? 1 : 0;
     if (active) live++;
     projIds.push(id);
-    writes.push(projStmt.bind(id, name.slice(0, 64), active, now));
+    projRowsOut.push([id, name.slice(0, 64), active]);
+    if (!hasPj) continue;
+    const prevNames = String(row[8] || "").split("|").map((x) => x.trim()).filter(Boolean);
+    for (const n of [name, ...prevNames]) {
+      for (const k of [projectKey(n), slug(n)]) {
+        if (!k || k === id || !known.has(k)) continue;
+        if (!claims.has(k)) claims.set(k, new Set());
+        claims.get(k).add(id);
+      }
+    }
   }
   if (!teamIds.length && !projIds.length) throw new Error("sheet looked empty - refusing to sync");
 
+  const moves = [];                   // [옛 id, PJ id]
+  const conflicts = [];
+  for (const [legacy, owners] of claims) {
+    if (owners.size > 1) { conflicts.push(legacy); continue; }
+    // 옛 id 가 그대로 시트의 다른 행(아직 PJ 가 없는 행)의 id 이기도 하면
+    // 그건 살아 있는 별개 프로젝트다 — 가져오면 섞인다.
+    if (projIds.includes(legacy)) { conflicts.push(legacy); continue; }
+    moves.push([legacy, [...owners][0]]);
+  }
+
+  /*
+   * 쓰기는 시트가 몇 줄이든 문장 7개 이하로 끝낸다.
+   *
+   * 무료 요금제는 워커 호출 한 번에 D1 쿼리가 50개까지인데, 배치 안의 문장을
+   * 하나씩 세는지는 문서가 분명하지 않다. 행마다 문장을 만들던 예전 방식은
+   * 팀 20 + 프로젝트 25 로 이미 50 가까이 와 있었고, 이관까지 얹으면 넘는다.
+   * 그래서 행 목록을 JSON 한 덩어리로 넘기고 json_each 로 펼친다. NOT IN (?,?,…)
+   * 으로 id 를 늘어놓던 것도 바인딩 100개 한도에 걸릴 수 있어 같이 바꿨다.
+   * (INSERT … SELECT 에 ON CONFLICT 를 붙일 땐 SQLite 문법상 WHERE 가 있어야 한다.)
+   * 배치는 한 트랜잭션이라 중간에 하나라도 실패하면 이관까지 전부 되돌아간다.
+   */
+  const J = JSON.stringify;
+  const writes = [];
+  if (teamRowsOut.length) {
+    writes.push(env.USAGE_DB.prepare(
+      `INSERT INTO teams (id, name, active, created_at, source)
+         SELECT json_extract(value,'$[0]'), json_extract(value,'$[1]'), 1, ?, 'sheet'
+           FROM json_each(?) WHERE true
+       ON CONFLICT(id) DO UPDATE SET name=excluded.name, active=1, source='sheet'`)
+      .bind(now, J(teamRowsOut)));
+  }
+  if (moves.length) {
+    // 별칭 기록 -> 사용 기록 이관 -> 옛 행 삭제. PJ 행은 바로 아래에서 만든다.
+    writes.push(env.USAGE_DB.prepare(
+      `INSERT INTO project_aliases (alias, project_id, created_at)
+         SELECT json_extract(value,'$[0]'), json_extract(value,'$[1]'), ?
+           FROM json_each(?) WHERE true
+       ON CONFLICT(alias) DO UPDATE SET project_id=excluded.project_id`)
+      .bind(now, J(moves)));
+    writes.push(env.USAGE_DB.prepare(
+      `UPDATE usage_events
+          SET project_id = (SELECT json_extract(m.value,'$[1]') FROM json_each(?) AS m
+                             WHERE json_extract(m.value,'$[0]') = usage_events.project_id)
+        WHERE project_id IN (SELECT json_extract(value,'$[0]') FROM json_each(?))`)
+      .bind(J(moves), J(moves)));
+    writes.push(env.USAGE_DB.prepare(
+      "DELETE FROM projects WHERE id IN (SELECT json_extract(value,'$[0]') FROM json_each(?))")
+      .bind(J(moves)));
+  }
+  if (projRowsOut.length) {
+    writes.push(env.USAGE_DB.prepare(
+      `INSERT INTO projects (id, name, team_id, active, created_at, source)
+         SELECT json_extract(value,'$[0]'), json_extract(value,'$[1]'), NULL,
+                json_extract(value,'$[2]'), ?, 'sheet'
+           FROM json_each(?) WHERE true
+       ON CONFLICT(id) DO UPDATE SET name=excluded.name, active=excluded.active, source='sheet'`)
+      .bind(now, J(projRowsOut)));
+  }
+
   // 시트에서 통째로 사라진 건은 보관으로 내린다 (삭제가 아니다).
-  const ph = (n) => new Array(n).fill("?").join(",");
   if (teamIds.length) {
     writes.push(env.USAGE_DB.prepare(
-      `UPDATE teams SET active=0 WHERE source='sheet' AND id NOT IN (${ph(teamIds.length)})`)
-      .bind(...teamIds));
+      "UPDATE teams SET active=0 WHERE source='sheet' AND id NOT IN (SELECT value FROM json_each(?))")
+      .bind(J(teamIds)));
   }
   if (projIds.length) {
     writes.push(env.USAGE_DB.prepare(
-      `UPDATE projects SET active=0 WHERE source='sheet' AND id NOT IN (${ph(projIds.length)})`)
-      .bind(...projIds));
+      "UPDATE projects SET active=0 WHERE source='sheet' AND id NOT IN (SELECT value FROM json_each(?))")
+      .bind(J(projIds)));
   }
   await env.USAGE_DB.batch(writes);
 
+  const moved = moves.map(([a, b]) => a + "->" + b);
   const detail = "팀 " + teamIds.length + " · 프로젝트 " + live + " 진행 / " +
-                 (projIds.length - live) + " 보관";
+                 (projIds.length - live) + " 보관" +
+                 (moves.length ? " · " + moves.length + "건 ID 로 이관" : "") +
+                 (conflicts.length ? " · 충돌 " + conflicts.length + "건(" + conflicts.join(",") + ")" : "");
   await env.USAGE_DB.prepare(
     `INSERT INTO sync_state (id, at, ok, detail, hash, changed_at)
      VALUES ('sheet',?,1,?,?,?)
@@ -667,7 +784,7 @@ async function syncSheets(env, force) {
                                    hash=excluded.hash, changed_at=excluded.changed_at`)
     .bind(now, detail, stamp, now).run();
   return { ok: true, at: now, changed_at: now, teams: teamIds.length,
-           projects: projIds.length, live, detail };
+           projects: projIds.length, live, detail, moved, conflicts };
 }
 
 async function syncSheetsSafe(env, force) {
@@ -1437,6 +1554,12 @@ async function dropCatalogRow(env, table, col, id) {
              error: "사용 기록이 " + used.n + "건 있어 지울 수 없습니다. 보관으로 내려두세요." };
   }
   await env.USAGE_DB.prepare(`DELETE FROM ${table} WHERE id = ?`).bind(id).run();
+  if (table === "projects") {
+    // 지운 프로젝트를 가리키는 별칭이 남으면 옛 id 로 오는 사용량이 없는 id 에 붙는다.
+    try {
+      await env.USAGE_DB.prepare("DELETE FROM project_aliases WHERE project_id = ?").bind(id).run();
+    } catch {}
+  }
   return { ok: true, deleted: id };
 }
 
@@ -1474,10 +1597,21 @@ async function handleCatalog(env, includeArchived) {
     "SELECT id, name, active, source FROM teams" + w).all();
   const projects = await env.USAGE_DB.prepare(
     "SELECT id, name, team_id, active, source FROM projects" + w).all();
+  // 앱이 탭에 저장해 둔 옛 id 를 새 id 로 바꿔 읽을 수 있게 별칭표를 같이 준다.
+  // 이게 없으면 이관 직후 그 탭은 "목록에서 내려갔습니다" 로 막힌다 — 사실은
+  // 이름표만 바뀐 같은 프로젝트인데.
+  let aliases = {};
+  try {
+    for (const a of ((await env.USAGE_DB.prepare(
+        "SELECT alias, project_id FROM project_aliases").all()).results || [])) {
+      aliases[a.alias] = a.project_id;
+    }
+  } catch {}
   return {
     ok: true,
     teams: (teams.results || []).sort(byName),
     projects: (projects.results || []).sort(byName),
+    aliases,
   };
 }
 
@@ -1505,7 +1639,17 @@ async function handleUsage(request, env, rec) {
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   const created = nowIso();
   const batch = [];
+  // 옛 프로젝트 id -> 시트 PJ id. 앱의 탭이나 아직 못 보낸 spool 은 이관 전 id 를
+  // 들고 있을 수 있다. 그대로 받으면 이관한 프로젝트가 다시 두 줄로 갈라진다.
+  const alias = {};
+  try {
+    for (const a of ((await env.USAGE_DB.prepare(
+        "SELECT alias, project_id FROM project_aliases").all()).results || [])) {
+      alias[a.alias] = a.project_id;
+    }
+  } catch {}
   for (const e of events) {
+    if (e && e.project_id && alias[e.project_id]) e.project_id = alias[e.project_id];
     const ts = String(e.ts || created).slice(0, 19);
     if (!e.id || !e.team_id || !e.project_id || !e.model) continue;
     batch.push(stmt.bind(

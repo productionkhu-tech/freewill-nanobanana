@@ -931,12 +931,6 @@ async function loadSettings() {
   const _bgc = document.getElementById("bgTransparentChk");
   if (_bgc) _bgc.checked = !!d.openai_bg_transparent;
   _syncBgHint();
-  // Soul 값도 프로젝트와 함께 다닌다 — 탭을 오가거나 프로젝트를 다시 열었을 때
-  // 스타일이 조용히 비면 같은 프롬프트로 다른 그림이 나온다.
-  const _sid = document.getElementById("soulStyleId");
-  if (_sid) _sid.value = d.soul_style_id || "";
-  const _sen = document.getElementById("soulEnhanceChk");
-  if (_sen) _sen.checked = !!d.soul_enhance_prompt;
   // H7: applyModelSpec() above already populated AND selected each dropdown
   // (loaded value, else this model's default). Raw-setting .value here would
   // bypass that fallback and blank out any value the model no longer offers
@@ -1128,19 +1122,6 @@ const MODEL_SPECS = {
     hint: "GPT Image 2.5 Heavy — editing precision. Starts at max quality.",
     refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
   },
-  // Higgsfield Soul 2 — 다른 셋과 다른 점이 많아 스펙에도 그대로 드러난다.
-  // 720p/1080p 뿐이고 레퍼런스를 못 넣으며, 장수는 1 또는 4 만 받는다.
-  "higgsfield-soul-v2": {
-    aspects: ["1:1","4:3","3:4","16:9","9:16","3:2","2:3"],
-    resolutions: ["720p","1080p"],
-    counts: ["1","4"],
-    showQuality: false,
-    showSoul: true,
-    noRefs: true,
-    defaultAspect: "16:9", defaultResolution: "1080p",
-    hint: "Higgsfield Soul 2 — 1080p까지. 레퍼런스 이미지는 쓰지 않습니다.",
-    refHint: "이 모델은 레퍼런스를 받지 않습니다. 슬롯은 그대로 두고 무시됩니다.",
-  },
 };
 // (Reve 2.1 removed 2026-09-01 — Reve shut down its API service. Old projects
 // that still say reve-create are remapped server-side to the default model;
@@ -1158,11 +1139,6 @@ const MODEL_SPECS = {
 // settings modal automatically: visible, starting on its highest quality.
 // A second hand-kept list here would be exactly the place a new model gets
 // forgotten.
-// Soul 2 는 실호출 검증 전까지 숨긴다. 스위치는 서버 한 곳(app.py SOUL_ENABLED)이고,
-// 화면은 페이지에 실린 값만 따른다 — 여기서 빼면 드롭다운·모델 설정 창에서 같이 빠진다.
-if ((document.querySelector('meta[name="nb-soul"]') || {}).content !== "1") {
-  delete MODEL_SPECS["higgsfield-soul-v2"];
-}
 const MODEL_ORDER = Object.keys(MODEL_SPECS);
 const MODEL_LABELS = {
   "seedream-5-0-pro-260628": "seedream-5-0-pro",
@@ -1170,7 +1146,6 @@ const MODEL_LABELS = {
   "gpt-image-2": "gpt-image-2 (OpenAI)",
   "gpt-image-2.5-flare": "gpt-image-2.5 Flare (Fast)",
   "gpt-image-2.5-sunburst": "gpt-image-2.5 Sunburst (Heavy)",
-  "higgsfield-soul-v2": "Soul 2 (Higgsfield)",
 };
 let _modelPrefs = { hidden: [], default_res: {} };
 
@@ -1253,7 +1228,6 @@ const _MODEL_SHORT = {
   "gpt-image-2.5-sunburst": "GPT Image 2.5 Sunburst",
   "seedream-5-0-pro-260628": "Seedream 5 Pro",
   "seedream-4-5-251128": "Seedream 4.5",
-  "higgsfield-soul-v2": "Soul 2",
   "reve-create": "Reve 2.1",
 };
 function _shortModel(m) {
@@ -1310,16 +1284,6 @@ function _syncBgHint() {
   hint.style.display = (rowVisible && chk.checked) ? "" : "none";
 }
 
-function onSoulStyleInput(v) {
-  clearTimeout(onSoulStyleInput._t);
-  onSoulStyleInput._t = setTimeout(() => {
-    api("/api/settings", { method: "POST", body: { soul_style_id: v } });
-  }, 400);
-}
-function onSoulEnhanceChange(on) {
-  api("/api/settings", { method: "POST", body: { soul_enhance_prompt: !!on } });
-}
-
 function applyModelSpec(model, preserved) {
   const spec = getModelSpec(model);
   // H8: migrate the wrong "0.5K" token (shipped v1201/02) back to "512px".
@@ -1352,13 +1316,6 @@ function applyModelSpec(model, preserved) {
       api("/api/settings", { method: "POST", body: { openai_bg_transparent: false } });
     }
   }
-  // Soul 전용 칸. 다른 모델로 갔을 때 숫값이 살아있어도 서버가 무시하므로
-  // (img_cfg 를 모델별로 다시 짓는다) 값을 지우진 않는다 — 돌아오면 그대로 있어야 한다.
-  const soulRow = document.getElementById("soulRow");
-  if (soulRow) soulRow.style.display = spec.showSoul ? "" : "none";
-  // 레퍼런스를 안 받는 모델이면 그 사실을 ref 안내에 명시한다.
-  const refArea = document.getElementById("refArea");
-  if (refArea) refArea.classList.toggle("refs-ignored", Boolean(spec.noRefs));
   _syncBgHint();
   const hintEl = document.getElementById("modelHint");
   if (hintEl) hintEl.textContent = spec.hint;
@@ -4211,8 +4168,6 @@ async function refreshApiStatus() {
   }
   const seedreamDot = document.getElementById("seedreamDot");
   if (seedreamDot) seedreamDot.className = "dot " + (d.seedream || "disconnected");
-  const soulDot = document.getElementById("soulDot");
-  if (soulDot) soulDot.className = "dot " + (d.soul || "disconnected");
   _anyGenerating = !!d.any_generating;
   // Status is always the ACTIVE project's, so the placeholder count follows the
   // tab on screen: a background batch never steals or clears them.

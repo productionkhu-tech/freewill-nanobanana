@@ -1591,9 +1591,6 @@ footer {
 /* 이 앱엔 공용 .hidden 규칙이 없다(요소마다 따로 둔다). 이게 빠져 있어서
    "목록 다시 불러오기" 가 목록을 잘 받았을 때도 늘 떠 있었다. */
 #billingRetry.hidden { display: none; }
-/* 레퍼런스를 안 받는 모델을 고르면 슬롯을 흐리게 — 지우지는 않는다.
-   다른 모델로 돌아가면 그대로 써야 하므로 보이기만 죽인다. */
-.ref-area.refs-ignored { opacity: .45; }
 .bill-recall { display: flex; align-items: center; gap: 8px; margin: 10px 0 0;
                padding: 8px 10px; background: var(--input-bg);
                border: 1px solid var(--border); border-radius: 8px; font-size: 12px; }

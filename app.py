@@ -62,6 +62,11 @@ GPT25_QUALITIES = ["low", "medium", "high", "xhigh", "max", "auto"]
 # The API only honours it on png/webp output, so the format is pinned to png
 # alongside it rather than left to the default.
 GPT25_BACKGROUNDS = ("auto", "transparent", "opaque")
+# 검열 강도. 기본값(auto)은 호러 특수분장·피 묻은 크리처 같은 창작 이미지도 자주 막는다
+# (좀비 캐릭터 시트가 OpenAI 판정에서 고어 0.71 로 걸린 게 계기). low 는 정책 안에서 덜 엄격하게
+# 거를 뿐, 정책 위반은 여전히 막힌다. 편집(레퍼런스 있음)은 SDK 에 인자가 없어 extra_body 로
+# 보낸다 — 문서엔 없지만 API 는 받는다. 2026-09-28 에 세 모델 × 생성/편집 6 조합을 실제로 확인했다.
+OPENAI_MODERATION = "low"
 
 
 def openai_qualities(model):
@@ -2240,6 +2245,7 @@ class AppState:
                         size=size,
                         quality=quality,
                         n=1,
+                        extra_body={"moderation": OPENAI_MODERATION},
                         **extra,
                     )
                 else:
@@ -2249,6 +2255,7 @@ class AppState:
                         size=size,
                         quality=quality,
                         n=1,
+                        moderation=OPENAI_MODERATION,
                         **extra,
                     )
                 self.log(f"{label} OK ({time.time()-t:.1f}s)")

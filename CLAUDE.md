@@ -268,6 +268,9 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   **조직 인증 필수** — 미인증이면 403 `organization must be verified`
   (https://platform.openai.com/settings/organization/general → Verify Organization, 반영까지 최대 15분).
   xhigh/max는 이미지당 토큰이 늘어 비용이 커진다(단가는 gpt-image-2와 동일) → 기본값은 `high` 유지
+- **GPT 이미지 검열은 `moderation=low`** (`OPENAI_MODERATION`, v2026-09-2801~). 기본값 auto 는 호러 특수분장
+  같은 창작물도 자주 막는다. 편집(레퍼런스)은 SDK 에 인자가 없어 `extra_body={"moderation": ...}` 로 보낸다 —
+  문서엔 없지만 API 는 받는다(세 모델 × 생성/편집 실측). low 도 정책 위반은 막는다
 - Reve는 2026-09 API 서비스 종료로 v2026-09-0101에서 완전 제거. `_RETIRED_MODEL_FALLBACK`이
   저장물의 reve-create를 기본 모델로 폴백 (개명 맵 `_MODEL_RENAMES`와 다름 — prefs 키는 건드리지 않음).
   과거 Reve 생성물의 갤러리 배지/라벨은 그대로 표시

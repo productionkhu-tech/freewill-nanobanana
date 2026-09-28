@@ -241,3 +241,5 @@ Start-Process ".\dist\NanoBanana\NanoBanana.exe"
 | Program Files 설치 사용자 | 자동 업데이트 불가 (UAC) — 일반 폴더로 이동 안내 |
 | `git push origin` 이 자격 증명 창에서 무한 대기 | `git push "https://x-access-token:${GH_TOKEN}@github.com/productionkhu-tech/freewill-nanobanana.git" main <tag>` (출력은 `sed "s#${GH_TOKEN}#***#g"` 로 토큰 가림) |
 | 날짜를 넘겨 공개 | 버전은 **공개하는 날** 기준. 빌드 후 자정을 넘기면 VERSION 을 새 날짜 01 로 고쳐 다시 빌드 (2026-09-24: 2302 → 2401) |
+| 공개 직후 E2E 가 "업데이트 안 함" 으로 FAIL | 앱의 비인증 `/releases/latest` 응답이 `Cache-Control: max-age=60` — 공개 후 60초 안에 켜진 구버전은 아직 자기가 최신인 줄 안다. **공개 후 1분 넘게 기다렸다 E2E** (2026-09-28 2401→2801 첫 시도 FAIL, 몇 분 뒤 9초 PASS). 교체 로그에 `--updater start` 가 없으면 이 경우다 |
+| 스크래치 테스트가 사라짐 | Windows 저장 공간 센스가 임시 폴더를 정리한다(세션 scratchpad 포함). 오래 둘 테스트는 임시 폴더 밖에 둘 것 |

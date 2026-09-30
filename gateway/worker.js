@@ -191,11 +191,25 @@ async function handleKey(request, env, ctx) {
   // The client sends its app_version alongside the fetch; recording it turns
   // the admin list into a live "which build is each machine on" roster —
   // exactly what a staged rollout needs to see who is lagging.
-  let ver = "";
+  let ver = "", host = "";
   try {
     const b = await request.json();
     ver = String(b.app_version || "").slice(0, 32);
+    host = String(b.machine || "").trim().slice(0, 64);
   } catch {}
+
+  // 지금 컴퓨터 이름. 앱은 켤 때마다 이 요청에 platform.node() 를 실어 보낸다.
+  // 토큰에 박힌 이름은 처음 등록할 때 것이라, PC 이름을 바꿔도 관리자 페이지엔
+  // 옛 이름만 남았다. 여기 적어 두면 리포트가 "새 이름 (처음 이름)" 으로 보여준다.
+  // 표시용일 뿐이다 — 비용 귀속과 무관하고, 토큰이 증명한 그 PC 의 이름만 바뀐다.
+  // 이름이 그대로면 쓰지 않는다(켤 때마다 쓰기가 생기지 않게).
+  if (host) {
+    ctx.waitUntil(env.USAGE_DB.prepare(
+      `INSERT INTO pc_names (token_id, name, updated_at) VALUES (?,?,?)
+       ON CONFLICT(token_id) DO UPDATE SET name=excluded.name, updated_at=excluded.updated_at
+        WHERE pc_names.name <> excluded.name`)
+      .bind(tokenId, host, nowIso()).run().catch(() => {}));
+  }
 
   // Who collected it and when — the only trail there is once a key is out.
   // Through waitUntil: a promise left running loose is killed the moment the
@@ -1710,7 +1724,11 @@ async function handleUsage(request, env, rec) {
 /** 단가표를 붙여 금액까지 계산한 집계. group_by 는 화이트리스트로만 받는다. */
 const GROUPS = {
   team: "e.team_id", project: "e.project_id", user: "e.user",
-  model: "e.model", day: "e.day", machine: "e.machine",
+  model: "e.model", day: "e.day",
+  // PC 는 이름이 아니라 토큰(= 등록된 PC 하나)으로 묶는다. 이름으로 묶으면 PC 이름을
+  // 바꿨을 때 한 대가 두 줄로 갈라지고, 이름이 같은 두 대는 한 줄로 합쳐진다.
+  // 이름표는 handleAdminUsage 가 붙인다 ("지금 이름 (처음 이름)").
+  machine: "e.token_id",
 };
 
 /**
@@ -1790,7 +1808,8 @@ async function handleAdminUsage(url, env) {
            SUM(${COST_USD})    AS cost_usd,
            SUM(${COST_USD} * ${KRW_RATE}) AS cost_krw,
            SUM(CASE WHEN p.model IS NULL OR p.verified=0 THEN e.images ELSE 0 END) AS unpriced,
-           MIN(e.day) AS first_day, MAX(e.day) AS last_day
+           MIN(e.day) AS first_day, MAX(e.day) AS last_day,
+           MAX(e.machine) AS first_name
     FROM usage_events e
     ${PRICE_JOIN}
     ${FX_JOIN}
@@ -1824,6 +1843,22 @@ async function handleAdminUsage(url, env) {
     const t = await env.USAGE_DB.prepare(
       `SELECT id, name, active FROM ${key === "team" ? "teams" : "projects"}`).all();
     for (const x of (t.results || [])) { names[x.id] = x.name; archived[x.id] = !x.active; }
+  }
+  if (key === "machine") {
+    // 처음 이름 = 등록할 때 찍혀 행마다 남은 이름. 지금 이름 = 앱이 켤 때 /key 로 알려 준 이름.
+    const now = {};
+    try {
+      for (const x of ((await env.USAGE_DB.prepare(
+          "SELECT token_id AS k, name FROM pc_names").all()).results || [])) now[x.k] = x.name;
+    } catch {}
+    for (const x of rows) {
+      const first = x.first_name || "", cur = now[x.k] || "";
+      names[x.k] = cur && first && cur !== first ? cur + " (" + first + ")" : (cur || first || String(x.k || "?"));
+    }
+    // 이름이 같은 PC 가 둘이면 끝에 토큰 앞 네 자리를 붙여 구분한다.
+    const seen = {};
+    for (const x of rows) seen[names[x.k]] = (seen[names[x.k]] || 0) + 1;
+    for (const x of rows) if (seen[names[x.k]] > 1) names[x.k] += " #" + String(x.k || "").slice(0, 4);
   }
   const fx = await latestFx(env);
   return {

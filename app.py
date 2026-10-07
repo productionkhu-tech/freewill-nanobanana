@@ -186,9 +186,14 @@ def gpt2_resolve_size(aspect, resolution, ref_size=None):
 _GEMINI_ASPECTS_BASE = {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4",
                         "9:16", "16:9", "21:9"}
 _GEMINI_ASPECTS_31 = _GEMINI_ASPECTS_BASE | {"1:4", "4:1", "1:8", "8:1"}
+# 이름에 "3.1" 이 없어도 확장 비율을 받는 모델. Nano Banana 2.1 은 ID 규칙이 바뀌어
+# (gemini-nano-banana-2.1) 아래 "3.1" 검사에 안 걸린다 — 2026-10-09 1:8 실제 생성으로 확인.
+_GEMINI_EXT_ASPECT_MODELS = {"gemini-nano-banana-2.1"}
 
 def _gemini_aspect_ok(model, aspect):
-    valid = _GEMINI_ASPECTS_31 if "3.1" in (model or "") else _GEMINI_ASPECTS_BASE
+    m = model or ""
+    ext = "3.1" in m or _normalize_model_name(m) in _GEMINI_EXT_ASPECT_MODELS
+    valid = _GEMINI_ASPECTS_31 if ext else _GEMINI_ASPECTS_BASE
     return aspect in valid
 
 
@@ -201,6 +206,7 @@ _GEMINI_IMAGE_SIZES = {
     "gemini-3-pro-image": {"1K", "2K", "4K"},
     "gemini-3.1-flash-image": {"512px", "1K", "2K", "4K"},
     "gemini-3.1-flash-lite-image": {"1K"},
+    "gemini-nano-banana-2.1": {"1K", "2K", "4K"},
 }
 
 
@@ -323,16 +329,33 @@ def _seedream_prompt(prompt):
                    lambda m: "image %s" % m.group(1), prompt or "", flags=_re.IGNORECASE)
 
 
-def _extract_usage(provider, result_obj, pil=None):
-    """프로바이더 응답에서 과금 근거를 뽑는다. 모양이 셋 다 달라 한 군데 모았다.
+def _modality_tokens(details, name):
+    """usage 의 *_tokens_details 목록에서 한 모달리티(IMAGE/TEXT)의 토큰 합.
+    모달리티는 SDK 에 따라 문자열이거나 enum 이라 끝 이름으로 맞춘다."""
+    n = 0
+    for d in details or []:
+        mod = getattr(d, "modality", None)
+        mod = str(getattr(mod, "value", mod) or "").upper()
+        if mod.endswith(name):
+            n += int(getattr(d, "token_count", 0) or 0)
+    return n
 
-    OpenAI  : usage.input_tokens / output_tokens (+ details 로 text/image 분리)
-    Seedream: usage.generated_images (장수 과금) + output_tokens
-    Gemini  : usage_metadata.prompt_token_count / candidates_token_count
-    어느 쪽이든 없으면 0 으로 둔다 — 비용 추정이 틀리는 건 고칠 수 있지만,
+
+def _extract_usage(provider, result_obj, pil=None):
+    """프로바이더가 '청구 근거'로 돌려준 사용량을 그대로 옮긴다 (2026-10-07 실측 기준).
+
+    Gemini  : 입력은 prompt_tokens_details 로 텍스트/이미지를 나누고, 출력 중 이미지는
+              candidates_tokens_details 의 IMAGE 다. candidates 의 나머지(응답 텍스트 -
+              Studio 에서 100~450토큰)와 thoughts_token_count(생각)는 이미지보다 훨씬 싼
+              텍스트·생각 단가로 따로 청구된다 -> out_text_tokens. 예전엔 생각은 아예 안
+              적고 텍스트는 이미지 단가로 셌다. 입력 + candidates + 생각 = total_token_count.
+    OpenAI  : input_tokens_details(text/image), output_tokens_details(image/text).
+    Seedream: generated_images(장수 과금), input_images(실제로 받은 레퍼런스 수).
+    images 는 pil(완성된 이미지)이 있을 때만 1 - 이미지 없이 청구된 시도는 0 장이다.
+    어느 쪽이든 없으면 0 으로 둔다 - 비용 추정이 틀리는 건 고칠 수 있지만,
     여기서 예외가 나 생성이 실패하는 건 되돌릴 수 없다."""
-    u = {"in_text_tokens": 0, "in_image_tokens": 0, "out_tokens": 0, "images": 1,
-         "out_px": 0}
+    u = {"in_text_tokens": 0, "in_image_tokens": 0, "out_tokens": 0, "out_text_tokens": 0,
+         "images": 1 if pil is not None else 0, "out_px": 0}
     try:
         if pil is not None and getattr(pil, "size", None):
             u["out_px"] = int(pil.size[0]) * int(pil.size[1])
@@ -342,17 +365,38 @@ def _extract_usage(provider, result_obj, pil=None):
         if provider in ("vertex", "studio"):
             m = getattr(result_obj, "usage_metadata", None)
             if m is not None:
-                u["in_text_tokens"] = int(getattr(m, "prompt_token_count", 0) or 0)
-                u["out_tokens"] = int(getattr(m, "candidates_token_count", 0) or 0)
+                prompt = int(getattr(m, "prompt_token_count", 0) or 0)
+                cand = int(getattr(m, "candidates_token_count", 0) or 0)
+                thoughts = int(getattr(m, "thoughts_token_count", 0) or 0)
+                in_img = min(_modality_tokens(getattr(m, "prompt_tokens_details", None), "IMAGE"), prompt)
+                c_det = getattr(m, "candidates_tokens_details", None)
+                # 내역이 있으면(빈 목록 포함) 그 안의 IMAGE 만 이미지다. 내역 자체가 없으면
+                # 이미지가 실제로 나온 응답일 때만 출력을 이미지로 본다 — 이미지 없는 응답의
+                # 출력은 텍스트라, 이미지 단가로 세면 몇 배로 부풀려진다.
+                if c_det is not None:
+                    out_img = min(_modality_tokens(c_det, "IMAGE"), cand)
+                else:
+                    out_img = cand if pil is not None else 0
+                u["in_image_tokens"] = in_img
+                u["in_text_tokens"] = prompt - in_img
+                u["out_tokens"] = out_img
+                u["out_text_tokens"] = (cand - out_img) + thoughts
             return u
         raw = getattr(result_obj, "usage", None)
         if raw is None:
             return u
         get = (lambda o, k: o.get(k) if isinstance(o, dict) else getattr(o, k, None))
-        u["out_tokens"] = int(get(raw, "output_tokens") or 0)
+        out_total = int(get(raw, "output_tokens") or 0)
+        od = get(raw, "output_tokens_details")
+        out_txt = min(int(get(od, "text_tokens") or 0), out_total) if od is not None else 0
+        u["out_text_tokens"] = out_txt
+        u["out_tokens"] = out_total - out_txt
         gen = get(raw, "generated_images")
         if gen:
             u["images"] = int(gen)
+        refs = get(raw, "input_images")
+        if refs is not None:
+            u["ref_images"] = int(refs)
         ind = get(raw, "input_tokens_details")
         if ind is not None:
             u["in_text_tokens"] = int(get(ind, "text_tokens") or 0)
@@ -362,6 +406,9 @@ def _extract_usage(provider, result_obj, pil=None):
     except Exception:
         pass
     return u
+
+
+_USAGE_TOKEN_KEYS = ("in_text_tokens", "in_image_tokens", "out_tokens", "out_text_tokens")
 
 
 def _model_file_prefix(model):
@@ -466,6 +513,7 @@ _ALL_MODEL_IDS = (
     "gemini-2.5-flash-image",
     "gemini-3-pro-image",
     "gemini-3.1-flash-image",
+    "gemini-nano-banana-2.1",
     "gemini-3.1-flash-lite-image",
     "seedream-5-0-pro-260628",
     "seedream-4-5-251128",
@@ -2174,7 +2222,8 @@ class AppState:
         # in from a stale snapshot — _normalize_model_name handles new sets,
         # but in-flight jobs queued before this build's restart might carry
         # the old name.
-        if _normalize_model_name(model) != "gemini-3.1-flash-image":
+        # Nano Banana 2.1 도 high 로 고정한다(2.1 의 API 기본값은 medium).
+        if _normalize_model_name(model) not in ("gemini-3.1-flash-image", "gemini-nano-banana-2.1"):
             return None
         try:
             return types.ThinkingConfig(thinking_level="high")
@@ -2419,10 +2468,32 @@ class AppState:
         start = time.time()
         max_retries = 5
         delay = 10
+        # 이 한 장을 만드느라 청구된 시도 전부의 합. 이미지가 안 나온 응답도 입력·생각
+        # 토큰은 청구된다 - 예전엔 마지막에 성공한 한 번만 적어서, 재시도와 Studio<->Vertex
+        # 전환에 든 돈이 집계에서 통째로 빠졌다.
+        acc = {"used": None}
+
+        def _bill(api, resp, pil=None):
+            u = _extract_usage(api, resp, pil)
+            if acc["used"] is None:
+                acc["used"] = u
+            else:
+                for k in _USAGE_TOKEN_KEYS:
+                    acc["used"][k] += u[k]
+                acc["used"]["images"], acc["used"]["out_px"] = u["images"], u["out_px"]
+            acc["api"] = api
+            return acc["used"]
+
+        def _end(r):
+            # 실패·취소로 끝나도 이미 청구된 시도가 있으면 그 사용량을 달고 나간다(0 장).
+            if acc["used"] is not None and r.get("status") != "success":
+                r["usage"] = dict(acc["used"], images=0, out_px=0)
+                r.setdefault("api_used", acc.get("api", ""))
+            return r
 
         for attempt in range(max_retries):
             if self.cancel_flag:
-                return {"status": "cancelled", "index": idx, "seed": seed}
+                return _end({"status": "cancelled", "index": idx, "seed": seed})
             try:
                 resp, api_used = self.call_api(model, contents, config, preferred_provider=preferred)
                 elapsed = time.time() - start
@@ -2430,7 +2501,8 @@ class AppState:
                 if pil is not None:
                     return {"status": "success", "index": idx, "seed": seed,
                             "image": pil, "elapsed": elapsed, "api_used": api_used,
-                            "usage": _extract_usage(api_used, resp, pil)}
+                            "usage": _bill(api_used, resp, pil)}
+                _bill(api_used, resp)
 
                 # Log WHY the primary provider returned no image
                 self.diagnose_empty_response(resp, self.get_provider_label(api_used))
@@ -2451,7 +2523,8 @@ class AppState:
                     if pil2:
                         return {"status": "success", "index": idx, "seed": seed,
                                 "image": pil2, "elapsed": time.time()-start, "api_used": fu,
-                                "usage": _extract_usage(fu, resp2, pil2)}
+                                "usage": _bill(fu, resp2, pil2)}
+                    _bill(fu, resp2)
                     # Log why the fallback also failed
                     self.diagnose_empty_response(resp2, fl)
 
@@ -2464,27 +2537,27 @@ class AppState:
                     seed = random.randint(0, 2147483646)
                     config = _build_config(seed)
                     if not self.sleep_with_cancel(3):
-                        return {"status": "cancelled", "index": idx, "seed": seed}
+                        return _end({"status": "cancelled", "index": idx, "seed": seed})
                     continue
-                return {"status": "failed", "index": idx, "seed": seed,
-                        "error": "No image in response", "elapsed": elapsed}
+                return _end({"status": "failed", "index": idx, "seed": seed,
+                             "error": "No image in response", "elapsed": elapsed})
 
             except Exception as e:
                 err = str(e)
                 if err == "Cancelled":
-                    return {"status": "cancelled", "index": idx, "seed": seed}
+                    return _end({"status": "cancelled", "index": idx, "seed": seed})
                 elapsed = time.time() - start
                 if self.is_retryable_error(err) and attempt < max_retries - 1:
                     wt = delay + random.uniform(2, 8)
                     self.log(f"[{idx+1}] Retryable error. Wait {wt:.0f}s (retry {attempt+1}/{max_retries})")
                     if not self.sleep_with_cancel(wt):
-                        return {"status": "cancelled", "index": idx, "seed": seed}
+                        return _end({"status": "cancelled", "index": idx, "seed": seed})
                     delay = min(delay * 2, 120)
                     continue
-                return {"status": "failed", "index": idx, "seed": seed,
-                        "error": err[:120], "elapsed": elapsed}
+                return _end({"status": "failed", "index": idx, "seed": seed,
+                             "error": err[:120], "elapsed": elapsed})
 
-        return {"status": "cancelled", "index": idx, "seed": seed}
+        return _end({"status": "cancelled", "index": idx, "seed": seed})
 
     def _spool_usage_row(self, job, result, filepath, elapsed, api_used, model):
         """이미지 한 장의 과금 근거를 로컬 spool 에 적는다.
@@ -2510,12 +2583,16 @@ class AppState:
                 "model": model or "",
                 "size": str(job.get("img_cfg", {}).get("size") or ""),
                 "quality": str(job.get("quality") or ""),
-                "images": int(u.get("images") or 1),
+                # 0 장 = 이미지는 안 나왔지만 청구된 시도. `or 1` 로 두면 1 장이 돼 버린다.
+                "images": int(u["images"]) if u.get("images") is not None else 1,
                 "in_text_tokens": int(u.get("in_text_tokens") or 0),
                 "in_image_tokens": int(u.get("in_image_tokens") or 0),
                 "out_tokens": int(u.get("out_tokens") or 0),
+                "out_text_tokens": int(u.get("out_text_tokens") or 0),
                 "out_px": int(u.get("out_px") or 0),
-                "ref_images": len([x for x in (job.get("ref_paths") or []) if x]),
+                # API 가 센 값이 있으면(Seedream input_images) 그걸 쓴다 - 실제로 청구된 수다.
+                "ref_images": (int(u["ref_images"]) if u.get("ref_images") is not None
+                               else len([x for x in (job.get("ref_paths") or []) if x])),
                 "elapsed_ms": int(round((elapsed or 0) * 1000)),
                 "app_version": _read_version(),
             }
@@ -2737,6 +2814,9 @@ class AppState:
                         })
                         self.log(f"[{idx+1}] Saved {fn} ({elapsed:.1f}s via {api_used})")
                     elif result["status"] == "failed":
+                        if result.get("usage"):
+                            self._spool_usage_row(job, result, None, result.get("elapsed", 0),
+                                                  result.get("api_used") or "", model)
                         self.fail_count += 1
                         self.push_event({
                             "type": "image_failed",
@@ -2749,6 +2829,9 @@ class AppState:
                         })
                         self.log(f"[{idx+1}] {result.get('error','')} ({result.get('elapsed',0):.1f}s)")
                     else:
+                        if result.get("usage"):
+                            self._spool_usage_row(job, result, None, result.get("elapsed", 0),
+                                                  result.get("api_used") or "", model)
                         self.log(f"[{idx+1}] Cancelled")
 
                 # Refill loop
@@ -4595,7 +4678,9 @@ def start_generate():
         img_cfg = {}
         if aspect and aspect != "auto" and _gemini_aspect_ok(model, aspect):
             img_cfg["aspect_ratio"] = aspect
-        if "gemini-3" in model:
+        # 해상도를 받는 모델인가. 예전엔 "gemini-3" 글자 검사뿐이라, 이름 규칙이 바뀐
+        # gemini-nano-banana-2.1 은 2K/4K 를 골라도 image_size 가 안 실려 늘 기본 해상도로 나왔다.
+        if "gemini-3" in model or _normalize_model_name(model) in _GEMINI_IMAGE_SIZES:
             # The Gemini API token is "512px", not "0.5K". v1201/02 shipped the
             # wrong token; translate it here so even a project saved with "0.5K"
             # (loaded straight into state) can't send the 400-causing value.

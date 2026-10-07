@@ -1058,6 +1058,17 @@ const MODEL_SPECS = {
     hint: "10 RPM limit — auto-throttled to ~8 RPM",
     refHint: "3rd-gen models support up to 14 reference images.",
   },
+  // Nano Banana 2.1 (2026-10). NB2 의 후속 — 비율은 NB2 와 같고(1:8 등 확장 포함),
+  // 512px 는 없다(API 가 400). 생각 단계는 서버가 high 로 고정한다.
+  "gemini-nano-banana-2.1": {
+    aspects: ["auto","1:1","2:3","3:2","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1"],
+    resolutions: ["1K","2K","4K"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: false,
+    defaultAspect: "16:9", defaultResolution: "2K",
+    hint: "Nano Banana 2.1 — thinking high. 10 RPM limit — auto-throttled to ~8 RPM",
+    refHint: "3rd-gen models support up to 14 reference images.",
+  },
   "gemini-3.1-flash-lite-image": {
     aspects: ["auto","1:1","2:3","3:2","3:4","4:3","4:5","5:4","9:16","16:9","21:9","1:4","4:1","1:8","8:1"],
     resolutions: ["1K"],
@@ -1221,6 +1232,7 @@ function migrateModelId(m) {
 const _MODEL_SHORT = {
   "gemini-3-pro-image": "Gemini 3 Pro",
   "gemini-3.1-flash-image": "Gemini 3.1 Flash",
+  "gemini-nano-banana-2.1": "Nano Banana 2.1",
   "gemini-3.1-flash-lite-image": "Gemini 3.1 Lite",
   "gemini-2.5-flash-image": "Gemini 2.5 Flash",
   "gpt-image-2": "GPT Image 2",

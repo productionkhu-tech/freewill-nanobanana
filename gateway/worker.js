@@ -473,13 +473,14 @@ async function handleAdmin(request, env, path) {
       await env.USAGE_DB.prepare(
         `INSERT INTO prices
            (model, effective_from, provider, mode, in_text_per_m, in_image_per_m, out_per_m,
-            per_image, per_image_hi, px_threshold, in_per_image, in_free_count,
+            out_text_per_m, per_image, per_image_hi, px_threshold, in_per_image, in_free_count,
             verified, note, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(model, effective_from) DO UPDATE SET
            provider=excluded.provider, mode=excluded.mode,
            in_text_per_m=excluded.in_text_per_m, in_image_per_m=excluded.in_image_per_m,
-           out_per_m=excluded.out_per_m, per_image=excluded.per_image,
+           out_per_m=excluded.out_per_m, out_text_per_m=excluded.out_text_per_m,
+           per_image=excluded.per_image,
            per_image_hi=excluded.per_image_hi, px_threshold=excluded.px_threshold,
            in_per_image=excluded.in_per_image, in_free_count=excluded.in_free_count,
            verified=excluded.verified, note=excluded.note, updated_at=excluded.updated_at`)
@@ -489,6 +490,9 @@ async function handleAdmin(request, env, path) {
               num(b.in_text_per_m, prev && prev.in_text_per_m),
               num(b.in_image_per_m, prev && prev.in_image_per_m),
               num(b.out_per_m, prev && prev.out_per_m),
+              // 텍스트·생각 출력 (Gemini 의 thinking, 응답 텍스트). 이미지 출력과 단가가
+              // 다르다 — 예: Nano Banana 2.1 은 이미지 $30, 텍스트·생각 $7.50 /1M.
+              num(b.out_text_per_m, prev && prev.out_text_per_m),
               num(b.per_image, prev && prev.per_image),
               // 고화소 단가와 레퍼런스 과금도 같이 저장한다. 예전엔 화면에 칸만
               // 있고 저장이 안 돼 고쳐도 조용히 원래 값으로 남았다.
@@ -1338,7 +1342,9 @@ async function loadUsage() {
       kpi("총 비용", useKrw ? krw(totalKrw) : usd(d.total_cost_usd),
           useKrw ? usd(d.total_cost_usd) : "환율을 아직 못 받았습니다")
     + kpi("이미지", nf(d.total_images) + "장",
-          days > 0 ? "하루 평균 " + avg(d.total_images / days) + "장" : "")
+          (days > 0 ? "하루 평균 " + avg(d.total_images / days) + "장" : "")
+          + (d.failed_attempts > 0 ? " · 이미지 없이 청구된 시도 " + nf(d.failed_attempts) + "건("
+             + (useKrw ? krw(d.failed_cost_krw) : usd(d.failed_cost_usd)) + ") 포함" : ""))
     + kpi("하루 평균 비용", useKrw ? krw(perDay) : usd(d.total_cost_usd / Math.max(days, 1)),
           busiest ? "가장 많은 날 " + busiest.day + " · " + (useKrw ? krw(busiest.cost_krw) : usd(busiest.cost_usd)) : "")
     + (d.unpriced_images > 0
@@ -1496,7 +1502,7 @@ async function loadPrices() {
   const d = await api("/admin/prices");
   const rows = d.prices || [];
   let h = '<table><tr><th>모델</th><th>적용 시작</th><th>방식</th>'
-        + '<th class="num">입력 텍스트 / 이미지 (1M)</th><th class="num">출력 (1M)</th>'
+        + '<th class="num">입력 텍스트 / 이미지 (1M)</th><th class="num">출력 이미지 / 텍스트·생각 (1M)</th>'
         + '<th class="num">장당</th><th class="num">장당(고화소)</th><th class="num">픽셀 기준</th>'
         + '<th class="num">레퍼런스 장당 / 무료</th><th>상태</th><th></th></tr>';
   rows.forEach((p, i) => {
@@ -1509,7 +1515,8 @@ async function loadPrices() {
       + '<option value="image"' + (p.mode === "image" ? " selected" : "") + '>장수</option></select></td>'
       + '<td class="num"><input id="' + id + '_it" value="' + p.in_text_per_m + '" size="4"> / '
       + '<input id="' + id + '_ii" value="' + p.in_image_per_m + '" size="4"></td>'
-      + '<td class="num"><input id="' + id + '_o" value="' + p.out_per_m + '" size="5"></td>'
+      + '<td class="num"><input id="' + id + '_o" value="' + p.out_per_m + '" size="5"> / '
+      + '<input id="' + id + '_ot" value="' + (p.out_text_per_m || 0) + '" size="4"></td>'
       + '<td class="num"><input id="' + id + '_pi" value="' + p.per_image + '" size="5"></td>'
       + '<td class="num"><input id="' + id + '_ph" value="' + p.per_image_hi + '" size="5"></td>'
       + '<td class="num"><input id="' + id + '_px" value="' + p.px_threshold + '" size="8"></td>'
@@ -1532,7 +1539,7 @@ async function savePrice(model, id, eff) {
   if (eff === "today" && !confirm(when + " 부터 적용되는 새 단가로 넣습니다. 그 전 기간은 지금 단가 그대로 남습니다.")) return;
   const d = await api("/admin/prices", { method: "POST", body: JSON.stringify({
     model, effective_from: when, mode: v("_mode"),
-    in_text_per_m: v("_it"), in_image_per_m: v("_ii"), out_per_m: v("_o"),
+    in_text_per_m: v("_it"), in_image_per_m: v("_ii"), out_per_m: v("_o"), out_text_per_m: v("_ot"),
     per_image: v("_pi"), per_image_hi: v("_ph"), px_threshold: v("_px"),
     in_per_image: v("_ip"), in_free_count: v("_if"), verified: 1 }) });
   if (!d.ok) return alert(d.error || "실패");
@@ -1672,9 +1679,9 @@ async function handleUsage(request, env, rec) {
     `INSERT OR IGNORE INTO usage_events
        (id, ts, day, team_id, project_id, token_id, user, machine,
         provider, model, size, quality, images,
-        in_text_tokens, in_image_tokens, out_tokens, out_px, ref_images,
+        in_text_tokens, in_image_tokens, out_tokens, out_text_tokens, out_px, ref_images,
         elapsed_ms, app_version, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   const created = nowIso();
   const batch = [];
   // 옛 프로젝트 id -> 시트 PJ id. 앱의 탭이나 아직 못 보낸 spool 은 이관 전 id 를
@@ -1690,9 +1697,11 @@ async function handleUsage(request, env, rec) {
       rec.token_id || null, rec.user || null, rec.machine || null,
       String(e.provider || "").slice(0, 24), String(e.model).slice(0, 64),
       String(e.size || "").slice(0, 24), String(e.quality || "").slice(0, 16),
-      Number(e.images) || 1,
+      // 0 장은 "이미지는 안 나왔지만 청구된 시도"다. 예전 식(|| 1)은 그걸 1 장으로 바꿨다.
+      e.images == null ? 1 : Math.max(0, Math.floor(Number(e.images) || 0)),
       Number(e.in_text_tokens) || 0, Number(e.in_image_tokens) || 0,
-      Number(e.out_tokens) || 0, Number(e.out_px) || 0, Number(e.ref_images) || 0,
+      Number(e.out_tokens) || 0, Number(e.out_text_tokens) || 0,
+      Number(e.out_px) || 0, Number(e.ref_images) || 0,
       e.elapsed_ms == null ? null : Number(e.elapsed_ms),
       String(e.app_version || "").slice(0, 32), created));
   }
@@ -1747,6 +1756,7 @@ const COST_USD = `
          ELSE e.in_text_tokens  * p.in_text_per_m  / 1000000.0
             + e.in_image_tokens * p.in_image_per_m / 1000000.0
             + e.out_tokens      * p.out_per_m      / 1000000.0
+            + e.out_text_tokens * p.out_text_per_m / 1000000.0
     END, 0)`;
 
 /**
@@ -1809,7 +1819,10 @@ async function handleAdminUsage(url, env) {
            SUM(${COST_USD} * ${KRW_RATE}) AS cost_krw,
            SUM(CASE WHEN p.model IS NULL OR p.verified=0 THEN e.images ELSE 0 END) AS unpriced,
            MIN(e.day) AS first_day, MAX(e.day) AS last_day,
-           MAX(e.machine) AS first_name
+           MAX(e.machine) AS first_name,
+           SUM(CASE WHEN e.images = 0 THEN 1 ELSE 0 END) AS failed_n,
+           SUM(CASE WHEN e.images = 0 THEN ${COST_USD} ELSE 0 END) AS failed_usd,
+           SUM(CASE WHEN e.images = 0 THEN ${COST_USD} * ${KRW_RATE} ELSE 0 END) AS failed_krw
     FROM usage_events e
     ${PRICE_JOIN}
     ${FX_JOIN}
@@ -1835,6 +1848,9 @@ async function handleAdminUsage(url, env) {
   const totalKrw = rows.reduce((a, x) => a + (x.cost_krw || 0), 0);
   const imgs = rows.reduce((a, x) => a + (x.images || 0), 0);
   const unpriced = rows.reduce((a, x) => a + (x.unpriced || 0), 0);
+  const failedN = rows.reduce((a, x) => a + (x.failed_n || 0), 0);
+  const failedUsd = rows.reduce((a, x) => a + (x.failed_usd || 0), 0);
+  const failedKrw = rows.reduce((a, x) => a + (x.failed_krw || 0), 0);
 
   // 이름과 보관 여부를 붙여 돌려준다. **active 로 거르지 않는다** — 끝난 프로젝트를
   // 목록에서 내렸다고 그 프로젝트가 쓴 돈까지 안 보이면 집계가 아니라 구멍이다.
@@ -1865,6 +1881,7 @@ async function handleAdminUsage(url, env) {
     ok: true, group_by: key, from, to, status,
     total_cost_usd: total, total_cost_krw: totalKrw,
     total_images: imgs, unpriced_images: unpriced,
+    failed_attempts: failedN, failed_cost_usd: failedUsd, failed_cost_krw: failedKrw,
     usd_krw: fx ? fx.usd_krw : 0, fx_day: fx ? fx.day : null,
     days: dr.results || [],
     rows: rows.map((x) => ({

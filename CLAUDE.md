@@ -275,6 +275,23 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   저장물의 reve-create를 기본 모델로 폴백 (개명 맵 `_MODEL_RENAMES`와 다름 — prefs 키는 건드리지 않음).
   과거 Reve 생성물의 갤러리 배지/라벨은 그대로 표시
 - Seedream 5.0 Pro 커스텀 크기 상한은 `2048²×1.1025 = 4,624,220px` (그냥 2048²로 두면 통과할 크기가 잘림)
+- **Nano Banana 2.1** = `gemini-nano-banana-2.1` (v2026-10-0701~). **ID 규칙이 바뀌었다** — 이름에 "gemini-3"도
+  "3.1"도 없다. 그래서 모델 이름 글자로 기능을 가르면 조용히 틀어진다(예전 `"gemini-3" in model` 검사 때문에
+  2K/4K 가 안 실릴 뻔했다). 해상도는 `_GEMINI_IMAGE_SIZES`, 확장 비율(1:4·8:1 등)은 `_GEMINI_EXT_ASPECT_MODELS`
+  처럼 **명시 목록**에 넣을 것. 2.1: 1K/2K/4K(512px 는 400), NB2 와 같은 비율, 생각 단계는 high 고정
+  (API 기본은 medium). 가격표상 `gemini-2.5-flash-image` 는 2026-10-02 지원 중단 표기
+- **Gemini 는 앱 순서상 AI Studio 가 먼저**, 실패 시 Vertex (`get_available_providers` = studio, vertex)
+
+### 6.1.1 사용량 기록 = 회사가 청구하는 그대로 (v2026-10-0701~)
+- 앱 `_extract_usage` 가 응답의 사용량을 모달리티별로 옮긴다: 입력 텍스트/이미지, 출력 **이미지**
+  (`out_tokens`), 출력 **텍스트·생각**(`out_text_tokens`). Gemini 는 `candidates` 중 IMAGE 가 아닌 부분(Studio 에서
+  100~450토큰)과 `thoughts_token_count`(장당 200~1,500)를 텍스트·생각 단가로 청구한다 — 이미지 단가의 1/4~1/20.
+  네 칸의 합 = `total_token_count`. OpenAI 는 `output_tokens_details`, Seedream 은 `input_images`(레퍼런스 수)
+- **이미지 없이 끝난 Gemini 응답도 청구된다.** 한 장을 만들기까지의 모든 시도(무이미지 재시도, Studio↔Vertex
+  전환)를 합산하고, 끝내 실패·취소돼도 청구된 토큰은 `images=0` 행으로 남긴다. 오류(4xx/5xx)는 청구 안 됨 → 안 남김
+- 게이트웨이: `usage_events.out_text_tokens`, `prices.out_text_per_m`(gateway/usage3.sql). `COST_USD` 가 둘을 곱한다.
+  워커는 `images=0` 을 1 로 바꾸지 않는다. 리포트의 `failed_attempts`/`failed_cost_*` 는 합계에 이미 들어 있는 몫을 보여줄 뿐
+- 새 모델을 넣을 땐 **텍스트·생각 단가까지** 단가표에 넣을 것(가격 페이지의 "text and thinking" 줄)
 
 ### 6.2 맥 (소스 실행)
 - `NanoBanana.command` 더블클릭 → `server_mac.py` → Flask를 기본 브라우저로

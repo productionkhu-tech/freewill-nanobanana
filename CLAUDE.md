@@ -91,8 +91,8 @@ NanoBanana.exe 실행
 켤 때 (app._init_keys, init_api 안)
   금고 사본(gw_keys.vault) 있으면 → 바로 클라이언트 생성 (네트워크 대기 0) → 뒤에서 /key 로 새로 받아 바뀌었으면 교체
   없으면 → /key (v=2) 를 기다림 → 실패하면 옛 설치가 남긴 환경변수 키(있으면)로 우선 동작
-  출입증 없음 → ① 옛 티켓 등록(환경변수의 OpenAI 키, ENROLL_OPEN=1 동안만, 조용히)
-               ② 안 되면 승인 요청 → 화면 위 배너에 4자리 번호 → 관리자 페이지 PC 탭에서 승인 → 5초 폴링으로 받음
+  출입증 없음 → ① 옛 티켓 등록(환경변수의 OpenAI 키) — 2026-10-08 ENROLL_OPEN="0" 으로 닫음, 지금은 늘 거절
+               ② 승인 요청 → 화면 위 배너에 4자리 번호 → 관리자 페이지 PC 탭에서 승인 → 5초 폴링으로 받음
 게이트웨이에서 새로 받은 게 확인되면(한 번) → nb_gateway.scrub_plaintext: 옛 평문 사본 정리
 생성 중 프로바이더가 "키 무효"(401·API key not valid·leaked) → 게이트웨이에 다시 묻고(60초 스로틀) 바뀌었으면 즉시 재시도
 ```
@@ -306,7 +306,10 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 - **키 교체(로테이션)**: 콘솔에서 새 키 발급 → `printf '%s' "$NEW" | env -u CLOUDFLARE_API_TOKEN npx wrangler secret put STUDIO_KEY`
   (값이 화면·히스토리에 남지 않게 stdin 으로) → **옛 키의 sha256 을 `RETIRED_KEY_HASHES` 에 추가**(그래야 아직 정리 안 된
   PC 의 옛 평문을 "우리 것"으로 알아보고 지운다) → 옛 키 폐기. 켜져 있는 앱은 다음 "키 무효" 응답 때, 나머지는 다음 실행 때 따라온다
-- 남은 숙제(2026-10-08 기준): 전 PC 가 0801 이상이 되면 `ENROLL_OPEN="0"`(wrangler.toml) → 키 4종 교체 → 업체별 사용 한도
+- 옛 티켓 등록 창구는 **2026-10-08 닫음**(`ENROLL_OPEN="0"`, wrangler.toml — 커밋 안 되는 파일이라 배포 PC 에서
+  확인할 것. "1" 로 다시 배포하면 옛 OpenAI 키만으로 승인 없이 등록되는 길이 다시 열린다). 새 PC·출입증 없는 PC 는 번호 승인
+- 남은 숙제(2026-10-08 기준): 키 4종 교체 → 업체별 사용 한도. `TICKET_HASHES` 는 지우지 말 것 — 등록엔 안 쓰지만
+  옛 OpenAI 평문 사본을 알아보는 `known_hashes` 에 들어간다
 
 - Gemini는 10 RPM → 앱이 8 RPM으로 스로틀. **결제 미연결 시 Studio 429(limit:0) + Vertex 403(BILLING_DISABLED)**
 - **GPT Image 2.5 (2026-09-08)**: sunburst(편집 정밀도) / flare(빠른 생성). 크기 규칙은 gpt-image-2와

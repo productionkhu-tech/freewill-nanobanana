@@ -688,17 +688,11 @@ def _broadcast_env_change():
         pass
 
 
-def scrub_plaintext(data_dir, keys, defaults=None, log=None, _env_key="Environment", _home=None):
-    """Erase the plaintext key copies older installers left on this machine.
-
-    Only what the gateway now supplies is erased, and only what is provably ours.
-    NANOBANANA_STUDIO_KEY is replaced by a placeholder instead of deleted on
-    Windows: older builds refuse to start without it, and an old copy of the EXE
-    has to boot far enough to update itself.
-
-    `keys` must come from a fresh gateway fetch — never from the offline copy.
-    Returns short ASCII labels of what was removed. (_env_key/_home exist for
-    tests, which must never touch the real environment or key file.)"""
+def _decider(keys, defaults=None, _home=None):
+    """The one rule for "is this plaintext copy ours to remove?" — shared by the
+    cleanup and by the report of what is left, so the two can never disagree.
+    Returns (decide, known_hashes, sa_email, home); decide(name, value) gives
+    "drop", "placeholder" or None."""
     known = set(keys.get("known_hashes") or [])
     for k in ("openai", "studio", "ark"):
         if keys.get(k):
@@ -707,7 +701,6 @@ def scrub_plaintext(data_dir, keys, defaults=None, log=None, _env_key="Environme
     sa_email = vx.get("sa_email") or ""
     defaults = {k.upper(): v for k, v in (defaults or {}).items()}
     home = _home or os.path.expanduser("~")
-    done = []
 
     def decide(name, value):
         n, v = name.upper(), (value or "").strip()
@@ -738,6 +731,23 @@ def scrub_plaintext(data_dir, keys, defaults=None, log=None, _env_key="Environme
         if n in defaults:
             return "drop" if v == defaults[n] else None
         return None
+
+    return decide, known, sa_email, home
+
+
+def scrub_plaintext(data_dir, keys, defaults=None, log=None, _env_key="Environment", _home=None):
+    """Erase the plaintext key copies older installers left on this machine.
+
+    Only what the gateway now supplies is erased, and only what is provably ours.
+    NANOBANANA_STUDIO_KEY is replaced by a placeholder instead of deleted on
+    Windows: older builds refuse to start without it, and an old copy of the EXE
+    has to boot far enough to update itself.
+
+    `keys` must come from a fresh gateway fetch — never from the offline copy.
+    Returns short ASCII labels of what was removed. (_env_key/_home exist for
+    tests, which must never touch the real environment or key file.)"""
+    decide, known, sa_email, home = _decider(keys, defaults, _home)
+    done = []
 
     if sys.platform == "win32":
         try:
@@ -827,15 +837,15 @@ def _scrub_keys_env(path, decide, sa_email, done):
         os.replace(tmp, path)
 
 
-def _scrub_installer_bats(known):
-    """Installer .bat files next to the EXE that carry one of our keys.
+def _find_installer_bats(known):
+    """Installer .bat files next to the EXE that carry one of our keys (paths).
 
     We shipped them side by side with the EXE, each with a key written inside
     in plain text. Only files that contain one of our keys (by hash) and set
-    variables are removed — nothing else in the folder is touched."""
+    variables count — nothing else in the folder is touched."""
     if not getattr(sys, "frozen", False):
         return []
-    removed = []
+    found = []
     folder = os.path.dirname(os.path.abspath(sys.executable))
     try:
         names = os.listdir(folder)
@@ -855,14 +865,123 @@ def _scrub_installer_bats(known):
         if "setx" not in txt.lower():
             continue
         hits = [m for pat in _KEY_SHAPES for m in re.findall(pat, txt)]
-        if not any(_h(m) in known for m in hits):
-            continue
+        if any(_h(m) in known for m in hits):
+            found.append(p)
+    return found
+
+
+def _scrub_installer_bats(known):
+    removed = 0
+    for p in _find_installer_bats(known):
         try:
             os.remove(p)
-            removed.append("bat")
+            removed += 1
         except Exception:
             pass
-    return ["installer-bat x%d" % len(removed)] if removed else []
+    return ["installer-bat x%d" % removed] if removed else []
+
+
+# A value under one of these names is reported even when we cannot prove it is ours:
+# on a company PC it is worth a look (an old key we never knew, or a program's own key).
+_WATCH_NAMES = ("OPENAI_API_KEY", "ARK_API_KEY", "REVE_API_KEY", "NANOBANANA_STUDIO_KEY",
+                "NANOBANANA_TICKET", "NANOBANANA_REAL_KEY_BACKUP")
+# Settings, not keys — never reported.
+_SETTING_NAMES = ("NANOBANANA_PROJECT_ID", "NANOBANANA_LOCATION",
+                  "ARK_SEEDREAM_PRO_ENDPOINT", "ARK_SEEDREAM_45_ENDPOINT")
+_SYSTEM_ENV = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+
+
+def plaintext_left(keys, defaults=None, _env_key="Environment", _home=None):
+    """Names — never values — of plaintext key copies still on this PC, for the
+    admin page's PC tab.
+      NAME               still holds one of our keys
+      NAME?              one of our variable names holds a value we cannot recognise
+      SYSTEM:NAME        a machine-wide variable (only an administrator can remove it)
+      file:...           our Vertex key file
+      installer-bat xN   installer files with a key next to the EXE
+    Same rule as the cleanup (_decider), so "남음" always means the cleanup could
+    not or may not touch it."""
+    decide, known, sa_email, home = _decider(keys, defaults, _home)
+    left = []
+
+    def judge(prefix, name, value):
+        n, v = name.upper(), (value or "").strip()
+        if not v or n in _SETTING_NAMES:
+            return
+        if n == "NANOBANANA_STUDIO_KEY" and is_placeholder(v):
+            return
+        if decide(name, v):
+            left.append(prefix + n)
+        elif n in _WATCH_NAMES:
+            left.append(prefix + n + "?")
+
+    if sys.platform == "win32":
+        import winreg
+        roots = [(winreg.HKEY_CURRENT_USER, _env_key, "")]
+        if _env_key == "Environment":
+            roots.append((winreg.HKEY_LOCAL_MACHINE, _SYSTEM_ENV, "SYSTEM:"))
+        for root, path, prefix in roots:
+            try:
+                with winreg.OpenKey(root, path) as k:
+                    i = 0
+                    while True:
+                        try:
+                            n, v, _t = winreg.EnumValue(k, i)
+                        except OSError:
+                            break
+                        i += 1
+                        if isinstance(v, str):
+                            judge(prefix, n, v)
+            except OSError:
+                pass
+        if _env_key == "Environment":
+            bats = _find_installer_bats(known)
+            if bats:
+                left.append("installer-bat x%d" % len(bats))
+    elif sys.platform == "darwin":
+        here = os.path.dirname(os.path.abspath(__file__))
+        for path in (os.path.join(here, "keys.env"), os.path.join(home, ".nanobanana", "keys.env")):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+            except OSError:
+                continue
+            for ln in lines:
+                m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", ln)
+                if not m or ln.lstrip().startswith("#"):
+                    continue
+                v = m.group(2).strip().strip('"').strip("'")
+                if m.group(1).upper() == "GOOGLE_APPLICATION_CREDENTIALS" and v and not os.path.isabs(v):
+                    v = os.path.join(os.path.dirname(path), v)
+                judge("keys.env:", m.group(1), v)
+    sa = os.path.join(home, ".nanobanana", "service_account.json")
+    if sa_email and os.path.isfile(sa) and _sa_email_of(sa) == sa_email:
+        left.append("file:service_account.json")
+    return sorted(set(left))
+
+
+def report_plaintext(data_dir, left, app_version=""):
+    """Tell the gateway which plaintext copies remain here (names only) for the
+    admin page's PC tab. Sent only when the list changed since the last report,
+    so a clean PC reports once instead of on every start. Raises GatewayError."""
+    left = sorted(set(left or []))
+    meta = _read_meta(data_dir) or {}
+    if meta.get("plain_reported") == left:
+        return False
+    url, auth = _bearer(data_dir)
+    try:
+        _post(url + "/report", {"plain_left": left, "app_version": app_version or ""},
+              timeout=15, headers=auth)
+    except urllib.error.HTTPError as e:
+        raise GatewayError("refused", _http_error_text(e))
+    except Exception as e:
+        raise GatewayError("unreachable", str(e)[:80])
+    with _token_lock:
+        meta = _read_meta(data_dir) or {}
+        meta["plain_reported"] = left
+        meta["plain_reported_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        _write_meta(data_dir, meta)
+    return True
 
 
 # ==========================================================================

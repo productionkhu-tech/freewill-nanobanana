@@ -6241,6 +6241,15 @@ def _scrub_once(keys):
             state.log("plaintext key copies removed from this PC: %s" % ", ".join(done))
     except Exception as e:
         state.log("plaintext cleanup failed: %s" % str(e)[:80])
+    # 정리한 뒤에도 남은 게 있는지(변수 이름만, 값은 절대 아님) 관리자 페이지 PC 탭에 알린다.
+    # 지난번과 같으면 보내지 않으므로 깨끗한 PC 는 한 번만 보고한다.
+    try:
+        left = _nbgw.plaintext_left(keys, defaults=_ARK_ENDPOINT_DEFAULTS)
+        if left:
+            state.log("plaintext key copies still on this PC: %s" % ", ".join(left))
+        _nbgw.report_plaintext(_user_data_dir(), left, app_version=_read_version())
+    except Exception as e:
+        state.log("plaintext report failed: %s" % str(e)[:80])
 
 
 def _start_enrollment():

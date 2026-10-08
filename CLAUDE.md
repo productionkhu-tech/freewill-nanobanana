@@ -3,13 +3,15 @@
 멀티 프로바이더 AI 이미지 생성 데스크톱 앱 (Flask + pywebview + PyInstaller).
 이 문서 하나로 **구조 · 원리 · 규칙 · 배포 · 관리**를 파악할 수 있게 씁니다. 낡은 내용을 발견하면 즉시 고칠 것.
 
-> 최종 갱신: 2026-08-07 (v2026-08-0701 기준)
+> 최종 갱신: 2026-10-08 (v2026-10-0801 기준 — 키 보안 개편)
 
 ---
 
 ## 0. 빠른 요약 (TL;DR)
 
-- **실행**: onefile PyInstaller EXE (`NanoBanana.exe`) + 키 설치 스크립트
+- **실행**: onefile PyInstaller EXE (`NanoBanana.exe`) 하나. 키 설치 스크립트는 폐기(v2026-10-0801~)
+- **키**: PC 에 평문으로 두지 않는다. 앱이 켤 때 게이트웨이에서 키 전부를 받아 **메모리에만** 들고,
+  PC 에는 그 윈도우 계정만 풀 수 있는 암호화 파일(출입증·키 사본)만 남는다. 새 PC 는 관리자 승인(4자리 번호). §2.1
 - **프론트**: HTML/CSS/JS를 Flask가 서빙, pywebview(WebView2) 창에서 렌더
 - **백엔드**: Flask 127.0.0.1:5656, `app.py` 단일 파일에 상태+라우트 전부
 - **프로바이더 3사**: Google Gemini(Vertex/Studio) · OpenAI gpt-image-2 / 2.5 · BytePlus Seedream
@@ -29,6 +31,8 @@
 ├── app.py                  # Flask 서버 + AppState(상태·로직 전부), ~4550줄, 라우트 64개
 ├── launcher.py             # pywebview 창 수명주기 + 단일인스턴스 + --updater 모드 + 부팅 업데이트 체크
 ├── updater.py              # 버전 체크 + 자산 다운로드/검증 + EXE 자기교체 + 자동설치 시도 예산
+├── nb_gateway.py           # 게이트웨이 클라이언트: 출입증·키 받기, DPAPI 금고, 승인 요청, 평문 정리, 사용량 spool
+├── gateway/worker.js       # Cloudflare Worker (키 배포·승인·사용량 집계·관리자 페이지). wrangler deploy
 ├── VERSION                 # 현재 버전 (커밋 대상, EXE에 번들됨)
 ├── NanoBanana.spec         # PyInstaller onefile 설정
 ├── static/app.js           # 프론트 로직 전부 (~3390줄)   static/style.css
@@ -54,6 +58,10 @@ C:\NanoBanana_build\
 ~/.nanobanana/prefs.json                 # skip_delete_confirm, prompt_history
 ~/.nanobanana/last_seen_version.txt      # "업데이트 완료" 팝업 판단
 ~/.nanobanana/auto_update_state.json     # 자동설치 시도 예산 (버전별)
+~/.nanobanana/gw_token.vault             # 출입증 (DPAPI — 이 PC·이 계정만 풀림). 맥은 로그인 키체인
+~/.nanobanana/gw_keys.vault              # 키 사본 (DPAPI) — 게이트웨이가 안 될 때 켜기용
+~/.nanobanana/gateway.json               # 출입증 메타(누구/언제). 토큰 자체는 없음 (옛 버전은 평문으로 뒀다)
+~/.nanobanana/usage_spool.jsonl          # 아직 못 올린 사용량 (30초마다 업로드)
 ~/Documents/NanoBanana JSON/             # 프로젝트 세션 JSON
 ~/Pictures/Screenshots/NanoBanana Clipboard/  # 클립보드·업로드 ref 캐시 (SHA1 이름)
 ~/Desktop/NanoBanana_Output/             # 기본 출력 폴더
@@ -71,12 +79,37 @@ NanoBanana.exe 실행
   ├── (모듈 로드) stdout UTF-8 재설정 + print 래퍼 + 고아 파일(.new.exe/.exe.old) 청소
   ├── sys.argv[1]=="--updater" 면 → _run_as_updater() 로 분기 (UI/Flask 없이 스왑만)
   ├── 단일 인스턴스 mutex → 이미 실행 중이면 기존 창 포커스 후 종료
-  ├── API 환경변수 체크 / Program Files 경고 / WebView2 존재 확인
+  ├── Program Files 경고 / WebView2 존재 확인  (API 키 검사는 없다 — 키는 창이 뜬 뒤 받는다, 규칙 21)
   ├── 포트 5656 점유 시 기존 창 포커스 후 종료 (mutex 놓친 경우 폴백)
   ├── 백그라운드 업데이트 체크 스레드 기동 (2초 지연)  ★ 절대 끄지 말 것 (§3-1)
   ├── Flask 스레드 기동 → 준비 대기(최대 15초)
   └── pywebview 창 생성 → WebView2가 http://127.0.0.1:5656 로드
 ```
+
+### 2.1 키 — 서버가 원본, PC 엔 암호화 사본만 (v2026-10-0801~)
+```
+켤 때 (app._init_keys, init_api 안)
+  금고 사본(gw_keys.vault) 있으면 → 바로 클라이언트 생성 (네트워크 대기 0) → 뒤에서 /key 로 새로 받아 바뀌었으면 교체
+  없으면 → /key (v=2) 를 기다림 → 실패하면 옛 설치가 남긴 환경변수 키(있으면)로 우선 동작
+  출입증 없음 → ① 옛 티켓 등록(환경변수의 OpenAI 키, ENROLL_OPEN=1 동안만, 조용히)
+               ② 안 되면 승인 요청 → 화면 위 배너에 4자리 번호 → 관리자 페이지 PC 탭에서 승인 → 5초 폴링으로 받음
+게이트웨이에서 새로 받은 게 확인되면(한 번) → nb_gateway.scrub_plaintext: 옛 평문 사본 정리
+생성 중 프로바이더가 "키 무효"(401·API key not valid·leaked) → 게이트웨이에 다시 묻고(60초 스로틀) 바뀌었으면 즉시 재시도
+```
+- **생성은 여전히 PC → 프로바이더 직통.** 게이트웨이는 키를 나눠줄 뿐 중계하지 않는다(4K 1~2분 응답이
+  워커 제한·지역 차단에 걸리는 걸 피하려고). 속도 변화 0
+- **Vertex 는 키 파일이 없다.** 워커가 VERTEX_SA 로 1시간 토큰을 만들어 주고(`/vertex-token`), 앱은
+  google-auth `Credentials(refresh_handler=...)` 로 만료 전에 알아서 다시 받는다. Studio 가 먼저라 대개 안 쓰인다
+- **평문 정리 규칙** (`scrub_plaintext`): 일반 이름(OPENAI_API_KEY·ARK_API_KEY·REVE_API_KEY)은 값의 sha256 이
+  회사 키(`known_hashes` = 현재 + TICKET_HASHES + RETIRED_KEY_HASHES)일 때만 지운다 — 같은 이름을 다른 프로그램이
+  쓸 수 있다. NANOBANANA_* 는 이름으로 우리 것. Vertex 키 파일은 client_email 이 게이트웨이 SA 일 때만.
+  EXE 옆 .bat 은 회사 키가 들어 있고 setx 가 있을 때만. `NANOBANANA_DATA_DIR` 이 걸린 테스트에선 안 돈다
+- **`NANOBANANA_STUDIO_KEY=managed-by-gateway` 는 일부러 남긴 표시다.** 옛 launcher 는 이 값이 비면 시작을
+  거부했다 → 정리된 PC 에서 옛 EXE 를 켜도 부팅해서 스스로 업데이트하게 하려는 것. 지우지 말 것(규칙 22)
+- **끊기**: 관리자가 PC 탭에서 끊으면 /key·/usage 가 401 "revoked" → 앱이 출입증·사본을 버리고 승인 화면으로.
+  끊긴 PC 는 티켓으로 되돌아오지 못한다(워커가 거부) — 다시 쓰려면 새 번호 승인
+- **재설치**: 같은 윈도우 계정·같은 PC 이름이면 승인할 때 예전 출입증을 그대로 돌려준다(ident 재사용) → PC 기록 이어짐
+- **새 PC 온보딩**: 최신 EXE 만 주고(구버전은 환경변수 키 없으면 시작을 거부해 업데이트도 못 받는다) → 번호 승인
 
 ### 프론트 ↔ 서버
 - 상태는 `AppState` 싱글톤 하나에 전부 (설정·갤러리·ref 슬롯·큐·로그·이벤트)
@@ -180,6 +213,16 @@ gen_worker:
     키(파일경로 / pid) 기반으로 DOM을 재사용할 것
 19. **app.py에서 `import launcher` 금지.** launcher는 frozen 진입 모듈이라 재import 시 모듈 레벨
     부작용이 재실행된다. 공유가 필요하면 `updater.py`에 둘 것
+20. **프로바이더 키를 환경변수·평문 파일에 쓰지 말 것 (setx 금지).** 2026-10 까지 키 4종이 70대의 환경변수에
+    평문으로 있어 `echo` 한 줄이면 보였고, 그 PC 에서 켜는 모든 프로그램이 물려받았다. 키는 게이트웨이에서 받아
+    메모리에만, 디스크엔 `nb_gateway.vault_put`(DPAPI/키체인)으로만
+21. **launcher 에 "키 없으면 시작 안 함" 검사를 넣지 말 것.** 창이 뜨기 전(=업데이트 체크 전)에 멈추면 그 PC 는
+    스스로 빠져나올 길이 없다. 키가 없으면 앱이 승인 번호를 띄우는 게 정답
+22. **`NANOBANANA_STUDIO_KEY=managed-by-gateway` 표시를 지우지 말 것.** 옛 버전 launcher 가 이걸 보고 시작한다
+    (§2.1). 평문 정리 코드는 이 값을 키로 오인하지 않는다(`is_placeholder`)
+23. **평문 정리(`scrub_plaintext`)는 게이트웨이에서 "새로 받은" 키로만, "우리 것"으로 증명된 것만.** 금고 사본이나
+    옛 환경변수로 판단해 지우면, 게이트웨이가 못 주는 키를 지워 PC 를 오프라인으로 만든다. 테스트는
+    `_env_key`/`_home` 인자로 가짜 레지스트리 키·임시 홈을 쓸 것 — 실제 환경변수를 지운 적은 없지만 지울 수 있는 코드다
 
 ---
 
@@ -253,12 +296,17 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 ## 6. 관리 (키 · 맥 · 문서)
 
 ### 6.1 프로바이더/키
-| 프로바이더 | 모델 | 환경변수 |
-|---|---|---|
-| Google Vertex | gemini-3-pro-image 등 | `GOOGLE_APPLICATION_CREDENTIALS` + `NANOBANANA_PROJECT_ID` |
-| Google AI Studio | 동일 모델군 | `NANOBANANA_STUDIO_KEY` |
-| OpenAI | gpt-image-2 · gpt-image-2.5-sunburst / -flare | `OPENAI_API_KEY` |
-| BytePlus | seedream-5-0-pro / 4-5 | `ARK_API_KEY` |
+| 프로바이더 | 모델 | 게이트웨이 시크릿 (v2026-10-0801~) | 옛 환경변수 (정리 대상) |
+|---|---|---|---|
+| Google Vertex | gemini-3-pro-image 등 | `VERTEX_SA` (서비스계정 JSON → 앱엔 1시간 토큰만) | `GOOGLE_APPLICATION_CREDENTIALS` + `NANOBANANA_PROJECT_ID` |
+| Google AI Studio | 동일 모델군 | `STUDIO_KEY` | `NANOBANANA_STUDIO_KEY` |
+| OpenAI | gpt-image-2 · gpt-image-2.5-sunburst / -flare | `OPENAI_KEY` | `OPENAI_API_KEY` |
+| BytePlus | seedream-5-0-pro / 4-5 | `ARK_KEY` | `ARK_API_KEY` |
+
+- **키 교체(로테이션)**: 콘솔에서 새 키 발급 → `printf '%s' "$NEW" | env -u CLOUDFLARE_API_TOKEN npx wrangler secret put STUDIO_KEY`
+  (값이 화면·히스토리에 남지 않게 stdin 으로) → **옛 키의 sha256 을 `RETIRED_KEY_HASHES` 에 추가**(그래야 아직 정리 안 된
+  PC 의 옛 평문을 "우리 것"으로 알아보고 지운다) → 옛 키 폐기. 켜져 있는 앱은 다음 "키 무효" 응답 때, 나머지는 다음 실행 때 따라온다
+- 남은 숙제(2026-10-08 기준): 전 PC 가 0801 이상이 되면 `ENROLL_OPEN="0"`(wrangler.toml) → 키 4종 교체 → 업체별 사용 한도
 
 - Gemini는 10 RPM → 앱이 8 RPM으로 스로틀. **결제 미연결 시 Studio 429(limit:0) + Vertex 403(BILLING_DISABLED)**
 - **GPT Image 2.5 (2026-09-08)**: sunburst(편집 정밀도) / flare(빠른 생성). 크기 규칙은 gpt-image-2와
@@ -295,7 +343,8 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 
 ### 6.2 맥 (소스 실행)
 - `NanoBanana.command` 더블클릭 → `server_mac.py` → Flask를 기본 브라우저로
-- 키는 `keys.env` (앱 폴더 → `~/.nanobanana/` 순으로 탐색). 상대경로 서비스계정 JSON 자동 해석
+- 키는 윈도우와 같이 게이트웨이에서 받는다(사본은 로그인 키체인 "NanoBanana"). `keys.env` 는 회사 게이트웨이를 안 쓰는
+  설치용으로만 남았고, 회사 맥에선 업데이트 후 키 줄이 자동으로 지워진다(상대경로 서비스계정 JSON 도 해석해서 정리)
 - **python.org Python 3.10+ 필수.** Xcode 내장 3.9는 google-genai 1.47까지만 설치돼
   `image_size`(2K/4K)가 없어 Gemini가 즉사한다 → 앱이 시작 시 안내 후 종료
 - **SSL**: python.org 파이썬은 `Install Certificates.command` 를 안 돌리면 CA 번들이 비어
@@ -334,14 +383,19 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 | `finish_reason: NO_IMAGE` 반복 | 모델(특히 Lite)이 이미지를 안 내놓음 | 재시도 때 시드 재발급 + 다른 프로바이더 폴백. 잦으면 Flash/Pro로 |
 | 다른 탭 갔다 오니 스켈레톤이 사라짐 | 스켈레톤이 프로젝트 소유가 아니었음 | `/api/gallery`의 `outstanding`에서 개수를 유도 (적용됨) |
 | `/api/*` 403 | CSRF 토큰 없음 | `api()` 헬퍼 사용 |
+| 새 PC 화면 위에 4자리 번호, 생성 안 됨 | 아직 승인 전 (출입증 없음) | 관리자 페이지 PC 탭 → 잠금 해제 → 번호 승인 (§2.1) |
+| 옛 EXE 가 "API 자격증명 없음" 으로 안 켜짐 | 0801 이전 launcher 의 환경변수 검사 + 키 없는 PC | 최신 EXE 로 교체 (정리된 PC 는 표시값 덕에 옛 EXE 도 켜진다) |
+| 테스트가 개발 PC 환경변수 키를 못 찾음 | 0801 이 이 PC 도 정리함(정상) | 실키 테스트는 게이트웨이 + 일회용 신원(nb-selftest), 끝나면 KV·D1 정리 |
 | Program Files 설치 사용자 | UAC로 자기교체 불가 | 일반 폴더로 이동 안내 |
 
 ---
 
 ## 8. 사용자 배포 (재판매)
 
-**Windows**: `NanoBanana.exe` + 키 설치 bat 2개 파일. 같은 폴더에 두고 bat 1회 실행 후 EXE 더블클릭.
+**Windows**: **최신** `NanoBanana.exe` 하나(릴리스 페이지에서 그날 받은 것). 키 설치 bat 은 폐기.
+실행하면 화면 위에 4자리 번호 → 관리자 페이지 PC 탭(잠금 해제) → 번호 입력 → 승인. 몇 초 뒤 사용 가능.
 Program Files 아래는 피할 것. 이후 업데이트는 **껐다 켜기만 하면 자동**.
+⚠ 옛날 EXE 를 주면 안 된다 — 0801 이전 버전은 환경변수 키가 없으면 시작을 거부해 업데이트도 못 받는다.
 
 **맥**: 저장소 clone + `pip3 install -r requirements_mac.txt` + `keys.env` 배치 →
 `NanoBanana.command` 더블클릭. 상세는 `맥_실행_가이드.md`.

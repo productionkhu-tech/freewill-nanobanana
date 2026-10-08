@@ -13,7 +13,9 @@ description: NanoBanana 정식 배포(릴리스) 절차 전체 — VERSION bump 
 - `GH_TOKEN` 환경변수 (GitHub 토큰) — 없으면 릴리스 생성/업로드 불가, 사용자에게 요청
 - 빌드 venv: `C:\NanoBanana_build\venv\Scripts\python.exe` (CLAUDE.md의 venv_build 표기는 낡은 것)
 - 릴리스 저장소: `productionkhu-tech/freewill-nanobanana`
-- (Reve는 2026-09 서비스 종료로 제거됨 — 키 주입 불필요. 나머지 키는 setx로 이미 사용자 환경변수에 있음)
+- (Reve는 2026-09 서비스 종료로 제거됨.) 프로바이더 키는 v2026-10-0801 부터 **게이트웨이 시크릿에만** 있다 —
+  빌드에는 키가 필요 없고, 이 PC 환경변수에도 더는 없다(0801 이 정리함). 실키가 필요한 테스트는 게이트웨이에서
+  일회용 신원(nb-selftest)으로 받고 끝나면 KV·D1 을 치울 것 (CLAUDE.md §2.1, 규칙 17·23)
 
 ## 1. VERSION bump
 
@@ -31,8 +33,11 @@ node --check static\app.js
 & "C:\NanoBanana_build\venv\Scripts\python.exe" -m py_compile app.py
 & "C:\NanoBanana_build\venv\Scripts\python.exe" -m py_compile launcher.py
 & "C:\NanoBanana_build\venv\Scripts\python.exe" -m py_compile updater.py
+& "C:\NanoBanana_build\venv\Scripts\python.exe" -m py_compile nb_gateway.py
 # 동기화 (변경된 파일 + VERSION은 항상)
-Copy-Item ".\app.py",".\launcher.py",".\updater.py",".\VERSION" "C:\NanoBanana_build\src\" -Force
+# ⚠ nb_gateway.py 도 반드시 — 2026-10-08 까지 이 목록에 없었다. 그 파일이 9/17 이후 안 바뀐 동안만
+#   우연히 맞았고, 바뀐 채로 빌드했다면 옛 모듈이 들어가 앱이 키를 못 받았을 것이다.
+Copy-Item ".\app.py",".\launcher.py",".\updater.py",".\nb_gateway.py",".\VERSION" "C:\NanoBanana_build\src\" -Force
 Copy-Item ".\static\app.js",".\static\style.css" "C:\NanoBanana_build\src\static\" -Force
 Copy-Item ".\templates\index.html",".\templates\viewer.html",".\templates\prompt_popup.html" "C:\NanoBanana_build\src\templates\" -Force
 # 클린 빌드 (캐시 재사용 금지 — Remove-Item은 훅 오해 방지를 위해 개별 명령으로)
@@ -243,3 +248,5 @@ Start-Process ".\dist\NanoBanana\NanoBanana.exe"
 | 날짜를 넘겨 공개 | 버전은 **공개하는 날** 기준. 빌드 후 자정을 넘기면 VERSION 을 새 날짜 01 로 고쳐 다시 빌드 (2026-09-24: 2302 → 2401) |
 | 공개 직후 E2E 가 "업데이트 안 함" 으로 FAIL | 앱의 비인증 `/releases/latest` 응답이 `Cache-Control: max-age=60` — 공개 후 60초 안에 켜진 구버전은 아직 자기가 최신인 줄 안다. **공개 후 1분 넘게 기다렸다 E2E** (2026-09-28 2401→2801 첫 시도 FAIL, 몇 분 뒤 9초 PASS). 교체 로그에 `--updater start` 가 없으면 이 경우다 |
 | 스크래치 테스트가 사라짐 | Windows 저장 공간 센스가 임시 폴더를 정리한다(세션 scratchpad 포함). 오래 둘 테스트는 임시 폴더 밖에 둘 것 |
+| E2E 뒤 이 PC 환경변수 키가 사라짐 | 정상 — 0801+ 는 실제 데이터 폴더로 켜지면 이 PC 도 평문 정리를 한다. 그 뒤 옛 EXE 로 하는 E2E 는 `NANOBANANA_STUDIO_KEY=managed-by-gateway` 표시 덕에 부팅하므로 오히려 "정리된 PC 에서 옛 EXE 가 스스로 업데이트되나" 까지 같이 검증된다 |
+| 테스트 빌드를 사용자 PC 에서 미리 띄울 때 | `NANOBANANA_DATA_DIR`(+사용량 집계를 살리려면 `NANOBANANA_USAGE_UPLOAD=1`)로 띄우면 평문 정리가 안 돈다 — 배포 전에 사용자의 기존 앱(구버전)을 망가뜨리지 않는다. 새 PC 흉내는 키 환경변수를 지운 프로세스로 띄우면 승인 번호가 뜬다 |

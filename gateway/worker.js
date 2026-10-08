@@ -536,6 +536,16 @@ async function handleAdmin(request, env, path) {
       const r = await env.USAGE_DB.prepare("SELECT token_id, name FROM pc_names").all();
       for (const x of r.results || []) now[x.token_id] = x.name;
     } catch {}
+    // 평문 키 정리 상태 (/report). 행이 없으면 아직 새 버전으로 켜지지 않은 PC.
+    const plain = {};
+    try {
+      const r = await env.USAGE_DB.prepare("SELECT token_id, left_json, checked_at FROM pc_plain").all();
+      for (const x of r.results || []) {
+        let l = [];
+        try { l = JSON.parse(x.left_json) || []; } catch {}
+        plain[x.token_id] = { left: l, at: x.checked_at };
+      }
+    } catch {}
     const rows = [];
     for (const k of list.keys) {
       const v = await env.NB_TOKENS.get(k.name);
@@ -550,6 +560,8 @@ async function handleAdmin(request, env, path) {
         app_version: r.app_version || "",
         key_fetches: r.key_fetches || 0, last_key_fetch: r.last_key_fetch || null,
         last_ip: r.last_ip || null,
+        plain_left: plain[r.token_id] ? plain[r.token_id].left : null,
+        plain_checked_at: plain[r.token_id] ? plain[r.token_id].at : null,
       });
     }
     rows.sort((a, b) => (a.issued_at < b.issued_at ? -1 : 1));
@@ -1937,23 +1949,51 @@ async function loadPcs() {
   // PC 이름을 바꿨으면 "새 이름 (처음 이름)" — 사용량 탭의 PC 보기와 같은 규칙.
   const name = t => (t.current_name && t.current_name !== t.machine)
     ? (t.current_name + " (" + t.machine + ")") : (t.machine || "?");
+  // 평문 키가 남은 PC 를 맨 위로, 끊긴 PC 는 맨 아래로.
+  const rank = t => t.revoked ? 2 : (Array.isArray(t.plain_left) && t.plain_left.length) ? 0 : 1;
   const rows = (d.tokens || []).slice().sort((a, b) =>
-    (a.revoked === b.revoked ? 0 : a.revoked ? 1 : -1) || name(a).localeCompare(name(b), "ko", { numeric: true }));
+    (rank(a) - rank(b)) || name(a).localeCompare(name(b), "ko", { numeric: true }));
   if (!rows.length) { el.innerHTML = '<div class="empty">등록된 PC 가 없습니다.</div>'; return; }
-  const live = rows.filter(t => !t.revoked).length;
-  el.innerHTML = '<div class="sub" style="margin-bottom:8px">사용 중 ' + live + '대'
-    + (rows.length > live ? ' · 끊김 ' + (rows.length - live) + '대' : '') + '</div>'
-    + '<table><thead><tr><th>PC</th><th>윈도우 사용자</th><th>앱 버전</th><th>마지막 실행</th><th>상태</th><th></th></tr></thead><tbody>'
+  const live = rows.filter(t => !t.revoked);
+  const nClean = live.filter(t => Array.isArray(t.plain_left) && !t.plain_left.length).length;
+  const nLeft = live.filter(t => Array.isArray(t.plain_left) && t.plain_left.length).length;
+  el.innerHTML = '<div class="sub" style="margin-bottom:8px">사용 중 ' + live.length + '대'
+    + (rows.length > live.length ? ' · 끊김 ' + (rows.length - live.length) + '대' : '')
+    + ' &nbsp;|&nbsp; 평문 키: <span class="ok">정리됨 ' + nClean + '</span>'
+    + (nLeft ? ' · <span class="pill">남음 ' + nLeft + '</span>' : ' · 남음 0')
+    + ' · 확인 전 ' + (live.length - nClean - nLeft) + '</div>'
+    + '<table><thead><tr><th>PC</th><th>윈도우 사용자</th><th>앱 버전</th><th>마지막 실행</th><th>상태</th><th>평문 키</th><th></th></tr></thead><tbody>'
     + rows.map(t => '<tr' + (t.revoked ? ' class="muted"' : '') + '><td><b>' + esc(name(t)) + '</b></td><td>' + esc(t.user)
       + '</td><td class="muted">' + esc(t.app_version || "") + '</td><td class="muted">'
       + esc(kst(t.last_key_fetch || t.issued_at)) + '</td><td>'
       + (t.revoked ? '끊김' + (t.revoked_at ? ' <span class="muted">' + esc(kst(t.revoked_at)) + '</span>' : '')
                    : '<span class="ok">사용 중</span>')
+      + '</td><td>' + plainCell(t)
       + '</td><td class="num">'
       + (t.revoked ? '' : '<button class="ghost" data-revoke="' + esc(t.token_id) + '" data-name="' + esc(name(t)) + '">끊기</button>')
       + '</td></tr>').join("") + '</tbody></table>';
   el.querySelectorAll("button[data-revoke]").forEach(b => { b.onclick = () => revokePc(b.dataset.revoke, b.dataset.name); });
   renderLock();
+}
+// 평문 키 칸: null = 아직 새 버전(0802+)으로 안 켜짐, [] = 정리됨, [...] = 남은 것의 이름(값은 오지 않는다)
+function plainName(x) {
+  if (x === "file:service_account.json") return "Vertex 키 파일";
+  if (x.indexOf("installer-bat x") === 0) return "키 설치 bat " + x.slice(15) + "개";
+  let s = x, tag = "";
+  if (s.indexOf("SYSTEM:") === 0) { s = s.slice(7); tag = " (시스템 변수 — 관리자 권한으로 지워야 함)"; }
+  if (s.indexOf("keys.env:") === 0) { s = s.slice(9); tag = " (맥 keys.env)"; }
+  if (s.slice(-1) === "?") { s = s.slice(0, -1); tag += " (회사 키인지 모르는 값)"; }
+  return s + tag;
+}
+function plainCell(t) {
+  if (t.revoked) return "";
+  if (t.plain_left == null) {
+    return '<span class="muted" title="이 PC 가 새 버전(v2026-10-0802 이상)으로 켜지면 표시됩니다">확인 전</span>';
+  }
+  if (!t.plain_left.length) return '<span class="ok">정리됨</span>';
+  const names = t.plain_left.map(plainName);
+  return '<span class="pill">남음 ' + names.length + '</span>'
+    + '<div class="muted" style="font-size:11px;margin-top:3px;max-width:260px">' + esc(names.join(", ")) + '</div>';
 }
 async function revokePc(id, nm) {
   if (!confirm(nm + " 을(를) 끊을까요?" + NL + NL
@@ -2346,6 +2386,27 @@ export default {
     // Vertex 1시간짜리 출입증. 앱의 google-auth 가 만료 전에 알아서 다시 부른다.
     if (path === "/vertex-token" && request.method === "POST") {
       return handleVertexToken(request, env);
+    }
+    // 이 PC 에 평문 키가 남았는지 — 이름만 온다. 관리자 페이지 PC 탭의 "평문 키" 칸.
+    if (path === "/report" && request.method === "POST") {
+      const g = await tokenRecord(request, env);
+      if (!g.ok) return json({ ok: false, error: g.error }, g.status);
+      let b;
+      try { b = await request.json(); } catch { return json({ ok: false, error: "bad request" }, 400); }
+      // 이름 모양만 받는다(값이 섞여 들어오지 않게). 앱이 보내는 형식: NAME, NAME?, SYSTEM:NAME,
+      // keys.env:NAME, file:service_account.json, installer-bat xN
+      // 대문자 변수 이름 꼴만 통과 — 키 값(소문자가 섞인 AIza…, sk-…, ark-…)은 모양부터 걸러진다.
+      const NAME_RE = /^(SYSTEM:|keys\.env:)?[A-Z][A-Z0-9_]{2,40}\??$|^file:[A-Za-z0-9_.-]{1,40}$|^installer-bat x[0-9]{1,3}$/;
+      const left = (Array.isArray(b.plain_left) ? b.plain_left : [])
+        .map((x) => String(x))
+        .filter((x) => NAME_RE.test(x))
+        .slice(0, 40);
+      await env.USAGE_DB.prepare(
+        `INSERT INTO pc_plain (token_id, left_json, checked_at, app_version) VALUES (?,?,?,?)
+         ON CONFLICT(token_id) DO UPDATE SET left_json = excluded.left_json,
+           checked_at = excluded.checked_at, app_version = excluded.app_version`)
+        .bind(g.tokenId, JSON.stringify(left), nowIso(), String(b.app_version || "").slice(0, 32)).run();
+      return json({ ok: true });
     }
     // 앱이 실행 때 받아가는 팀/프로젝트 목록 — 토큰이 있어야 한다.
     if (path === "/catalog" && request.method === "GET") {

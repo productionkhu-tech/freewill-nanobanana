@@ -502,25 +502,11 @@ def show_error_and_exit(title, message):
     sys.exit(1)
 
 
-def check_api_env():
-    """Verify required API credentials are present; abort with dialog if not."""
-    studio_key = os.environ.get("NANOBANANA_STUDIO_KEY", "").strip()
-    vertex_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-    vertex_project = os.environ.get("NANOBANANA_PROJECT_ID", "").strip()
-
-    has_studio = bool(studio_key)
-    has_vertex = bool(vertex_creds) and os.path.isfile(vertex_creds) and bool(vertex_project)
-
-    if not (has_studio or has_vertex):
-        show_error_and_exit(
-            "NanoBanana - API 자격증명 없음",
-            "API 환경변수가 설정되지 않아 앱을 시작할 수 없습니다.\n\n"
-            "필요한 환경변수 (하나 이상):\n"
-            "  • NANOBANANA_STUDIO_KEY  (Google AI Studio)\n"
-            "  • GOOGLE_APPLICATION_CREDENTIALS + NANOBANANA_PROJECT_ID  (Vertex AI)\n\n"
-            "배포 패키지에 포함된 setup_env.bat 을 관리자 권한으로 실행한 후\n"
-            "컴퓨터를 재시작하거나 새 터미널/탐색기 세션을 열어주세요."
-        )
+# There is no "API credentials missing" check here any more. Keys come from the
+# key server after the window is up (app._init_keys), and a PC without them shows
+# its approval number on screen. The old check aborted before the window — and
+# before the update check — so a PC without environment keys could never start,
+# let alone update itself out of the problem.
 
 
 class JsApi:
@@ -866,9 +852,6 @@ def main():
     if not acquire_single_instance():
         print("  Another instance is already running - focused and exiting.")
         sys.exit(0)
-
-    # Verify API credentials — abort if missing
-    check_api_env()
 
     # Warn (don't abort) if installed under Program Files. The auto-updater
     # can't overwrite the EXE there without UAC, so a user stuck there would

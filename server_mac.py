@@ -35,9 +35,10 @@ def load_keys():
     ]
     path = next((p for p in candidates if os.path.isfile(p)), None)
     if not path:
-        print("[NanoBanana] keys.env not found.")
-        print("  -> Put keys.env (and service_account.json) in this folder or in")
-        print("     ~/.nanobanana/, or copy keys.env.example to keys.env.")
+        # Normal now: keys come from the key server and live in memory (a new Mac
+        # shows an approval number in the app). keys.env is only for setups that
+        # are not on the company key server.
+        print("[NanoBanana] no keys.env - keys come from the key server.")
         return
     base = os.path.dirname(path)
     with open(path, "r", encoding="utf-8") as f:

@@ -2009,3 +2009,33 @@ footer {
 }
 .mp-res { font-size: 11px; height: 24px; }
 .mp-res:disabled { opacity: .45; }
+
+/* Key server banner: the approval number a new PC shows (app.js renderGwBanner).
+   Reading it out is all anyone does with it, so it never blocks a click. */
+.gw-banner {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9600;
+  max-width: 560px;
+  padding: 14px 24px;
+  border-radius: 14px;
+  background: #2b241c;
+  border: 1px solid var(--accent);
+  color: var(--text);
+  text-align: center;
+  box-shadow: 0 6px 24px rgba(0,0,0,.45);
+  pointer-events: none;
+}
+.gw-banner.warn { background: #2a1f1f; border-color: #c97a6a; }
+.gw-banner .gw-title { font-size: 13px; font-weight: 600; }
+.gw-banner .gw-code {
+  margin: 6px 0 2px;
+  font-family: Consolas, "SF Mono", monospace;
+  font-size: 34px;
+  font-weight: 700;
+  letter-spacing: 8px;
+  color: var(--accent);
+}
+.gw-banner .gw-sub { margin-top: 4px; font-size: 11px; color: #b9b9c0; }

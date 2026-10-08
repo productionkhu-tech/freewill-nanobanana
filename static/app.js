@@ -4180,6 +4180,7 @@ async function refreshApiStatus() {
   }
   const seedreamDot = document.getElementById("seedreamDot");
   if (seedreamDot) seedreamDot.className = "dot " + (d.seedream || "disconnected");
+  renderGwBanner(d.gw);
   _anyGenerating = !!d.any_generating;
   // Status is always the ACTIVE project's, so the placeholder count follows the
   // tab on screen: a background batch never steals or clears them.
@@ -4194,6 +4195,57 @@ async function refreshApiStatus() {
     ? d.current_project.split(/[\\/]/).pop().replace(/\.json$/i, "")
     : "";
   updateTitleDirty(!!d.project_dirty, projName);
+}
+
+// ==========================================
+// Key server banner — approval number / cut off / can't reach
+// ==========================================
+// 키는 PC 에 평문으로 두지 않고 키 서버가 준다. 승인 전인 새 PC 는 여기 번호가 뜨고,
+// 관리자가 그 번호를 관리자 페이지에 넣으면 몇 초 뒤 저절로 사라진다.
+// 클릭을 가로채지 않는다(pointer-events: none) — 읽어 주기만 하면 되는 안내다.
+let _gwPrevState = "";
+function renderGwBanner(gw) {
+  gw = gw || {};
+  const st = gw.state || "";
+  let el = document.getElementById("gwBanner");
+  const visible = st === "pending" || st === "revoked" || st === "denied" || st === "error";
+  if (!visible) {
+    if (el) el.remove();
+    if ((_gwPrevState === "pending" || _gwPrevState === "revoked") && st === "ok") {
+      showToast("승인됐어요 — 이제 이미지를 만들 수 있어요", "success");
+    }
+    _gwPrevState = st;
+    return;
+  }
+  _gwPrevState = st;
+  const code = gw.code || "";
+  const key = st + "|" + code + "|" + (gw.msg || "");
+  if (el && el.dataset.k === key) return;          // 그대로면 다시 그리지 않는다
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "gwBanner";
+    document.body.appendChild(el);
+  }
+  el.dataset.k = key;
+  el.className = "gw-banner" + (st === "pending" ? "" : " warn");
+  el.textContent = "";
+  const add = (cls, text) => {
+    const div = document.createElement("div");
+    div.className = cls;
+    div.textContent = text;
+    el.appendChild(div);
+  };
+  if (st === "pending" || (st === "revoked" && code)) {
+    add("gw-title", st === "pending" ? "이 PC는 아직 관리자 승인 전이에요" : (gw.msg || "이 PC는 사용이 중지됐어요"));
+    if (code) {
+      add("gw-code", code);
+      add("gw-sub", "관리자에게 이 번호를 알려 주세요 · 관리자 페이지 → PC 탭 → 새 PC 승인");
+    } else {
+      add("gw-sub", "승인 요청을 보내는 중이에요…");
+    }
+  } else {
+    add("gw-title", gw.msg || "키 서버에 연결하지 못했어요");
+  }
 }
 
 // ==========================================

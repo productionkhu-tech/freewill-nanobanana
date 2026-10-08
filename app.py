@@ -308,15 +308,26 @@ def _seedream_custom_size(model, w, h):
     return w, h, notes
 
 
+# The endpoint ids the installers used to write into the environment were these
+# same defaults. The key cleanup removes such a variable only when it still holds
+# the default, so a deliberate override is left alone.
+_ARK_ENDPOINT_DEFAULTS = {
+    "ARK_SEEDREAM_PRO_ENDPOINT": "dola-seedream-5-0-pro-260628",
+    "ARK_SEEDREAM_45_ENDPOINT": "seedream-4-5-251128",
+}
+
+
 def _seedream_endpoint(model):
     """Map an internal model id to the id we actually send to BytePlus. Some
     models are not callable by their raw Model ID on a given account and need a
     custom inference Endpoint ID (e.g. 'dola-seedream-5-0-pro-260628'). Kept
     overridable via env so resellers can point at their own endpoint."""
     if model == "seedream-5-0-pro-260628":
-        return os.environ.get("ARK_SEEDREAM_PRO_ENDPOINT", "dola-seedream-5-0-pro-260628")
+        return os.environ.get("ARK_SEEDREAM_PRO_ENDPOINT",
+                              _ARK_ENDPOINT_DEFAULTS["ARK_SEEDREAM_PRO_ENDPOINT"])
     if model == "seedream-4-5-251128":
-        return os.environ.get("ARK_SEEDREAM_45_ENDPOINT", "seedream-4-5-251128")
+        return os.environ.get("ARK_SEEDREAM_45_ENDPOINT",
+                              _ARK_ENDPOINT_DEFAULTS["ARK_SEEDREAM_45_ENDPOINT"])
     return model
 
 
@@ -617,8 +628,9 @@ def _to_rgb_flatten(img, bg_color=(255, 255, 255)):
         return img.convert("RGB")
 
 # ==========================================
-# API Credentials — read from environment variables
-# Run setup_env.bat to configure these.
+# API Credentials — from the key server at startup, held in memory only
+# (see "provider keys" near init_app). The installer .bat files and the
+# environment variables they set are retired; old copies are erased.
 # ==========================================
 
 # ==========================================
@@ -694,6 +706,12 @@ class _Shared:
         # conclusion when the real answer is "the office server is not
         # reachable from here".
         self.openai_detail = ""
+        # Key server state for the banner: "" (starting) | ok | offline | pending
+        # (waiting for the admin; gw_code is the number on screen) | denied |
+        # revoked | error. gw_msg is the plain-language line under it.
+        self.gw_state = ""
+        self.gw_code = ""
+        self.gw_msg = ""
 
         # One log pane for the whole app (generation lines carry their project
         # name when more than one tab is open).
@@ -975,104 +993,8 @@ class AppState:
                         pass
         except Exception:
             pass
-        # Vertex AI — requires GOOGLE_APPLICATION_CREDENTIALS + NANOBANANA_PROJECT_ID
-        creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
-        project_id = os.environ.get("NANOBANANA_PROJECT_ID", "")
-        location = os.environ.get("NANOBANANA_LOCATION", "global")
-
-        if creds_path and os.path.isfile(creds_path) and project_id:
-            try:
-                self.client_vertex = genai.Client(
-                    vertexai=True, project=project_id, location=location
-                )
-                self.log("Vertex AI connected")
-                self.vertex_status = "connected"
-            except Exception as e:
-                self.log(f"Vertex error: {e}")
-                self.vertex_status = "error"
-        else:
-            self.log("Vertex AI: credentials not configured (skipped)")
-            self.vertex_status = "disconnected"
-
-        # AI Studio — requires NANOBANANA_STUDIO_KEY
-        studio_key = os.environ.get("NANOBANANA_STUDIO_KEY", "")
-        if studio_key:
-            try:
-                self.client_studio = genai.Client(api_key=studio_key)
-                self.log("AI Studio connected")
-                self.studio_status = "connected"
-            except Exception as e:
-                self.log(f"Studio error: {e}")
-                self.studio_status = "error"
-        else:
-            self.log("AI Studio: key not configured (skipped)")
-            self.studio_status = "disconnected"
-
-        # OpenAI. Before anything else, ask the key server whether this machine
-        # is holding the current key — it proves itself with the key it already
-        # has. That is what replaced walking to 70 desks every time a key
-        # changes: change it in one place, and each app collects it on its next
-        # start. A key that comes back broken is discarded rather than
-        # installed, so a bad answer can never take a working machine offline.
-        changed = False
-        try:
-            def _key_works(candidate):
-                if _OpenAI is None:
-                    return True
-                try:
-                    _OpenAI(api_key=candidate).models.list()
-                    return True
-                except Exception:
-                    return False
-
-            os.environ.setdefault("NANOBANANA_APP_VERSION", _read_version())
-            changed, msg = _nbgw.refresh_provider_key(
-                _user_data_dir(), log=self.log, validate=_key_works)
-            if msg and msg != "ok":
-                self.log(f"OpenAI: {msg}")
-        except Exception as e:
-            self.log(f"key refresh error: {str(e)[:100]}")
-
-        # Generation talks to OpenAI directly, exactly as it always has. The key
-        # server only supplies the key; routing images through it would put a
-        # relay in the middle of a two-minute 4K render for no benefit.
-        openai_key = os.environ.get("OPENAI_API_KEY", "")
-        if openai_key and _OpenAI is not None:
-            if changed:
-                self.openai_detail = "서버에서 받은 키로 연결됨"
-            try:
-                self.client_openai = _OpenAI(api_key=openai_key)
-                self.log("OpenAI connected")
-                self.openai_status = "connected"
-                # 부팅 직후 백그라운드로 가벼운 연결 자가진단.
-                threading.Thread(target=self._openai_selftest, daemon=True).start()
-            except Exception as e:
-                self.log(f"OpenAI error: {e}")
-                self.openai_status = "error"
-        elif openai_key and _OpenAI is None:
-            self.log("OpenAI: openai package not installed (pip install openai)")
-            self.openai_status = "error"
-        else:
-            self.log("OpenAI: key not configured (skipped)")
-            self.openai_status = "disconnected"
-
-        # Seedream (BytePlus ModelArk) — requires ARK_API_KEY. OpenAI-SDK-compatible
-        # endpoint, so we reuse the openai client library with a BytePlus base_url.
-        ark_key = os.environ.get("ARK_API_KEY", "")
-        if ark_key and _OpenAI is not None:
-            try:
-                self.client_seedream = _OpenAI(base_url=SEEDREAM_BASE_URL, api_key=ark_key)
-                self.log("Seedream (BytePlus) connected")
-                self.seedream_status = "connected"
-            except Exception as e:
-                self.log(f"Seedream error: {e}")
-                self.seedream_status = "error"
-        elif ark_key and _OpenAI is None:
-            self.log("Seedream: openai package not installed")
-            self.seedream_status = "error"
-        else:
-            self.log("Seedream: ARK_API_KEY not configured (skipped)")
-            self.seedream_status = "disconnected"
+        # Provider keys: from the key server, held in memory only. See _init_keys.
+        _init_keys()
 
     def _openai_selftest(self):
         """앱 부팅 직후 OpenAI 연결을 1회 점검. models.list()는 무과금.
@@ -1112,7 +1034,7 @@ class AppState:
                     self.openai_detail = ("이 PC 의 키로는 OpenAI 에 직접 접근할 수 없습니다. "
                                           "서버를 통해 쓰는 구조라면 서버 연결을 확인하세요.")
             elif "invalid_api_key" in low or "incorrect api key" in low:
-                self.log("OpenAI: API key rejected - reinstall the key")
+                self.log("OpenAI: API key rejected - the key on the key server needs replacing")
             elif "insufficient_quota" in low or "billing" in low:
                 self.log("OpenAI: account has no usable quota - check billing")
 
@@ -1171,7 +1093,8 @@ class AppState:
     def should_fallback(self, provider, err_text):
         err_lower = err_text.lower()
         if provider == "studio":
-            return self.is_retryable_error(err_text)
+            # A rejected Studio key is exactly when the Vertex path should take over.
+            return self.is_retryable_error(err_text) or _is_auth_error(err_text)
         if provider == "vertex":
             return "invalid_grant" in err_lower or self.is_retryable_error(err_text)
         return False
@@ -1213,6 +1136,9 @@ class AppState:
                     self.log(f"-> {self.get_provider_label(next_p)} fallback")
                     continue
                 break
+        if not errors:
+            # No client at all (the PC was cut off mid-batch, or keys never arrived).
+            raise RuntimeError(_no_client_error("Gemini"))
         raise RuntimeError(f"All providers failed: {'; '.join(errors)}")
 
     def extract_image_from_response(self, resp):
@@ -2276,6 +2202,12 @@ class AppState:
             limiter = self.openai_rate_limiter
             if limiter and not limiter.acquire(should_cancel=lambda: self.cancel_flag):
                 return {"status": "cancelled", "index": idx, "seed": seed}
+            keys_before = _keys_rt["ids"]
+            # Read per attempt: a key reload may have swapped it, or a cut-off dropped it.
+            client = self.client_openai
+            if client is None:
+                return {"status": "failed", "index": idx, "seed": seed,
+                        "error": _no_client_error("OpenAI"), "elapsed": time.time() - start}
             try:
                 self.log(f"{label} requesting...")
                 t = time.time()
@@ -2287,7 +2219,7 @@ class AppState:
                 if img_cfg.get("output_format"):
                     extra["output_format"] = img_cfg["output_format"]
                 if ref_payloads:
-                    result = self.client_openai.images.edit(
+                    result = client.images.edit(
                         model=model,
                         image=self._openai_file_tuples(ref_payloads),
                         prompt=prompt,
@@ -2298,7 +2230,7 @@ class AppState:
                         **extra,
                     )
                 else:
-                    result = self.client_openai.images.generate(
+                    result = client.images.generate(
                         model=model,
                         prompt=prompt,
                         size=size,
@@ -2345,6 +2277,11 @@ class AppState:
                     cause = nxt
                     depth += 1
                 self.log(f"{label} failed: {detail[:400]}")
+                # The key was changed on the key server (rotation): pick it up and
+                # go again right away instead of failing every image until a restart.
+                if _is_auth_error(detail) and attempt < max_retries - 1 and \
+                        _keys_changed_since(keys_before, label):
+                    continue
                 if self.is_retryable_error(err) and attempt < max_retries - 1:
                     wt = delay + random.uniform(2, 8)
                     self.log(f"[{idx+1}] Retryable error. Wait {wt:.0f}s (retry {attempt+1}/{max_retries})")
@@ -2367,7 +2304,7 @@ class AppState:
         self.log(f"[{idx+1}/{total}] Queued on {label} ({model}, size {size})")
         if not self.client_seedream:
             return {"status": "failed", "index": idx, "seed": seed,
-                    "error": "Seedream not connected (set ARK_API_KEY)", "elapsed": 0.0}
+                    "error": "Seedream not connected", "elapsed": 0.0}
         # [Image N] -> "image N" so Seedream's positional referencing works.
         prompt_s = _seedream_prompt(prompt)
         # Method 2: convey the aspect ratio in the prompt so the model maps it to
@@ -2397,10 +2334,15 @@ class AppState:
             limiter = self.seedream_rate_limiter
             if limiter and not limiter.acquire(should_cancel=lambda: self.cancel_flag):
                 return {"status": "cancelled", "index": idx, "seed": seed}
+            keys_before = _keys_rt["ids"]
+            client = self.client_seedream
+            if client is None:
+                return {"status": "failed", "index": idx, "seed": seed,
+                        "error": _no_client_error("Seedream"), "elapsed": time.time() - start}
             try:
                 self.log(f"{label} requesting...")
                 t = time.time()
-                result = self.client_seedream.images.generate(**kwargs)
+                result = client.images.generate(**kwargs)
                 self.log(f"{label} OK ({time.time()-t:.1f}s)")
                 data_list = getattr(result, "data", None) or []
                 if not data_list:
@@ -2424,6 +2366,9 @@ class AppState:
                     return {"status": "cancelled", "index": idx, "seed": seed}
                 detail = f"{type(e).__name__}: {err}"
                 self.log(f"{label} failed: {detail[:400]}")
+                if _is_auth_error(detail) and attempt < max_retries - 1 and \
+                        _keys_changed_since(keys_before, label):
+                    continue
                 if self.is_retryable_error(err) and attempt < max_retries - 1:
                     wt = delay + random.uniform(2, 8)
                     if not self.sleep_with_cancel(wt):
@@ -2494,6 +2439,7 @@ class AppState:
         for attempt in range(max_retries):
             if self.cancel_flag:
                 return _end({"status": "cancelled", "index": idx, "seed": seed})
+            keys_before = _keys_rt["ids"]
             try:
                 resp, api_used = self.call_api(model, contents, config, preferred_provider=preferred)
                 elapsed = time.time() - start
@@ -2547,6 +2493,9 @@ class AppState:
                 if err == "Cancelled":
                     return _end({"status": "cancelled", "index": idx, "seed": seed})
                 elapsed = time.time() - start
+                if _is_auth_error(err) and attempt < max_retries - 1 and \
+                        _keys_changed_since(keys_before, "Gemini"):
+                    continue
                 if self.is_retryable_error(err) and attempt < max_retries - 1:
                     wt = delay + random.uniform(2, 8)
                     self.log(f"[{idx+1}] Retryable error. Wait {wt:.0f}s (retry {attempt+1}/{max_retries})")
@@ -3373,6 +3322,9 @@ def api_status():
         # look at this, not at the visible tab alone.
         "any_generating": any_project_generating(),
         "openai_detail": state.openai_detail,
+        # 키 서버 상태: 승인 대기면 화면 위에 번호를 띄운다.
+        "gw": {"state": shared.gw_state, "code": shared.gw_code, "msg": shared.gw_msg,
+               "source": _keys_rt["source"]},
         "done": state.done_count,
         "failed": state.fail_count,
         "total": state.queue_count,
@@ -4550,13 +4502,13 @@ def start_generate():
 
     if is_openai:
         if not state.client_openai:
-            return jsonify({"ok": False, "error": "OpenAI not connected — set OPENAI_API_KEY"})
+            return jsonify({"ok": False, "error": _no_client_error("OpenAI")})
     elif is_seedream:
         if not state.client_seedream:
-            return jsonify({"ok": False, "error": "Seedream not connected — set ARK_API_KEY"})
+            return jsonify({"ok": False, "error": _no_client_error("Seedream")})
     else:
         if not state.client_vertex and not state.client_studio:
-            return jsonify({"ok": False, "error": "No API connected"})
+            return jsonify({"ok": False, "error": _no_client_error("Gemini")})
 
     # 비용 귀속이 확인되지 않은 탭은 생성하지 않는다. 이 검사가 없으면
     # 어디에 달아야 할지 모르는 이미지가 쌓이고, 나중에 소급할 방법이 없다.
@@ -6049,6 +6001,406 @@ def _restore_session():
         state.log(f"Opened {restored} project(s) at startup")
 
 
+# ---- provider keys -----------------------------------------------------------
+# 키는 PC 에 평문으로 두지 않는다 (2026-10). 앱은 켤 때 게이트웨이에서 키 전부를 받아
+# 메모리에만 든다. 게이트웨이가 안 될 때도 켜지게 사본 하나를 이 PC·이 윈도우 계정만
+# 풀 수 있게 암호화해 둔다(nb_gateway 금고). 생성은 예전처럼 프로바이더로 직접 간다 —
+# 키를 어디서 받느냐만 바뀌었고 생성 경로와 속도는 그대로다.
+#
+# 순서: 금고 사본으로 바로 켜고 → 뒤에서 게이트웨이에 새로 받아 바뀌었으면 교체.
+# 사본이 없으면(이 버전 첫 실행·새 PC) 게이트웨이를 기다리고, 그것도 안 되면 옛 설치가
+# 남긴 환경변수를 쓴다. 게이트웨이에서 새로 받은 게 확인되면 옛 평문 사본은 지운다.
+# 출입증이 없거나 끊긴 PC 는 관리자 승인을 요청하고 화면에 번호를 띄운다.
+# _apply_lock: clients + _keys_rt["ids"/"source"] change only under it, and ids is
+#   published AFTER the clients are swapped — a reader that sees new ids also sees
+#   the new clients, and two overlapping applies cannot leave them out of step.
+# _reload_lock: one key reload at a time; workers that hit an auth error meanwhile
+#   wait for it and then use its result instead of failing on the spot.
+# _keys_lock: only the enrolment-thread bookkeeping.
+_apply_lock = threading.Lock()
+_reload_lock = threading.Lock()
+_keys_lock = threading.Lock()
+_keys_rt = {"ids": None, "source": "", "reload_at": 0.0, "scrubbed": False,
+            "enroll_thread": None, "last_err": ""}
+_CUT_OFF_MSG = "이 PC는 관리자가 사용을 중지했습니다. 다시 쓰려면 승인을 받아야 합니다."
+
+
+def _set_gw(st, code="", msg=""):
+    shared.gw_state, shared.gw_code, shared.gw_msg = st, code or "", msg or ""
+
+
+def _keys_fingerprint(keys):
+    """What the clients were built from. The Vertex token is left out — it changes
+    every hour and the credentials object renews it by itself."""
+    import hashlib
+    vx = keys.get("vertex") or {}
+    raw = json.dumps([keys.get("openai") or "", keys.get("studio") or "", keys.get("ark") or "",
+                      vx.get("project") or "", vx.get("location") or "",
+                      vx.get("sa_email") or "", bool(vx.get("adc"))])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _legacy_env_keys():
+    """Keys an older installer left in this PC's environment (until they are erased)."""
+    studio = os.environ.get("NANOBANANA_STUDIO_KEY", "").strip()
+    if _nbgw.is_placeholder(studio):
+        studio = ""
+    keys = {"openai": os.environ.get("OPENAI_API_KEY", "").strip(), "studio": studio,
+            "ark": os.environ.get("ARK_API_KEY", "").strip(), "vertex": None}
+    creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    proj = os.environ.get("NANOBANANA_PROJECT_ID", "")
+    if creds and os.path.isfile(creds) and proj:
+        # adc: the SDK reads the key file named by the variable, as it always did
+        keys["vertex"] = {"project": proj, "adc": True,
+                          "location": os.environ.get("NANOBANANA_LOCATION", "global")}
+    if keys["openai"] or keys["studio"] or keys["ark"] or keys["vertex"]:
+        return keys
+    return None
+
+
+def _vertex_credentials(vx):
+    """Credentials that ask the key server for a fresh 1-hour token whenever the
+    current one is about to run out — google-auth calls the handler on its own.
+    Vertex is the backup path behind Studio, so this mostly never runs at all."""
+    import datetime as _dt
+    from google.oauth2.credentials import Credentials
+    from google.auth import exceptions as _gae
+
+    def _utcnow():
+        return _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+
+    def _refresh(request, scopes=None):
+        try:
+            tok, exp_in = _nbgw.vertex_token(_user_data_dir())
+        except _nbgw.GatewayError as e:
+            # "temporarily unavailable" lets the generation path treat it as a
+            # retryable failure and fall back, instead of failing the image.
+            raise _gae.RefreshError("vertex token temporarily unavailable (%s)" % e.kind)
+        return tok, _utcnow() + _dt.timedelta(seconds=max(0.0, exp_in - 30))
+
+    token, expiry = vx.get("token") or None, None
+    if token:
+        remain = float(vx.get("expires_at") or 0) - time.time()
+        if remain > 300:
+            expiry = _utcnow() + _dt.timedelta(seconds=remain - 30)
+        else:
+            token = None
+    return Credentials(token=token, expiry=expiry, refresh_handler=_refresh)
+
+
+def _apply_keys(keys, source):
+    """Build the provider clients from `keys`. Swaps them in place: a batch that is
+    already running keeps the client object it picked up; the next attempt reads
+    the new one. Returns True when anything was rebuilt."""
+    ids = _keys_fingerprint(keys)
+    with _apply_lock:
+        _keys_rt["source"] = source
+        if ids == _keys_rt["ids"]:
+            return False
+
+        vx = keys.get("vertex") or None
+        if vx and vx.get("project"):
+            try:
+                if vx.get("adc"):
+                    client = genai.Client(vertexai=True, project=vx["project"],
+                                          location=vx.get("location") or "global")
+                else:
+                    client = genai.Client(vertexai=True, project=vx["project"],
+                                          location=vx.get("location") or "global",
+                                          credentials=_vertex_credentials(vx))
+                shared.client_vertex = client
+                shared.vertex_status = "connected"
+                shared.vertex_session_disabled = False
+            except Exception as e:
+                shared.client_vertex = None
+                shared.vertex_status = "error"
+                state.log("Vertex error: %s" % str(e)[:100])
+        else:
+            shared.client_vertex = None
+            shared.vertex_status = "disconnected"
+
+        if keys.get("studio"):
+            try:
+                shared.client_studio = genai.Client(api_key=keys["studio"])
+                shared.studio_status = "connected"
+            except Exception as e:
+                shared.client_studio = None
+                shared.studio_status = "error"
+                state.log("Studio error: %s" % str(e)[:100])
+        else:
+            shared.client_studio = None
+            shared.studio_status = "disconnected"
+
+        openai_built = False
+        if keys.get("openai") and _OpenAI is not None:
+            try:
+                shared.client_openai = _OpenAI(api_key=keys["openai"])
+                shared.openai_status = "connected"
+                shared.openai_detail = ""
+                openai_built = True
+            except Exception as e:
+                shared.client_openai = None
+                shared.openai_status = "error"
+                state.log("OpenAI error: %s" % str(e)[:100])
+        else:
+            shared.client_openai = None
+            shared.openai_status = "error" if keys.get("openai") else "disconnected"
+
+        if keys.get("ark") and _OpenAI is not None:
+            try:
+                shared.client_seedream = _OpenAI(base_url=SEEDREAM_BASE_URL, api_key=keys["ark"])
+                shared.seedream_status = "connected"
+            except Exception as e:
+                shared.client_seedream = None
+                shared.seedream_status = "error"
+                state.log("Seedream error: %s" % str(e)[:100])
+        else:
+            shared.client_seedream = None
+            shared.seedream_status = "error" if keys.get("ark") else "disconnected"
+
+        _keys_rt["ids"] = ids            # published last, once the clients are in place
+
+    if openai_built:
+        # 부팅 직후 백그라운드로 가벼운 연결 자가진단 (무과금).
+        threading.Thread(target=state._openai_selftest, daemon=True).start()
+    have = [n for n, ok in (("Studio", shared.client_studio), ("Vertex", shared.client_vertex),
+                            ("OpenAI", shared.client_openai), ("Seedream", shared.client_seedream)) if ok]
+    state.log("keys from %s: %s" % (source, ", ".join(have) or "none"))
+    return True
+
+
+def _drop_all_keys(msg=_CUT_OFF_MSG):
+    """The admin cut this PC off: forget the token and the key copy, stop the clients,
+    and ask for approval again. forget_token leaves a mark, so the next start does
+    not fall back to plaintext keys an older installer may still have left here."""
+    dd = _user_data_dir()
+    _nbgw.forget_keys(dd)
+    _nbgw.forget_token(dd)
+    with _apply_lock:
+        for attr in ("client_vertex", "client_studio", "client_openai", "client_seedream"):
+            setattr(shared, attr, None)
+        shared.vertex_status = shared.studio_status = "disconnected"
+        shared.openai_status = shared.seedream_status = "disconnected"
+        _keys_rt["ids"] = None
+        _keys_rt["source"] = ""
+    _set_gw("revoked", "", msg)
+    state.log("this PC was cut off by the admin - keys dropped")
+    # Every path that finds the PC cut off ends here, so the approval request is
+    # started here too (a no-op when the enrolment thread is already running).
+    _start_enrollment()
+
+
+def _keys_from_gateway():
+    """Fresh keys from the key server -> clients -> (once) erase the old plaintext.
+    Returns (ok, error_kind). "invalid" only ever means a just-issued token the
+    server has yet to show everywhere — callers retry it, they do not re-enrol."""
+    dd = _user_data_dir()
+    try:
+        keys = _nbgw.fetch_keys(dd, app_version=_read_version())
+    except _nbgw.GatewayError as e:
+        _keys_rt["last_err"] = e.kind
+        if e.kind == "revoked" or (e.kind == "invalid" and _nbgw.token_age(dd) > 600):
+            # A token the server does not know any more, not one it has yet to
+            # propagate (a just-approved token can take a moment to show up).
+            _drop_all_keys()
+            return False, "revoked"
+        if e.kind in ("unreachable", "refused", "no_url") and _keys_rt["source"]:
+            _set_gw("offline", "", "키 서버에 연결하지 못해 저장해 둔 키로 동작합니다")
+        state.log("key server: %s (%s)" % (e.kind, str(e)[:80]))
+        return False, e.kind
+    _keys_rt["last_err"] = ""
+    _apply_keys(keys, "gateway")
+    _set_gw("ok")
+    if not _keys_rt["scrubbed"]:
+        _keys_rt["scrubbed"] = True
+        threading.Thread(target=_scrub_once, args=(keys,), daemon=True).start()
+    return True, ""
+
+
+def _keys_from_gateway_patiently(tries=18, wait_s=5):
+    """For a token that was issued a moment ago: the first /key can land where the
+    new token is not visible yet. Keep asking for a while instead of giving up."""
+    ok, kind = False, ""
+    for i in range(tries):
+        ok, kind = _keys_from_gateway()
+        if ok or kind not in ("invalid", "unreachable", "refused"):
+            break
+        time.sleep(wait_s)
+    return ok, kind
+
+
+def _scrub_once(keys):
+    # 테스트는 격리용 데이터 폴더를 건다(CLAUDE.md 규칙 17). 그때 지우면 개발 PC 의 진짜
+    # 환경변수가 날아가므로 하지 않는다 — 사용량 업로드와 같은 안전장치.
+    if os.environ.get("NANOBANANA_DATA_DIR") and os.environ.get("NANOBANANA_SCRUB") != "1":
+        return
+    try:
+        done = _nbgw.scrub_plaintext(_user_data_dir(), keys,
+                                     defaults=_ARK_ENDPOINT_DEFAULTS, log=state.log)
+        if done:
+            state.log("plaintext key copies removed from this PC: %s" % ", ".join(done))
+    except Exception as e:
+        state.log("plaintext cleanup failed: %s" % str(e)[:80])
+
+
+def _start_enrollment():
+    with _keys_lock:
+        t = _keys_rt.get("enroll_thread")
+        if t is not None and t.is_alive():
+            return
+        t = threading.Thread(target=_enroll_loop, daemon=True)
+        _keys_rt["enroll_thread"] = t
+    t.start()
+
+
+def _enroll_loop():
+    """No token: get one. The old way first (a ticket the installer left, while the
+    server still accepts it — no one has to do anything), then admin approval:
+    post a request, show the number, wait for the admin. Once a token is in hand
+    this never asks for a number again — it only keeps asking for the keys."""
+    dd = _user_data_dir()
+    was_cut = shared.gw_state == "revoked" or _nbgw.was_cut_off(dd)
+    url = _nbgw.gateway_url(dd)
+    if url and _nbgw.ticket() and not was_cut:
+        tok, _msg = _nbgw.enroll(dd, url, app_version=_read_version(), log=state.log)
+        if tok:
+            ok, kind = _keys_from_gateway_patiently()
+            if not ok and kind != "revoked":
+                threading.Thread(target=_retry_keys_until_ok, daemon=True).start()
+            if ok or kind != "revoked":
+                return
+    wait_s = 5
+    while True:
+        try:
+            rec = _nbgw.request_enrollment(dd, app_version=_read_version())
+            if was_cut:
+                _set_gw("revoked", rec.get("code", ""),
+                        "이 PC는 관리자가 사용을 중지했습니다. 다시 쓰려면 관리자에게 아래 번호를 알려 주세요.")
+            else:
+                _set_gw("pending", rec.get("code", ""))
+            st = _nbgw.poll_enrollment(dd, app_version=_read_version())
+            if st == "approved":
+                state.log("this PC was approved by the admin")
+                ok, kind = _keys_from_gateway_patiently()
+                if not ok:
+                    # We hold a token now; keep asking for keys, never for a new number.
+                    _set_gw("error", "", "승인은 됐지만 키를 아직 받지 못했습니다 — 잠시 뒤 저절로 다시 시도합니다.")
+                    threading.Thread(target=_retry_keys_until_ok, daemon=True).start()
+                return
+            if st == "denied":
+                _set_gw("denied", "", "관리자가 승인 요청을 거절했습니다. 앱을 다시 켜면 새 번호로 다시 요청합니다.")
+                return
+            # pending: same number, ask again shortly. expired/none: the next pass
+            # posts a fresh request and shows its new number.
+            wait_s = 5
+        except _nbgw.GatewayError as e:
+            if not shared.gw_code:
+                _set_gw("error", "", "승인 요청을 보내지 못했습니다 — 인터넷 연결을 확인해 주세요 (%s)" % e.kind)
+            wait_s = min(wait_s * 2, 60)
+        except Exception as e:
+            state.log("enrollment loop error: %s" % str(e)[:80])
+            wait_s = min(wait_s * 2, 60)
+        time.sleep(wait_s)
+
+
+def _after_failed_fetch(kind):
+    """What to do when the key server did not give keys: no token -> enrol;
+    cut off -> already enrolling (_drop_all_keys); anything else, including a
+    just-issued token that is not visible yet -> keep asking for the keys."""
+    if kind == "no_token":
+        _start_enrollment()
+    elif kind != "revoked":
+        threading.Thread(target=_retry_keys_until_ok, daemon=True).start()
+
+
+def _init_keys():
+    """Startup. Never blocks on the network when an encrypted copy exists."""
+    os.environ.setdefault("NANOBANANA_APP_VERSION", _read_version())
+    dd = _user_data_dir()
+    cached = _nbgw.cached_keys(dd)
+    if cached:
+        _apply_keys(cached, "cache")
+        _set_gw("ok")
+        threading.Thread(target=_refresh_keys_bg, daemon=True).start()
+        return
+    # No copy yet (first run of this version, or a new PC). The old build fetched the
+    # OpenAI key here before building its clients too, so this wait is not new.
+    ok, kind = _keys_from_gateway()
+    if ok:
+        return
+    # A PC the admin cut off must not carry on with keys an older installer left here.
+    legacy = None if (kind == "revoked" or _nbgw.was_cut_off(dd)) else _legacy_env_keys()
+    if legacy:
+        _apply_keys(legacy, "env")
+        _set_gw("ok")
+    elif kind not in ("no_token", "revoked"):
+        _set_gw("error", "", "키 서버에 연결하지 못했습니다 — 인터넷 연결을 확인해 주세요. 연결되면 저절로 이어집니다.")
+    _after_failed_fetch(kind)
+
+
+def _refresh_keys_bg():
+    ok, kind = _keys_from_gateway()
+    if not ok:
+        _after_failed_fetch(kind)
+
+
+def _retry_keys_until_ok():
+    wait_s = 15
+    while _keys_rt["source"] != "gateway":
+        time.sleep(wait_s)
+        ok, kind = _keys_from_gateway()
+        if ok:
+            return
+        if kind in ("no_token", "revoked"):
+            if kind == "no_token":
+                _start_enrollment()
+            return
+        wait_s = min(wait_s * 2, 300)
+
+
+_AUTH_RE = re.compile(r"\b401\b|invalid_api_key|incorrect api key|authenticationerror|"
+                      r"api key not valid|api_key_invalid|api key expired|reported as leaked|"
+                      r"unauthenticated|invalid authentication", re.I)
+
+
+def _is_auth_error(err_text):
+    return bool(_AUTH_RE.search(err_text or ""))
+
+
+def _keys_changed_since(ids_before, provider):
+    """A provider rejected the key (rotated, or the PC was cut off). Ask the key
+    server — one reload at a time, at most once a minute — and say whether the
+    clients now hold different, usable keys. Workers that fail while a reload is
+    in flight wait for it: after a rotation every image of a running batch picks
+    up the new key, not just the first one to notice."""
+    if not _reload_lock.acquire(timeout=45):
+        ids = _keys_rt["ids"]
+        return ids is not None and ids != ids_before
+    try:
+        ids = _keys_rt["ids"]
+        if ids != ids_before:
+            return ids is not None          # someone already reloaded (or the PC was cut off)
+        now = time.time()
+        if now - _keys_rt["reload_at"] < 60:
+            return False                    # just asked: the server has nothing newer
+        _keys_rt["reload_at"] = now
+        state.log("%s rejected the key - asking the key server for the current one" % provider)
+        _keys_from_gateway()
+        ids = _keys_rt["ids"]
+        return ids is not None and ids != ids_before
+    finally:
+        _reload_lock.release()
+
+
+def _no_client_error(what):
+    """Why a provider is not available, in words the user can act on."""
+    if shared.gw_state == "pending" and shared.gw_code:
+        return "이 PC는 아직 관리자 승인 전입니다 — 관리자에게 번호 %s 를 알려 주세요" % shared.gw_code
+    if shared.gw_state in ("revoked", "denied", "error") and shared.gw_msg:
+        return shared.gw_msg
+    return "%s 키가 없습니다 — 키 서버 연결을 확인해 주세요" % what
+
+
 def _start_usage_flusher():
     """쌓인 사용량을 주기적으로 올린다.
 
@@ -6074,6 +6426,10 @@ def _start_usage_flusher():
                                               app_version=_read_version())
                 if sent:
                     state.log("usage: %d row(s) uploaded" % sent)
+                elif err == "revoked" and _keys_rt["source"]:
+                    # 끊긴 PC 는 여기서 가장 먼저 드러난다(생성할 때마다 올리므로).
+                    # 켜 둔 채로도 다음 생성부터 막히게 키를 내려놓는다(승인 요청도 거기서 시작).
+                    _drop_all_keys()
             except Exception:
                 pass            # 집계 전송은 어떤 경우에도 앱을 흔들지 않는다
             time.sleep(30)

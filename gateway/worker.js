@@ -17,9 +17,17 @@
  * Bindings this Worker needs:
  *   KV namespace : NB_TOKENS
  *   Secret       : OPENAI_KEY        the real provider key
+ *   Secret       : STUDIO_KEY        Gemini API (AI Studio) key
+ *   Secret       : ARK_KEY           BytePlus ModelArk (Seedream) key
+ *   Secret       : VERTEX_SA         Vertex service-account JSON — never leaves here;
+ *                                    apps get 1-hour access tokens minted from it
+ *   Secret       : RETIRED_KEY_HASHES comma-separated SHA-256 of rotated-out keys, so
+ *                                    apps can recognise and erase old plaintext copies
  *   Secret       : TICKET_HASHES     comma-separated SHA-256 of accepted tickets
  *   Secret       : ADMIN_KEY         for the admin routes
  *   Variable     : ENROLL_OPEN       "1" while enrolling, "0" once everyone is in
+ *                                    (ticket enrolment only — approval enrolment is
+ *                                    always available and needs the admin)
  */
 
 const ALLOWED = new Set([
@@ -124,27 +132,228 @@ async function handleEnroll(request, env) {
     return json({ ok: false, error: "ticket not accepted" }, 403);
   }
 
-  // Reinstalling the app must not mint an endless list of tokens per person.
+  // 관리자가 끊은 PC 는 티켓으로 되돌아오지 못한다 — 다시 쓰려면 승인을 받아야 한다.
+  // 이게 없으면 평문 키가 아직 남은 PC 는 끊겨도 다음 실행에 새 출입증을 받아 갔다.
+  const prev = await env.NB_TOKENS.get(`ident:${(await sha256Hex(`${user}|${machine}`)).slice(0, 16)}`);
+  if (prev && JSON.parse(prev).revoked) {
+    return json({ ok: false, error: "this PC was cut off - ask the admin to approve it" }, 403);
+  }
+
+  const t = await issueToken(env, user, machine, version, {});
+  return json({ ok: true, token: t.token, token_id: t.token_id, reused: t.reused });
+}
+
+/**
+ * 한 PC 에 출입증 하나. 같은 사람·같은 PC 이름이면 쓰던 걸 그대로 돌려준다 —
+ * 재설치할 때마다 새로 찍으면 PC 목록과 사용량이 매번 다른 줄로 갈라진다.
+ * 끊긴(revoked) 출입증은 되살리지 않고 새로 만든다.
+ */
+async function issueToken(env, user, machine, version, extra) {
   const ident = (await sha256Hex(`${user}|${machine}`)).slice(0, 16);
   const existing = await env.NB_TOKENS.get(`ident:${ident}`);
   if (existing) {
     const rec = JSON.parse(existing);
-    if (!rec.revoked) {
-      return json({ ok: true, token: rec.token, token_id: rec.token_id, reused: true });
-    }
+    if (!rec.revoked) return { token: rec.token, token_id: rec.token_id, reused: true };
   }
-
   const raw = crypto.getRandomValues(new Uint8Array(24));
   const token = "nbt_" + [...raw].map((b) => b.toString(16).padStart(2, "0")).join("");
   const tokenId = (await sha256Hex(token)).slice(0, 16);
   const rec = {
     token, token_id: tokenId, ident, user, machine,
     app_version: version, issued_at: new Date().toISOString().slice(0, 19),
-    calls: 0, revoked: false,
+    calls: 0, revoked: false, ...(extra || {}),
   };
   await env.NB_TOKENS.put(`tok:${tokenId}`, JSON.stringify(rec));
   await env.NB_TOKENS.put(`ident:${ident}`, JSON.stringify(rec));
-  return json({ ok: true, token, token_id: tokenId, reused: false });
+  return { token, token_id: tokenId, reused: false };
+}
+
+// ------------------------------------------------------ enrolment by approval
+/**
+ * 새 PC 는 관리자 승인으로 들어온다.
+ *
+ * 티켓 등록은 "예전에 나눠준 OpenAI 키" 를 입장권으로 받았다. 그 키는 70대에 몇 달씩
+ * 평문으로 깔려 있었고 퇴사자 PC 에도 남아 있으니, 창구를 열어두는 한 누구든 집에서
+ * PC 를 등록해 지금 키를 받아갈 수 있었다. 이 길은 새 PC 에 비밀을 하나도 보내지
+ * 않는다: 앱이 요청을 올리면 그 PC 화면에 4자리 번호가 뜨고, 관리자가 그 번호를
+ * 관리자 페이지에 넣어야 출입증이 나간다.
+ *
+ * 번호는 관리자 페이지에 **표시하지 않는다.** 표시하면 "그 PC 화면을 보고 맞는지
+ * 확인했다" 는 증명이 사라지고, 비슷한 이름으로 끼어든 요청을 실수로 승인하게 된다.
+ * 요청 id(req_id)는 요청한 앱만 아는 128비트 값이라, 승인된 출입증은 그 앱만 받아간다.
+ *
+ * KV 가 아니라 D1 에 둔다 — KV 는 다른 지역에서 쓴 값이 1분까지 늦게 보일 수 있어,
+ * 방금 올라온 요청을 관리자가 못 찾는 일이 생긴다.
+ */
+const ENROLL_TTL_S = 3600;
+const enrollCutoff = (sec = ENROLL_TTL_S) =>
+  new Date(Date.now() - sec * 1000).toISOString().slice(0, 19);
+const hex = (n) => [...crypto.getRandomValues(new Uint8Array(n))]
+  .map((b) => b.toString(16).padStart(2, "0")).join("");
+
+async function handleEnrollRequest(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ ok: false, error: "bad request" }, 400); }
+  const user = String(body.user || "unknown").slice(0, 64);
+  const machine = String(body.machine || "unknown").slice(0, 64);
+  const version = String(body.app_version || "").slice(0, 32);
+  const ip = clientIp(request);
+  const db = env.USAGE_DB;
+
+  // 일주일 지난 요청은 치운다. 실패해도 요청 자체는 받는다.
+  await db.prepare("DELETE FROM enroll_requests WHERE created_at < ?")
+    .bind(enrollCutoff(7 * 86400)).run().catch(() => {});
+  // 인증 없이 닿는 길이라 쏟아붓기만 막는다. 정상 PC 는 요청 하나를 한 시간 동안 다시 쓴다.
+  // 사무실 PC 들은 공인 IP 하나를 같이 쓰므로 너무 빡빡하면 신규 여러 대를 한 번에 못 받는다.
+  const mine = await db.prepare(
+    "SELECT COUNT(*) AS n FROM enroll_requests WHERE ip = ? AND created_at >= ?")
+    .bind(ip, enrollCutoff(600)).first();
+  if (mine && mine.n >= 20) return json({ ok: false, error: "too many requests, try later" }, 429);
+  const all = await db.prepare(
+    "SELECT COUNT(*) AS n FROM enroll_requests WHERE status = 'pending' AND created_at >= ?")
+    .bind(enrollCutoff()).first();
+  // 전체 상한은 표가 끝없이 자라지 않게 하는 용도다. 낮게 잡으면 요청이 몰렸을 때 진짜 새 PC 가
+  // 번호를 못 받는다 — 승인은 번호로 하니 목록이 길어져도 일에는 지장이 없다.
+  if (all && all.n >= 300) return json({ ok: false, error: "too many pending requests" }, 429);
+
+  // 대기 중인 요청끼리는 번호가 겹치지 않게 한다 (D1 이라 바로 보인다).
+  let code = "";
+  for (let i = 0; i < 30 && !code; i++) {
+    const c = String(1000 + (crypto.getRandomValues(new Uint32Array(1))[0] % 9000));
+    const dup = await db.prepare(
+      "SELECT 1 AS x FROM enroll_requests WHERE code = ? AND status = 'pending' AND created_at >= ?")
+      .bind(c, enrollCutoff()).first();
+    if (!dup) code = c;
+  }
+  if (!code) return json({ ok: false, error: "try again" }, 503);
+
+  const reqId = hex(16);
+  await db.prepare(
+    `INSERT INTO enroll_requests (req_id, code, user, machine, app_version, ip, created_at, status)
+     VALUES (?,?,?,?,?,?,?, 'pending')`)
+    .bind(reqId, code, user, machine, version, ip, nowIso()).run();
+  return json({ ok: true, req_id: reqId, code, expires_in: ENROLL_TTL_S });
+}
+
+async function handleEnrollPoll(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return json({ ok: false, error: "bad request" }, 400); }
+  const reqId = String(body.req_id || "");
+  if (!/^[0-9a-f]{32}$/.test(reqId)) return json({ ok: false, error: "bad request" }, 400);
+  const db = env.USAGE_DB;
+  const row = await db.prepare("SELECT * FROM enroll_requests WHERE req_id = ?").bind(reqId).first();
+  if (!row) return json({ ok: true, status: "unknown" });
+  if (row.status === "pending") {
+    return json({ ok: true, status: row.created_at < enrollCutoff() ? "expired" : "pending" });
+  }
+  if (row.status === "approved" && row.token) {
+    // 한 번만 내준다. 받아간 뒤엔 D1 에 출입증이 남지 않는다.
+    await db.prepare("UPDATE enroll_requests SET token = NULL, picked_up_at = ? WHERE req_id = ?")
+      .bind(nowIso(), reqId).run();
+    return json({ ok: true, status: "approved", token: row.token, token_id: row.token_id });
+  }
+  return json({ ok: true, status: row.status === "approved" ? "picked_up" : row.status });
+}
+
+// ------------------------------------------------------------ provider keys
+/**
+ * 앱이 쓰는 이미지 키 전부.
+ *
+ * 예전엔 OpenAI 키만 여기 있었고 나머지(Studio·시드림·Vertex 키 파일)는 PC 환경변수에
+ * 평문으로 깔려 있었다 — `echo %키%` 한 줄이면 보였고, 그 PC 에서 켜는 모든 프로그램이
+ * 물려받았다. 이제 키는 전부 여기 있고, 앱은 켤 때 받아 메모리에만 둔다. 생성은 여전히
+ * 앱이 프로바이더로 직접 한다 — 이건 키를 나눠줄 뿐 중계하지 않는다.
+ *
+ * Vertex 는 서비스 계정 비밀키(만료 없음)를 내주지 않는다. 그걸로 만든 1시간짜리
+ * 액세스 토큰만 나간다.
+ */
+function vertexSa(env) {
+  try {
+    const sa = JSON.parse(env.VERTEX_SA || "");
+    if (sa && sa.client_email && sa.private_key) return sa;
+  } catch {}
+  return null;
+}
+
+// 격리(isolate) 안에서 먼저 재사용하고, 없으면 KV 를 본다. 15분 넘게 남은 것만 쓴다 —
+// 앱의 google-auth 는 만료 3분 45초 전부터 "이미 만료" 로 보고 거부한다.
+let _vxMem = null;
+
+async function vertexToken(env) {
+  const now = Math.floor(Date.now() / 1000);
+  const fresh = (c) => c && c.token && c.exp - now > 900;
+  if (fresh(_vxMem)) return _vxMem;
+  try {
+    const c = await env.NB_TOKENS.get("vx:token", "json");
+    if (fresh(c)) { _vxMem = c; return c; }
+  } catch {}
+  const sa = vertexSa(env);
+  if (!sa) throw new Error("vertex not configured");
+  const t = await saAccessToken(sa.client_email, sa.private_key,
+    "https://www.googleapis.com/auth/cloud-platform");
+  const c = { token: t.token, exp: now + Math.max(120, (t.expires_in || 3600) - 60) };
+  _vxMem = c;
+  try {
+    await env.NB_TOKENS.put("vx:token", JSON.stringify(c),
+      { expirationTtl: Math.max(60, c.exp - now) });
+  } catch {}
+  return c;
+}
+
+/** 지금 키와 예전 키의 해시. 앱은 이걸로 PC 에 남은 평문 사본이 "우리 것" 인지
+ *  알아보고 지운다 — 이름만 보고 지우면 남의 프로그램이 쓰는 같은 이름의 키를 날린다. */
+async function knownKeyHashes(env) {
+  const out = new Set();
+  for (const src of [env.TICKET_HASHES, env.RETIRED_KEY_HASHES]) {
+    for (const h of String(src || "").split(",")) {
+      const v = h.trim().toLowerCase();
+      if (/^[0-9a-f]{64}$/.test(v)) out.add(v);
+    }
+  }
+  for (const k of [env.OPENAI_KEY, env.STUDIO_KEY, env.ARK_KEY]) {
+    if (clean(k)) out.add(await sha256Hex(clean(k)));
+  }
+  return [...out];
+}
+
+async function keyBundle(env) {
+  const id = async (k) => (clean(k) ? (await sha256Hex(clean(k))).slice(0, 12) : "");
+  let vertex = null;
+  const sa = vertexSa(env);
+  if (sa) {
+    vertex = {
+      project: env.VERTEX_PROJECT || sa.project_id || "",
+      location: env.VERTEX_LOCATION || "global",
+      sa_email: sa.client_email,
+    };
+    try {
+      const t = await vertexToken(env);
+      vertex.token = t.token;
+      vertex.expires_in = t.exp - Math.floor(Date.now() / 1000);
+    } catch (e) {
+      // 출입증을 못 만들어도 나머지 키는 나간다. 앱은 나중에 /vertex-token 으로 다시 받는다.
+      vertex.error = String((e && e.message) || e).slice(0, 160);
+    }
+  }
+  return {
+    v: 2,
+    keys: { openai: clean(env.OPENAI_KEY), studio: clean(env.STUDIO_KEY), ark: clean(env.ARK_KEY) },
+    key_ids: { openai: await id(env.OPENAI_KEY), studio: await id(env.STUDIO_KEY),
+               ark: await id(env.ARK_KEY) },
+    vertex,
+    known_hashes: await knownKeyHashes(env),
+  };
+}
+
+async function handleVertexToken(request, env) {
+  const g = await tokenRecord(request, env);
+  if (!g.ok) return json({ ok: false, error: g.error }, g.status);
+  try {
+    const t = await vertexToken(env);
+    return json({ ok: true, token: t.token, expires_in: t.exp - Math.floor(Date.now() / 1000) });
+  } catch (e) {
+    return json({ ok: false, error: String((e && e.message) || e).slice(0, 160) }, 503);
+  }
 }
 
 // ----------------------------------------------------------------- key issue
@@ -191,11 +400,12 @@ async function handleKey(request, env, ctx) {
   // The client sends its app_version alongside the fetch; recording it turns
   // the admin list into a live "which build is each machine on" roster —
   // exactly what a staged rollout needs to see who is lagging.
-  let ver = "", host = "";
+  let ver = "", host = "", want = 1;
   try {
     const b = await request.json();
     ver = String(b.app_version || "").slice(0, 32);
     host = String(b.machine || "").trim().slice(0, 64);
+    want = Number(b.v) || 1;
   } catch {}
 
   // 지금 컴퓨터 이름. 앱은 켤 때마다 이 요청에 platform.node() 를 실어 보낸다.
@@ -228,11 +438,15 @@ async function handleKey(request, env, ctx) {
     } catch {}
   })());
 
-  return json({
+  const out = {
     ok: true,
     key: env.OPENAI_KEY,
     key_id: (await sha256Hex(env.OPENAI_KEY)).slice(0, 12),
-  });
+  };
+  // 옛 앱(v1)은 OpenAI 키만 받는다. 나머지 키는 그걸 쓸 줄 아는 앱에만 보낸다 —
+  // 읽지도 않을 앱에 키를 실어 보낼 이유가 없다.
+  if (want >= 2) Object.assign(out, await keyBundle(env));
+  return json(out);
 }
 
 // --------------------------------------------------------------------- proxy
@@ -316,6 +530,12 @@ async function handleAdmin(request, env, path) {
   }
   if (path === "/admin/tokens") {
     const list = await env.NB_TOKENS.list({ prefix: "tok:" });
+    // 지금 PC 이름 (켤 때마다 /key 가 적는다). 표시용 — 처음 등록한 이름은 그대로 둔다.
+    const now = {};
+    try {
+      const r = await env.USAGE_DB.prepare("SELECT token_id, name FROM pc_names").all();
+      for (const x of r.results || []) now[x.token_id] = x.name;
+    } catch {}
     const rows = [];
     for (const k of list.keys) {
       const v = await env.NB_TOKENS.get(k.name);
@@ -323,8 +543,10 @@ async function handleAdmin(request, env, path) {
       const r = JSON.parse(v);
       rows.push({
         token_id: r.token_id, user: r.user, machine: r.machine,
+        current_name: now[r.token_id] || "",
         issued_at: r.issued_at, last_used: r.last_used || null,
-        calls: r.calls || 0, revoked: Boolean(r.revoked),
+        calls: r.calls || 0, revoked: Boolean(r.revoked), revoked_at: r.revoked_at || null,
+        approved_at: r.approved_at || null,
         app_version: r.app_version || "",
         key_fetches: r.key_fetches || 0, last_key_fetch: r.last_key_fetch || null,
         last_ip: r.last_ip || null,
@@ -332,6 +554,54 @@ async function handleAdmin(request, env, path) {
     }
     rows.sort((a, b) => (a.issued_at < b.issued_at ? -1 : 1));
     return json({ ok: true, count: rows.length, tokens: rows });
+  }
+  // ---- 새 PC 승인 ------------------------------------------------------------
+  if (path === "/admin/enroll" && request.method === "GET") {
+    const db = env.USAGE_DB;
+    // 번호(code)는 내보내지 않는다 — handleEnrollRequest 주석 참고.
+    const p = await db.prepare(
+      `SELECT req_id, user, machine, app_version, ip, created_at FROM enroll_requests
+        WHERE status = 'pending' AND created_at >= ? ORDER BY created_at DESC`)
+      .bind(enrollCutoff()).all();
+    const d = await db.prepare(
+      `SELECT req_id, user, machine, status, token_id, decided_at, picked_up_at FROM enroll_requests
+        WHERE status <> 'pending' AND decided_at >= ? ORDER BY decided_at DESC LIMIT 20`)
+      .bind(enrollCutoff(86400)).all();
+    return json({ ok: true, pending: p.results || [], recent: d.results || [] });
+  }
+  if (path === "/admin/enroll/approve" && request.method === "POST") {
+    if (!setupOk(request, env)) return json(NEED_SETUP, 403);
+    let b;
+    try { b = await request.json(); } catch { return json({ ok: false, error: "bad request" }, 400); }
+    const code = String(b.code || "").replace(/\D/g, "");
+    if (code.length !== 4) return json({ ok: false, error: "번호 4자리를 넣어 주세요" }, 400);
+    const db = env.USAGE_DB;
+    const row = await db.prepare(
+      "SELECT * FROM enroll_requests WHERE code = ? AND status = 'pending' AND created_at >= ?")
+      .bind(code, enrollCutoff()).first();
+    if (!row) {
+      return json({ ok: false, error: "그 번호로 기다리는 PC 가 없습니다. 번호를 다시 확인하고, "
+        + "1시간이 지났으면 그 PC 에서 앱을 다시 켜 새 번호를 받으세요." }, 404);
+    }
+    const who = { user: row.user, machine: row.machine, created_at: row.created_at, ip: row.ip };
+    // 먼저 누구인지 보여주고, 확인을 받은 뒤에만 출입증을 만든다.
+    if (!b.confirm) return json({ ok: true, preview: true, ...who });
+    const t = await issueToken(env, row.user, row.machine, row.app_version,
+      { approved_at: nowIso(), approved_ip: clientIp(request) });
+    await db.prepare(
+      `UPDATE enroll_requests SET status = 'approved', token = ?, token_id = ?, decided_at = ?
+        WHERE req_id = ? AND status = 'pending'`)
+      .bind(t.token, t.token_id, nowIso(), row.req_id).run();
+    return json({ ok: true, ...who, token_id: t.token_id, reused: t.reused });
+  }
+  if (path === "/admin/enroll/deny" && request.method === "POST") {
+    if (!setupOk(request, env)) return json(NEED_SETUP, 403);
+    let b;
+    try { b = await request.json(); } catch { return json({ ok: false, error: "bad request" }, 400); }
+    await env.USAGE_DB.prepare(
+      "UPDATE enroll_requests SET status = 'denied', decided_at = ? WHERE req_id = ? AND status = 'pending'")
+      .bind(nowIso(), String(b.req_id || "")).run();
+    return json({ ok: true });
   }
   // ---- 사용량 조회 / 설정 (전부 관리자 키) --------------------------------
   if (path === "/admin" || path === "/admin/") {
@@ -508,6 +778,8 @@ async function handleAdmin(request, env, path) {
     return json({ ok: true, prices: r.results || [] });
   }
   if (path === "/admin/revoke" && request.method === "POST") {
+    // 끊으면 그 PC 는 키를 못 받는다 — 승인과 같은 무게라 같은 2차 잠금을 건다.
+    if (!setupOk(request, env)) return json(NEED_SETUP, 403);
     let body;
     try { body = await request.json(); } catch { return json({ ok: false, error: "bad request" }, 400); }
     const key = `tok:${body.token_id}`;
@@ -600,9 +872,17 @@ async function googleToken(env) {
 }
 
 async function googleTokenFresh(env) {
-  const pem = String(env.GS_SA_KEY || "").replace(/\\n/g, "\n");
+  if (!env.GS_SA_KEY || !env.GS_SA_EMAIL) throw new Error("sheet credentials not configured");
+  const t = await saAccessToken(env.GS_SA_EMAIL, env.GS_SA_KEY,
+    "https://www.googleapis.com/auth/spreadsheets.readonly");
+  return t.token;
+}
+
+/** 서비스 계정 비밀키로 JWT 를 서명해 액세스 토큰과 남은 초를 받는다 (시트·Vertex 공용). */
+async function saAccessToken(email, privateKeyPem, scope) {
+  const pem = String(privateKeyPem || "").replace(/\\n/g, "\n");
   const body = pem.replace(/-----(BEGIN|END) PRIVATE KEY-----/g, "").replace(/\s+/g, "");
-  if (!body || !env.GS_SA_EMAIL) throw new Error("sheet credentials not configured");
+  if (!body || !email) throw new Error("service account not configured");
   const der = Uint8Array.from(atob(body), (c) => c.charCodeAt(0));
   const key = await crypto.subtle.importKey(
     "pkcs8", der, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
@@ -611,8 +891,8 @@ async function googleTokenFresh(env) {
   const enc = new TextEncoder();
   const unsigned = b64url(enc.encode(JSON.stringify({ alg: "RS256", typ: "JWT" }))) + "." +
     b64url(enc.encode(JSON.stringify({
-      iss: env.GS_SA_EMAIL,
-      scope: "https://www.googleapis.com/auth/spreadsheets.readonly",
+      iss: email,
+      scope,
       aud: "https://oauth2.googleapis.com/token",
       iat: now, exp: now + 3600,
     })));
@@ -627,7 +907,7 @@ async function googleTokenFresh(env) {
   });
   const d = await r.json();
   if (!d.access_token) throw new Error("google auth failed: " + JSON.stringify(d).slice(0, 160));
-  return d.access_token;
+  return { token: d.access_token, expires_in: Number(d.expires_in) || 3600 };
 }
 
 /**
@@ -948,6 +1228,7 @@ svg.chart text{fill:var(--tx2);font-size:10px}
   <button id="tb-usage" class="on" onclick="show('usage')">사용량</button>
   <button id="tb-setup" onclick="show('setup')">팀 · 프로젝트</button>
   <button id="tb-price" onclick="show('price')">단가 · 환율</button>
+  <button id="tb-pc" onclick="show('pc')">PC</button>
 </div>
 
 <div id="pane-usage">
@@ -986,7 +1267,7 @@ svg.chart text{fill:var(--tx2);font-size:10px}
 </div>
 
 <div id="pane-setup" style="display:none">
-  <div class="card" id="lockBar"></div>
+  <div class="card lockBar"></div>
   <div class="card">
     <div class="row" style="justify-content:space-between">
       <div>
@@ -1041,6 +1322,31 @@ svg.chart text{fill:var(--tx2);font-size:10px}
   </div>
 </div>
 
+<div id="pane-pc" style="display:none">
+  <div class="card lockBar"></div>
+  <div class="card">
+    <h2>새 PC 승인</h2>
+    <div class="sub" style="line-height:1.7">
+      새 PC 에서 앱을 켜면 화면에 <b>4자리 번호</b>가 뜹니다. 그 번호를 넣고 승인하면 몇 초 안에 그 PC 앱이 쓸 수 있게 됩니다.<br>
+      번호는 이 페이지에 나오지 않습니다 &mdash; 그 PC 화면에서 직접 확인하는 것이 확인 절차입니다. 번호는 1시간 동안 유효합니다.
+    </div>
+    <div class="row" style="margin-top:12px">
+      <input id="enrollCode" inputmode="numeric" maxlength="4" placeholder="번호 4자리" style="width:130px"
+             onkeydown="if (event.key === 'Enter') approveCode()">
+      <button class="go" id="enrollBtn" onclick="approveCode()">승인</button>
+    </div>
+    <div id="enrollList" style="margin-top:14px"></div>
+  </div>
+  <div class="card">
+    <h2>등록된 PC</h2>
+    <div id="pcList"><div class="empty">불러오는 중…</div></div>
+    <div class="sub" style="margin-top:10px;line-height:1.7">
+      <b>끊기</b>를 누르면 그 PC 는 키를 더 받지 못해 이미지를 만들 수 없습니다(켜져 있던 앱은 다음 생성 때 멈춥니다).
+      지난 사용량은 그대로 남습니다. 다시 쓰게 하려면 그 PC 에서 앱을 켜고 새 번호로 승인하세요.
+    </div>
+  </div>
+</div>
+
 <script>
 const KEY_LS = "nb_admin_key";
 let KEY = localStorage.getItem(KEY_LS) || "";
@@ -1083,13 +1389,17 @@ async function api(path, opt) {
   }
   return d;
 }
+let pcTimer = null;
 function show(which) {
-  ["usage", "setup", "price"].forEach(k => {
+  ["usage", "setup", "price", "pc"].forEach(k => {
     document.getElementById("pane-" + k).style.display = (k === which) ? "" : "none";
     document.getElementById("tb-" + k).className = (k === which) ? "on" : "";
   });
   if (which === "setup") { renderLock(); loadCatalog(); loadSync(); }
   if (which === "price") { loadPrices(); loadFx(); }
+  // 승인 대기 목록은 이 탭을 보고 있는 동안만 10초마다 새로 받는다.
+  if (pcTimer) { clearInterval(pcTimer); pcTimer = null; }
+  if (which === "pc") { renderLock(); loadEnroll(); loadPcs(); pcTimer = setInterval(loadEnroll, 10000); }
 }
 
 /* ---- 기간 ---- */
@@ -1436,17 +1746,24 @@ async function runSync() {
 
 /* ---- 변경 잠금 ---- */
 function renderLock() {
-  const el = document.getElementById("lockBar");
-  if (!el) return;
-  el.innerHTML = locked()
-    ? '<div class="row" style="justify-content:space-between">'
-      + '<div><b>변경이 잠겨 있습니다</b><div class="sub" style="margin-top:4px">'
-      + '목록은 볼 수 있습니다. 추가·보관·되살리기·삭제·동기화는 비밀번호를 한 번 더 넣어야 합니다.</div></div>'
-      + '<button class="go" onclick="unlockSetup()">잠금 해제</button></div>'
-    : '<div class="row" style="justify-content:space-between">'
-      + '<div><b class="ok">변경할 수 있습니다</b><div class="sub" style="margin-top:4px">'
-      + '이 창을 닫으면 다시 잠깁니다.</div></div>'
-      + '<button class="ghost" onclick="lockSetup()">다시 잠그기</button></div>';
+  // 팀·프로젝트 탭과 PC 탭이 같은 잠금을 쓴다.
+  document.querySelectorAll(".lockBar").forEach(el => {
+    el.innerHTML = locked()
+      ? '<div class="row" style="justify-content:space-between">'
+        + '<div><b>변경이 잠겨 있습니다</b><div class="sub" style="margin-top:4px">'
+        + '목록은 볼 수 있습니다. 추가·보관·되살리기·삭제·동기화, PC 승인·끊기는 비밀번호를 한 번 더 넣어야 합니다.</div></div>'
+        + '<button class="go" onclick="unlockSetup()">잠금 해제</button></div>'
+      : '<div class="row" style="justify-content:space-between">'
+        + '<div><b class="ok">변경할 수 있습니다</b><div class="sub" style="margin-top:4px">'
+        + '이 창을 닫으면 다시 잠깁니다.</div></div>'
+        + '<button class="ghost" onclick="lockSetup()">다시 잠그기</button></div>';
+  });
+  document.querySelectorAll("#pane-pc button[data-deny],#pane-pc button[data-revoke]")
+    .forEach(b => { b.disabled = locked(); });
+  ["enrollCode", "enrollBtn"].forEach(id => {
+    const x = document.getElementById(id);
+    if (x) x.disabled = locked();
+  });
   // 잠겨 있으면 버튼을 눌러도 안 되게 미리 막는다 — 눌러보고 실패하는 것보다 낫다.
   document.querySelectorAll("#pane-setup button[data-off-team],#pane-setup button[data-on-team],"
     + "#pane-setup button[data-off-proj],#pane-setup button[data-on-proj],"
@@ -1552,6 +1869,99 @@ async function loadFx() {
     : "아직 받아온 환율이 없습니다";
 }
 async function refreshFx() { await api("/admin/fx?refresh=1"); loadFx(); loadUsage(); }
+
+/* ---- PC: 새 PC 승인 · 끊기 ---- */
+// 이 페이지는 서버 코드의 문자열 안에 들어 있어서 백슬래시·백틱을 쓰지 않는다.
+const NL = String.fromCharCode(10);
+// 서버 시각(UTC)을 한국 시각으로: "2026-10-08T03:12:00" -> "10-08 12:12"
+function kst(s) {
+  if (!s) return "";
+  const d = new Date(String(s).replace(" ", "T") + (/Z$/.test(String(s)) ? "" : "Z"));
+  if (isNaN(d.getTime())) return String(s);
+  return new Date(d.getTime() + 9 * 3600 * 1000).toISOString().slice(5, 16).replace("T", " ");
+}
+async function loadEnroll() {
+  const d = await api("/admin/enroll");
+  const el = document.getElementById("enrollList");
+  if (!el) return;
+  const p = d.pending || [], r = d.recent || [];
+  let h = p.length
+    ? '<div class="sub" style="margin-bottom:6px">승인을 기다리는 PC (번호는 그 PC 화면에 있습니다)</div>'
+      + '<table><thead><tr><th>요청 시각</th><th>PC 이름</th><th>윈도우 사용자</th><th>IP</th><th></th></tr></thead><tbody>'
+      + p.map(x => '<tr><td>' + esc(kst(x.created_at)) + '</td><td><b>' + esc(x.machine) + '</b></td><td>'
+        + esc(x.user) + '</td><td class="muted">' + esc(x.ip) + '</td><td class="num">'
+        + '<button class="ghost" data-deny="' + esc(x.req_id) + '">거절</button></td></tr>').join("")
+      + '</tbody></table>'
+    : '<div class="empty">승인을 기다리는 PC 가 없습니다.</div>';
+  if (r.length) {
+    const st = { approved: "승인", denied: "거절" };
+    h += '<div class="sub" style="margin:12px 0 6px">최근 24시간 처리</div><table><tbody>'
+      + r.map(x => '<tr><td class="muted">' + esc(kst(x.decided_at)) + '</td><td>' + esc(x.machine)
+        + '</td><td>' + esc(x.user) + '</td><td>' + (st[x.status] || esc(x.status))
+        + (x.status === "approved"
+            ? (x.picked_up_at ? ' <span class="ok">· 앱이 받아감</span>' : ' <span class="muted">· 앱이 아직 안 받아감</span>')
+            : '')
+        + '</td></tr>').join("") + '</tbody></table>';
+  }
+  el.innerHTML = h;
+  el.querySelectorAll("button[data-deny]").forEach(b => { b.onclick = () => denyReq(b.dataset.deny); });
+  renderLock();
+}
+async function approveCode() {
+  if (locked()) return alert("먼저 잠금을 해제하세요.");
+  const box = document.getElementById("enrollCode");
+  const code = box.value.replace(/[^0-9]/g, "");
+  if (code.length !== 4) return alert("번호 4자리를 넣어 주세요.");
+  // 먼저 그 번호가 어느 PC 인지 받아 보여주고, 확인을 받은 뒤에만 승인한다.
+  const pv = await api("/admin/enroll/approve", { method: "POST", body: JSON.stringify({ code }) });
+  if (!pv.ok) return alert(pv.need_setup ? "먼저 잠금을 해제하세요." : (pv.error || "승인하지 못했습니다."));
+  if (!confirm("이 PC 를 승인할까요?" + NL + NL + "PC 이름: " + pv.machine + NL + "윈도우 사용자: " + pv.user
+      + NL + "요청 시각: " + kst(pv.created_at))) return;
+  const d = await api("/admin/enroll/approve", { method: "POST", body: JSON.stringify({ code, confirm: true }) });
+  if (!d.ok) return alert(d.error || "승인하지 못했습니다.");
+  box.value = "";
+  alert("승인했습니다. " + d.machine + " 의 앱이 몇 초 안에 알아서 쓸 수 있게 됩니다."
+    + (d.reused ? NL + NL + "이 PC 가 예전에 쓰던 출입증을 그대로 이어받았습니다 (PC 기록이 이어집니다)." : ""));
+  loadEnroll(); loadPcs();
+}
+async function denyReq(id) {
+  if (!confirm("이 요청을 거절할까요? 그 PC 는 앱을 다시 켜서 새 번호를 받아야 합니다.")) return;
+  const d = await api("/admin/enroll/deny", { method: "POST", body: JSON.stringify({ req_id: id }) });
+  if (!d.ok) return alert(d.need_setup ? "먼저 잠금을 해제하세요." : (d.error || "거절하지 못했습니다."));
+  loadEnroll();
+}
+async function loadPcs() {
+  const d = await api("/admin/tokens");
+  const el = document.getElementById("pcList");
+  if (!el) return;
+  // PC 이름을 바꿨으면 "새 이름 (처음 이름)" — 사용량 탭의 PC 보기와 같은 규칙.
+  const name = t => (t.current_name && t.current_name !== t.machine)
+    ? (t.current_name + " (" + t.machine + ")") : (t.machine || "?");
+  const rows = (d.tokens || []).slice().sort((a, b) =>
+    (a.revoked === b.revoked ? 0 : a.revoked ? 1 : -1) || name(a).localeCompare(name(b), "ko", { numeric: true }));
+  if (!rows.length) { el.innerHTML = '<div class="empty">등록된 PC 가 없습니다.</div>'; return; }
+  const live = rows.filter(t => !t.revoked).length;
+  el.innerHTML = '<div class="sub" style="margin-bottom:8px">사용 중 ' + live + '대'
+    + (rows.length > live ? ' · 끊김 ' + (rows.length - live) + '대' : '') + '</div>'
+    + '<table><thead><tr><th>PC</th><th>윈도우 사용자</th><th>앱 버전</th><th>마지막 실행</th><th>상태</th><th></th></tr></thead><tbody>'
+    + rows.map(t => '<tr' + (t.revoked ? ' class="muted"' : '') + '><td><b>' + esc(name(t)) + '</b></td><td>' + esc(t.user)
+      + '</td><td class="muted">' + esc(t.app_version || "") + '</td><td class="muted">'
+      + esc(kst(t.last_key_fetch || t.issued_at)) + '</td><td>'
+      + (t.revoked ? '끊김' + (t.revoked_at ? ' <span class="muted">' + esc(kst(t.revoked_at)) + '</span>' : '')
+                   : '<span class="ok">사용 중</span>')
+      + '</td><td class="num">'
+      + (t.revoked ? '' : '<button class="ghost" data-revoke="' + esc(t.token_id) + '" data-name="' + esc(name(t)) + '">끊기</button>')
+      + '</td></tr>').join("") + '</tbody></table>';
+  el.querySelectorAll("button[data-revoke]").forEach(b => { b.onclick = () => revokePc(b.dataset.revoke, b.dataset.name); });
+  renderLock();
+}
+async function revokePc(id, nm) {
+  if (!confirm(nm + " 을(를) 끊을까요?" + NL + NL
+      + "그 PC 는 키를 더 받지 못해 이미지를 만들 수 없습니다. 지난 사용량은 그대로 남습니다.")) return;
+  const d = await api("/admin/revoke", { method: "POST", body: JSON.stringify({ token_id: id }) });
+  if (!d.ok) return alert(d.need_setup ? "먼저 잠금을 해제하세요." : (d.error || "끊지 못했습니다."));
+  loadPcs();
+}
 
 applyPreset("thisMonth");
 </script></body></html>`;
@@ -1925,6 +2335,17 @@ export default {
     }
     if (path === "/key" && request.method === "POST") {
       return handleKey(request, env, ctx);
+    }
+    // 새 PC: 승인 요청을 올리고(번호를 받고), 승인됐는지 묻는다.
+    if (path === "/enroll/request" && request.method === "POST") {
+      return handleEnrollRequest(request, env);
+    }
+    if (path === "/enroll/poll" && request.method === "POST") {
+      return handleEnrollPoll(request, env);
+    }
+    // Vertex 1시간짜리 출입증. 앱의 google-auth 가 만료 전에 알아서 다시 부른다.
+    if (path === "/vertex-token" && request.method === "POST") {
+      return handleVertexToken(request, env);
     }
     // 앱이 실행 때 받아가는 팀/프로젝트 목록 — 토큰이 있어야 한다.
     if (path === "/catalog" && request.method === "GET") {

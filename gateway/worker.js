@@ -1957,15 +1957,29 @@ async function loadPcs() {
   const live = rows.filter(t => !t.revoked);
   const nClean = live.filter(t => Array.isArray(t.plain_left) && !t.plain_left.length).length;
   const nLeft = live.filter(t => Array.isArray(t.plain_left) && t.plain_left.length).length;
-  el.innerHTML = '<div class="sub" style="margin-bottom:8px">사용 중 ' + live.length + '대'
+  // 어디서 접속하는지: 마지막으로 키를 받아 간 공인 IP(앱을 켤 때마다 갱신). 사무실 PC 들은 보통
+  // 같은 주소 하나로 묶이니, 대수가 적은 주소가 집·외부에서 쓰는 PC 다.
+  const ipCount = {};
+  live.forEach(t => { if (t.last_ip) ipCount[t.last_ip] = (ipCount[t.last_ip] || 0) + 1; });
+  const ipTop = Object.keys(ipCount).sort((a, b) => ipCount[b] - ipCount[a]);
+  // 사무실은 공인 주소를 여러 개 쓴다(실측: 27·11·11·10대). "제일 많은 주소가 아니면 밖" 으로 보면
+  // 사무실 PC 수십 대가 다 걸린다. 그래서 2대 이하만 쓰는 주소만 "다른 곳" 으로 표시한다.
+  const rareIp = ip => ipCount[ip] <= 2 && ipTop.length > 1 && ipCount[ipTop[0]] >= 5;
+  el.innerHTML = '<div class="sub" style="margin-bottom:6px">사용 중 ' + live.length + '대'
     + (rows.length > live.length ? ' · 끊김 ' + (rows.length - live.length) + '대' : '')
     + ' &nbsp;|&nbsp; 평문 키: <span class="ok">정리됨 ' + nClean + '</span>'
     + (nLeft ? ' · <span class="pill">남음 ' + nLeft + '</span>' : ' · 남음 0')
     + ' · 확인 전 ' + (live.length - nClean - nLeft) + '</div>'
-    + '<table><thead><tr><th>PC</th><th>윈도우 사용자</th><th>앱 버전</th><th>마지막 실행</th><th>상태</th><th>평문 키</th><th></th></tr></thead><tbody>'
+    + (ipTop.length ? '<div class="sub" style="margin-bottom:8px">접속 IP: '
+        + ipTop.slice(0, 6).map(ip => esc(ip) + ' ×' + ipCount[ip]).join(" · ")
+        + (ipTop.length > 6 ? ' 외 ' + (ipTop.length - 6) + '곳' : '') + '</div>' : '')
+    + '<table><thead><tr><th>PC</th><th>윈도우 사용자</th><th>앱 버전</th><th>마지막 실행</th><th>IP</th><th>상태</th><th>평문 키</th><th></th></tr></thead><tbody>'
     + rows.map(t => '<tr' + (t.revoked ? ' class="muted"' : '') + '><td><b>' + esc(name(t)) + '</b></td><td>' + esc(t.user)
       + '</td><td class="muted">' + esc(t.app_version || "") + '</td><td class="muted">'
-      + esc(kst(t.last_key_fetch || t.issued_at)) + '</td><td>'
+      + esc(kst(t.last_key_fetch || t.issued_at)) + '</td><td class="muted" style="font-size:12px">'
+      + (t.last_ip ? esc(t.last_ip) + (rareIp(t.last_ip) && !t.revoked
+          ? ' <span class="pill" title="이 주소로 접속하는 PC 가 2대 이하 — 사무실 밖일 수 있음">다른 곳</span>' : '') : '')
+      + '</td><td>'
       + (t.revoked ? '끊김' + (t.revoked_at ? ' <span class="muted">' + esc(kst(t.revoked_at)) + '</span>' : '')
                    : '<span class="ok">사용 중</span>')
       + '</td><td>' + plainCell(t)

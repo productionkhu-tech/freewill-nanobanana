@@ -3,7 +3,7 @@
 멀티 프로바이더 AI 이미지 생성 데스크톱 앱 (Flask + pywebview + PyInstaller).
 이 문서 하나로 **구조 · 원리 · 규칙 · 배포 · 관리**를 파악할 수 있게 씁니다. 낡은 내용을 발견하면 즉시 고칠 것.
 
-> 최종 갱신: 2026-10-08 (v2026-10-0801 기준 — 키 보안 개편)
+> 최종 갱신: 2026-10-20 (v2026-10-2001 기준 — 에이전트가 탭을 지정해 보내기)
 
 ---
 
@@ -18,6 +18,8 @@
   (Reve는 2026-09 API 서비스 종료로 제거 — 구 프로젝트의 reve-create는 로드 시 기본 모델로 자동 폴백)
 - **멀티 프로젝트 탭**: 앱 상태는 `_Shared`(앱 전역) + 프로젝트별 `AppState` N개.
   `state`는 "이 요청이 다루는 프로젝트"를 가리키는 프록시라 기존 라우트는 그대로 동작
+- **에이전트 → 탭 지정 생성** (v2026-10-2001~): `/api/generate` 에 `pid` 를 주면 그 탭에 그 요청의 값으로만 생성.
+  화면의 탭도, 그 탭의 입력칸도 안 바뀐다. 모르는 pid 는 404. §2.2
 - **배포**: GitHub Release에 EXE 업로드 → 사용자는 **앱을 껐다 켜기만 하면 자동 설치** (클릭 불필요)
 - **버전**: `vYYYY-MM-DDNN` — **오늘 날짜 기준**, 같은 날 재릴리스는 NN 증가, 날짜 바뀌면 01부터
 - **맥**: EXE 없이 소스 실행 (`server_mac.py` + `keys.env`), git pull로 업데이트
@@ -28,14 +30,14 @@
 
 ```
 나노바나나 api/                     # 프로젝트 루트 = 문서 저장 폴더
-├── app.py                  # Flask 서버 + AppState(상태·로직 전부), ~4550줄, 라우트 64개
+├── app.py                  # Flask 서버 + AppState(상태·로직 전부), ~6850줄, 라우트 82개
 ├── launcher.py             # pywebview 창 수명주기 + 단일인스턴스 + --updater 모드 + 부팅 업데이트 체크
 ├── updater.py              # 버전 체크 + 자산 다운로드/검증 + EXE 자기교체 + 자동설치 시도 예산
 ├── nb_gateway.py           # 게이트웨이 클라이언트: 출입증·키 받기, DPAPI 금고, 승인 요청, 평문 정리, 사용량 spool
 ├── gateway/worker.js       # Cloudflare Worker (키 배포·승인·사용량 집계·관리자 페이지). wrangler deploy
 ├── VERSION                 # 현재 버전 (커밋 대상, EXE에 번들됨)
 ├── NanoBanana.spec         # PyInstaller onefile 설정
-├── static/app.js           # 프론트 로직 전부 (~3390줄)   static/style.css
+├── static/app.js           # 프론트 로직 전부 (~5100줄)   static/style.css
 ├── templates/index.html    # 메인 UI
 ├── templates/viewer.html   # 프리뷰 창 (자체 완결 — 뷰어 로직 전부 이 파일)
 ├── templates/prompt_popup.html
@@ -112,6 +114,41 @@ NanoBanana.exe 실행
   끊긴 PC 는 티켓으로 되돌아오지 못한다(워커가 거부) — 다시 쓰려면 새 번호 승인
 - **재설치**: 같은 윈도우 계정·같은 PC 이름이면 승인할 때 예전 출입증을 그대로 돌려준다(ident 재사용) → PC 기록 이어짐
 - **새 PC 온보딩**: 최신 EXE 만 주고(구버전은 환경변수 키 없으면 시작을 거부해 업데이트도 못 받는다) → 번호 승인
+
+### 2.2 에이전트가 탭을 지정해 보내기 (v2026-10-2001~)
+설계 원문: `D:\연구\2026.10.02 api mcp\앱 패치 계획 — 탭 이동 없이 보내기.md` §2 (커넥터·시댄스 쪽은 그쪽 세션 몫)
+```
+원칙
+  화면의 탭을 바꾸지 않는다            → switch 없음, 새 탭은 activate:false
+  그 탭의 입력칸에 쓰지 않는다          → 프롬프트·모델·비율·레퍼런스는 요청에 실어 그 묶음에만 (1회성)
+  pid 는 엄격                          → 모르는 pid 는 404 no_such_tab. 화면 탭으로 폴백 안 함 (규칙 24)
+  팀·프로젝트는 사람만 고른다           → 미설정 탭은 needs_billing 으로 거절 → 사람이 탭의 "!" / 우클릭 "팀·프로젝트…"
+```
+| 요청 | 하는 일 |
+|---|---|
+| `GET /api/projects` | `agent_pid: true`·`features:["agent_pid"]`(기능 확인), 탭마다 `pid·name·generating·billing_confirmed` |
+| `POST /api/generate` `{pid, prompt, settings:{model,aspect,resolution,quality,count,custom_w,custom_h,openai_bg_transparent}, ref_paths:[..]}` | 그 탭에 생성 → `{ok, batch_id, pid, count, queued, outstanding}`. pid 가 없으면 예전 그대로(화면 탭의 입력칸 = 창의 Generate) |
+| `GET /api/batch?pid=&batch_id=` | 그 묶음의 `count·done·failed·cancelled·pending·finished·images·errors`. `finished` 면 더 올 것 없음 |
+| `GET /api/gallery?pid=&strict=1&batch_id=` | 그 묶음의 이미지 (항목마다 `batch_id`) |
+| `GET /api/settings?pid=` · `/api/refs?pid=` · `/api/billing/state?pid=` | 그 탭 읽기 (엄격) |
+| `POST /api/stop {pid}` | 그 탭만 멈춤 |
+| `POST /api/projects/new {title, activate:false}` | 화면을 안 바꾸고 새 탭 (사람이 시켰을 때만). false·0·"false"·"0"·"no"·"off" 다 "안 바꿈" |
+
+- **빠진 설정값**은 그 탭의 지금 값을 읽어 쓴다(쓰지는 않음). 그 값이 고른 모델에 안 맞으면(Pro 의 4K 가 남은 채 Lite 를
+  고름) 모델 기본값(auto / 1K / 시드림 기본 / high) — 창에서 모델을 바꿀 때와 같다. **에이전트가 보낸 값**이 안 맞으면
+  고치지 않고 거절: `bad_aspect|bad_resolution|bad_quality` + `field` + `allowed`. 화면 메뉴가 막는 값과 같은 기준
+  (`_agent_settings_problem`). 예전 경로는 모르는 비율을 조용히 빼고 갤러리엔 요청한 비율을 적었다
+- 그 밖의 거절: `unknown_model`, `ref_limit`(모델별 장수), `ref_unreadable`, `ref_duplicate`(픽셀 비교 — 다시 저장한
+  사본도 잡힘, 드롭과 같은 규칙), `Empty prompt`, 큐 가득, 멈추는 중. 거절이면 아무것도 생성되지 않는다
+- 크기 계산은 창·에이전트 모두 `_gen_img_cfg` 하나. 갤러리 "Load setup" 은 에이전트 프롬프트를 섹션 하나로 돌려준다
+- 창 쪽 표시: `batch_started` 이벤트(탭 줄 점이 첫 장이 아니라 시작부터 켜짐. 에이전트 묶음이면 "에이전트가 'X' 탭에서
+  N장 생성을 시작했습니다" 토스트), `projects_changed`(탭 줄 다시 그림), 팀·프로젝트 미설정 탭의 "!" 표시
+- **묶음 집계는 메모리에만** (탭마다 최근 50개, 재시작하면 사라짐 → 그땐 갤러리 `batch_id` 로). `_batch_open` 은
+  `pending_jobs_lock` 안에서(일이 워커에 보이기 전에). 워커가 끝날 때 못 끝난 묶음 닫기(Stop → cancelled, 사고 →
+  failed)도 **같은 락 안에서** — 밖에서 하면 그 틈에 들어온 다음 묶음까지 닫아 버린다
+- **에이전트가 부르면 안 되는 것** (서버가 막지 않는다 — 커넥터 정책으로 막는다): `/api/billing/set`(사람만),
+  `/api/projects/switch`, `POST /api/settings`(입력칸 쓰기), `/api/events`(pop 방식이라 화면 팝업을 가로챈다),
+  `/api/status`(화면 탭 기준)
 
 ### 프론트 ↔ 서버
 - 상태는 `AppState` 싱글톤 하나에 전부 (설정·갤러리·ref 슬롯·큐·로그·이벤트)
@@ -225,6 +262,9 @@ gen_worker:
 23. **평문 정리(`scrub_plaintext`)는 게이트웨이에서 "새로 받은" 키로만, "우리 것"으로 증명된 것만.** 금고 사본이나
     옛 환경변수로 판단해 지우면, 게이트웨이가 못 주는 키를 지워 PC 를 오프라인으로 만든다. 테스트는
     `_env_key`/`_home` 인자로 가짜 레지스트리 키·임시 홈을 쓸 것 — 실제 환경변수를 지운 적은 없지만 지울 수 있는 코드다
+24. **pid 가 온 요청을 화면 탭으로 폴백하지 말 것, 에이전트 경로에서 탭 입력칸(state)에 쓰지 말 것.** 폴백하면 사람이
+    보고 있는 탭에 생성·저장이 새어 들어간다(닫힌 탭의 늦은 저장이 화면 탭 프롬프트를 덮던 경로도 같은 원인).
+    pid 가 오면 읽기(`_tab_for_read`)·쓰기 모두 `_project_strict` → 없으면 404. 예외는 뷰어용 `/api/gallery`(strict 없이) 하나
 
 ---
 
@@ -394,6 +434,9 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 | 옛 EXE 가 "API 자격증명 없음" 으로 안 켜짐 | 0801 이전 launcher 의 환경변수 검사 + 키 없는 PC | 최신 EXE 로 교체 (정리된 PC 는 표시값 덕에 옛 EXE 도 켜진다) |
 | 테스트가 개발 PC 환경변수 키를 못 찾음 | 0801 이 이 PC 도 정리함(정상) | 실키 테스트는 게이트웨이 + 일회용 신원(nb-selftest), 끝나면 KV·D1 정리 |
 | Program Files 설치 사용자 | UAC로 자기교체 불가 | 일반 폴더로 이동 안내 |
+| 에이전트 요청이 `needs_billing` | 그 탭 팀·프로젝트 미설정 | 사람이 탭의 "!" 또는 우클릭 "팀·프로젝트…" (탭을 안 옮기고 고름) |
+| 에이전트 요청이 `bad_aspect` 등 | 그 모델이 모르는 값을 보냄 | 응답의 `allowed` 중에서 다시 (§2.2) |
+| `/api/batch` 가 `no_such_batch` | 앱 재시작(집계는 메모리) 또는 그 탭의 최근 50개 밖 | 갤러리 `?batch_id=` 로 찾기 |
 
 ---
 

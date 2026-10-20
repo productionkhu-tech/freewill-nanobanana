@@ -796,6 +796,11 @@ class AppState:
         self.max_parallel_requests = 100
         self.pending_jobs = []
         self.pending_jobs_lock = threading.Lock()
+        # Per-batch tally (done / failed / cancelled) for callers that cannot
+        # watch the window's pop-once events — the agent asks /api/batch.
+        # Newest 50 kept; see _batch_open/_batch_note.
+        self.batches = {}
+        self.batch_lock = threading.Lock()
         self.active_job_count = 0
         self.output_dir = os.path.join(os.path.expanduser("~"), "Desktop", "NanoBanana_Output")
         self.file_counter = 0
@@ -1064,6 +1069,8 @@ class AppState:
     def get_provider_label(self, provider):
         if provider == "openai":
             return "OpenAI"
+        if provider == "seedream":
+            return "Seedream"   # was reported as "Studio" in the batch-start log
         return "Vertex" if provider == "vertex" else "Studio"
 
     def build_provider_order(self, preferred_provider=None):
@@ -2588,6 +2595,54 @@ class AppState:
         with self.pending_jobs_lock:
             return len(self.pending_jobs)
 
+    # --- per-batch tally (for /api/batch) ---------------------------------
+    # The gallery lists only images that came out and the window's events are
+    # consumed by the window, so a caller that sent 4 and sees 3 could not tell
+    # "one failed" from "one still running". This answers that.
+    def _batch_open(self, batch_id, count, agent):
+        with self.batch_lock:
+            self.batches[batch_id] = {
+                "count": int(count), "done": 0, "failed": 0, "cancelled": 0,
+                "images": [], "errors": [], "agent": bool(agent),
+                "started_at": time.time(), "finished_at": None,
+            }
+            if len(self.batches) > 50:
+                oldest = sorted(self.batches, key=lambda k: self.batches[k]["started_at"])
+                for k in oldest[:len(self.batches) - 50]:
+                    self.batches.pop(k, None)
+
+    def _batch_note(self, batch_id, kind, filepath=None, error=None):
+        """kind: done | failed | cancelled."""
+        if not batch_id:
+            return
+        with self.batch_lock:
+            b = self.batches.get(batch_id)
+            if b is None:
+                return
+            b[kind] += 1
+            if filepath:
+                b["images"].append(filepath)
+            if error:
+                b["errors"] = (b["errors"] + [str(error)[:200]])[-5:]
+            if b["done"] + b["failed"] + b["cancelled"] >= b["count"] and not b["finished_at"]:
+                b["finished_at"] = time.time()
+
+    def _batch_close_unfinished(self, reason):
+        """The worker is gone (Stop dropped the queue, or it crashed): whatever
+        has not reported will never run. Count it so no batch waits forever."""
+        with self.batch_lock:
+            for b in self.batches.values():
+                if b["finished_at"]:
+                    continue
+                left = b["count"] - b["done"] - b["failed"] - b["cancelled"]
+                if left > 0:
+                    if reason == "stopped":
+                        b["cancelled"] += left
+                    else:
+                        b["failed"] += left
+                        b["errors"] = (b["errors"] + [reason])[-5:]
+                b["finished_at"] = time.time()
+
     def gen_worker(self):
         try:
             self._gen_worker_body()
@@ -2609,12 +2664,14 @@ class AppState:
             # with "outstanding N, no worker" — the exact stall bug we set out
             # to kill. v2102 splits the three cases.
             respawn = False
+            stopped = False
             with self.pending_jobs_lock:
                 if self.cancel_flag:
                     self.pending_jobs.clear()
                     self.is_generating = False
                     self.cancel_flag = False
                     self.active_job_count = 0
+                    stopped = True
                 elif self.pending_jobs:
                     self.active_job_count = 0
                     respawn = True
@@ -2622,6 +2679,14 @@ class AppState:
                     self.is_generating = False
                     self.cancel_flag = False
                     self.active_job_count = 0
+                if not respawn:
+                    # Nothing will run any more: a batch still short of its count
+                    # was stopped (or lost to a crash) — say so instead of leaving
+                    # it open. Inside the lock on purpose: a request arriving the
+                    # moment we let go opens its batch under this same lock, and
+                    # that batch belongs to the NEXT worker — closing it from here
+                    # would report it stopped/failed before it ever ran.
+                    self._batch_close_unfinished("stopped" if stopped else "worker ended before it ran")
             if respawn:
                 threading.Thread(target=self.gen_worker, daemon=True).start()
             else:
@@ -2662,6 +2727,7 @@ class AppState:
                         self.log(f"Submit failed: {str(e)[:120]}")
                         self._finish_pending_job()
                         self.fail_count += 1
+                        self._batch_note(job.get("batch_id"), "failed", error="submit failed: %s" % str(e)[:120])
                         continue
                     active[fut] = job
 
@@ -2734,11 +2800,15 @@ class AppState:
                             "naming": naming,
                             "ref_paths": list(job.get("ref_paths", [])),
                             "pinned_ref_paths": list(job.get("pinned_ref_paths", [])),
+                            # Which request made it — an agent finds its own images by this.
+                            "batch_id": job.get("batch_id", ""),
+                            "agent": bool(job.get("agent")),
                         }
                         self.add_gallery_item(fp, prompt, elapsed, api_used,
                                               aspect=aspect, resolution=resolution,
                                               generated_at=gen_at,
                                               generation_settings=gen_settings)
+                        self._batch_note(job.get("batch_id"), "done", filepath=fp)
                         # 비용 귀속 한 줄. 파일에 덧붙이기만 하고 전송은
                         # 백그라운드가 맡는다 — 여기서 네트워크를 타면 생성
                         # 루프가 그만큼 느려진다.
@@ -2751,6 +2821,7 @@ class AppState:
                             self.unseen_done += 1
                         self.push_event({
                             "type": "image_done",
+                            "batch_id": job.get("batch_id", ""),
                             "filepath": fp,
                             "filename": fn,
                             "elapsed": round(elapsed, 1),
@@ -2767,8 +2838,10 @@ class AppState:
                             self._spool_usage_row(job, result, None, result.get("elapsed", 0),
                                                   result.get("api_used") or "", model)
                         self.fail_count += 1
+                        self._batch_note(job.get("batch_id"), "failed", error=result.get("error", ""))
                         self.push_event({
                             "type": "image_failed",
+                            "batch_id": job.get("batch_id", ""),
                             "index": idx,
                             "error": result.get("error", ""),
                             "done": self.done_count,
@@ -2781,6 +2854,7 @@ class AppState:
                         if result.get("usage"):
                             self._spool_usage_row(job, result, None, result.get("elapsed", 0),
                                                   result.get("api_used") or "", model)
+                        self._batch_note(job.get("batch_id"), "cancelled")
                         self.log(f"[{idx+1}] Cancelled")
 
                 # Refill loop
@@ -3340,6 +3414,9 @@ def api_status():
 
 @app.route("/api/settings", methods=["GET"])
 def get_settings():
+    state = _tab_for_read()                 # shadows the module proxy on purpose
+    if state is None:
+        return _no_such_tab()
     return jsonify({
         "model": state.model,
         "aspect": state.aspect,
@@ -3391,6 +3468,11 @@ def update_settings():
     # page debounces edits by 500ms, so a save can land after the user already
     # switched tabs — that is how a prompt typed in one project ended up in
     # another. The pid pins it to where it was typed.
+    # A pid that is no longer open is refused, not applied to the tab on screen:
+    # a save for a closed tab (or a stale pid from a caller) would otherwise
+    # overwrite the prompt and settings of whatever the person is looking at.
+    if d.get("pid") and _project_strict(d.get("pid")) is None:
+        return _no_such_tab()
     state = _project_from_body(d)      # shadows the module proxy on purpose
     # Snapshot first: a POST that changes nothing must not mark the project
     # dirty. The page re-sends the whole settings block after opening a project
@@ -3462,6 +3544,9 @@ def get_refs():
     # is reported as {index, empty: true} so the grid can render a hole
     # placeholder there. `count` is the number of FILLED slots; `slot_count`
     # is the total number of slots (highest [Image N] number in play).
+    state = _tab_for_read()                 # shadows the module proxy on purpose
+    if state is None:
+        return _no_such_tab()
     state.ensure_refs_loaded()
     with state.ref_lock:
         images = list(state.ref_images)
@@ -3866,10 +3951,21 @@ def _project_for_request():
 
 @app.route("/api/gallery")
 def get_gallery():
-    state = _project_for_request()          # shadows the module proxy on purpose
+    # strict=1 (agent): a pid that is not open is an error, never the tab on
+    # screen. The viewer keeps the lenient lookup — it outlives a closed tab.
+    if request.args.get("strict") in ("1", "true"):
+        state = _project_strict(request.args.get("pid", ""))
+        if state is None:
+            return _no_such_tab()
+    else:
+        state = _project_for_request()      # shadows the module proxy on purpose
+    want_batch = request.args.get("batch_id", "")
     state.prune_missing_files()
     items = []
     for fp, item in sorted(state.gallery_items.items(), key=lambda x: (x[1].get("order", 0), x[0])):
+        gs = item.get("generation_settings", {}) or {}
+        if want_batch and gs.get("batch_id", "") != want_batch:
+            continue
         items.append({
             "filepath": fp,
             "filename": os.path.basename(fp),
@@ -3886,6 +3982,7 @@ def get_gallery():
             "transparent": bool(item.get("generation_settings", {}).get("openai_bg_transparent")),
             "generated_at": item.get("generated_at", ""),
             "favorite": fp in state.favorites,
+            "batch_id": gs.get("batch_id", ""),
         })
     # The gallery carries THIS project's queue state so the frontend can draw
     # the right number of skeletons for whichever tab it is showing. Reading it
@@ -4006,6 +4103,29 @@ def serve_gallery_image():
 # main window already polls /api/events, so the viewer reports through the
 # same event queue: which image is on screen (gallery follows + highlights),
 # selection toggles, and "refresh your cards" after a favorite change.
+
+def _project_strict(pid):
+    """The project a caller named — or None. No fallback.
+
+    For callers outside the window (the agent connector): a pid that does not
+    exist must fail, not quietly land on whatever tab is on screen. The lenient
+    helpers below fall back on purpose (the viewer outlives a closed tab); an
+    agent sending a batch to the wrong tab would spend money in the wrong place."""
+    if not pid:
+        return None
+    return get_project(str(pid))
+
+
+def _no_such_tab():
+    return jsonify({"ok": False, "error": "no_such_tab"}), 404
+
+
+def _tab_for_read():
+    """?pid= named -> that tab, or None when it is not open (strict). No pid ->
+    the tab on screen, which is what the window itself has always asked for."""
+    pid = request.args.get("pid", "")
+    return _project_strict(pid) if pid else current_project()
+
 
 def _project_from_body(d):
     """The preview window is pinned to the project that opened it, so anything
@@ -4426,8 +4546,15 @@ def billing_catalog():
 
 @app.route("/api/billing/state")
 def billing_state():
+    # ?pid= : the tab menu's "팀·프로젝트…" opens this window for a tab that is
+    # not on screen, and an agent asks before sending whether that tab may spend.
+    state = _tab_for_read()                 # shadows the module proxy on purpose
+    if state is None:
+        return _no_such_tab()
     return jsonify({
         "ok": True,
+        "pid": state.pid,
+        "tab": state.display_name(),
         "team_id": state.billing_team_id,
         "project_id": state.billing_project_id,
         "confirmed": bool(state.billing_confirmed),
@@ -4440,6 +4567,14 @@ def billing_state():
 @app.route("/api/billing/set", methods=["POST"])
 def billing_set():
     d = request.get_json(silent=True) or {}
+    # pid: the person picked billing for a tab from its right-click menu without
+    # switching to it. Strict — the pick must land on exactly that tab.
+    if d.get("pid"):
+        state = _project_strict(d.get("pid"))   # shadows the module proxy on purpose
+        if state is None:
+            return _no_such_tab()
+    else:
+        state = current_project()
     team = str(d.get("team_id") or "").strip()
     proj = str(d.get("project_id") or "").strip()
     if not team or not proj:
@@ -4496,86 +4631,75 @@ def _billing_still_valid(team_id, project_id):
 # --- Generation ---
 @app.route("/api/generate", methods=["POST"])
 def start_generate():
-    model = state.model
-    is_openai = model in OPENAI_MODEL_IDS
-    is_seedream = model in SEEDREAM_MODEL_IDS
+    """Two callers, one queue.
 
-    if is_openai:
-        if not state.client_openai:
+    - The window's Generate button posts no body: the batch is built from the tab
+      on screen, exactly as before.
+    - An agent (the studio connector) posts {pid, prompt, settings, ref_paths}: the
+      batch goes to THAT tab and is built from those one-shot values. Nothing is
+      written into the tab's prompt, settings or reference slots, and the tab on
+      screen does not change. Only the billing pick, the output folder and the
+      gallery come from the tab — billing is always the person's choice."""
+    d = request.get_json(silent=True) or {}
+    if "pid" in d:
+        p = _project_strict(d.get("pid"))
+        if p is None:
+            return _no_such_tab()
+        return _start_generate_agent(p, d)
+    return _start_generate_window()
+
+
+def _client_gate(model):
+    """None when a client for `model` is up, else the JSON refusal."""
+    if model in OPENAI_MODEL_IDS:
+        if not shared.client_openai:
             return jsonify({"ok": False, "error": _no_client_error("OpenAI")})
-    elif is_seedream:
-        if not state.client_seedream:
+    elif model in SEEDREAM_MODEL_IDS:
+        if not shared.client_seedream:
             return jsonify({"ok": False, "error": _no_client_error("Seedream")})
-    else:
-        if not state.client_vertex and not state.client_studio:
-            return jsonify({"ok": False, "error": _no_client_error("Gemini")})
+    elif not shared.client_vertex and not shared.client_studio:
+        return jsonify({"ok": False, "error": _no_client_error("Gemini")})
+    return None
 
-    # 비용 귀속이 확인되지 않은 탭은 생성하지 않는다. 이 검사가 없으면
-    # 어디에 달아야 할지 모르는 이미지가 쌓이고, 나중에 소급할 방법이 없다.
-    if not (state.billing_confirmed and state.billing_team_id and state.billing_project_id):
+
+def _billing_gate(p):
+    """None when tab `p` may spend, else the JSON refusal (needs_billing).
+
+    비용 귀속이 확인되지 않은 탭은 생성하지 않는다. 이 검사가 없으면 어디에 달아야
+    할지 모르는 이미지가 쌓이고, 나중에 소급할 방법이 없다. 에이전트도 같은 문을
+    지난다 — 팀·프로젝트는 사람만 고른다."""
+    if not (p.billing_confirmed and p.billing_team_id and p.billing_project_id):
         return jsonify({"ok": False, "error": "팀과 프로젝트를 먼저 선택해 주세요",
-                        "needs_billing": True})
+                        "needs_billing": True, "pid": p.pid, "tab": p.display_name()})
     # 고른 뒤에 관리자가 그 건을 내렸을 수 있다. 이미 돌고 있는 배치는 건드리지
     # 않되(제출 시점에만 검사한다), 다음 생성부터는 다시 고르게 한다.
-    _ok, _gone, _canon = _billing_still_valid(state.billing_team_id, state.billing_project_id)
-    if _ok and _canon != state.billing_project_id:
+    _ok, _gone, _canon = _billing_still_valid(p.billing_team_id, p.billing_project_id)
+    if _ok and _canon != p.billing_project_id:
         # 이 탭은 이관 전 id 를 들고 있었다. 새 id 로 바꿔 둬야 이번 배치의 사용량과
         # 다음 저장이 새 id 로 간다 (워커도 별칭을 거르지만 여기서 먼저 맞춘다).
-        state.log("billing: project id updated after sheet rename %s" % ascii(_canon))
-        state.billing_project_id = _canon
-        state.project_dirty = True
+        p.log("billing: project id updated after sheet rename %s" % ascii(_canon))
+        p.billing_project_id = _canon
+        p.project_dirty = True
     if not _ok:
-        state.billing_confirmed = False
-        return jsonify({"ok": False, "needs_billing": True,
+        p.billing_confirmed = False
+        return jsonify({"ok": False, "needs_billing": True, "pid": p.pid, "tab": p.display_name(),
                         "error": "선택한 %s이(가) 목록에서 내려갔습니다. 다시 선택해 주세요" % _gone})
+    return None
 
-    prompt = state.compose_prompt()
-    if not prompt:
-        return jsonify({"ok": False, "error": "Empty prompt"})
 
-    if is_openai:
-        providers = ["openai"]
-    elif is_seedream:
-        providers = ["seedream"]
-    else:
-        providers = state.get_available_providers()
-        if not providers:
-            return jsonify({"ok": False, "error": "No provider available"})
+def _providers_for(p, model):
+    if model in OPENAI_MODEL_IDS:
+        return ["openai"]
+    if model in SEEDREAM_MODEL_IDS:
+        return ["seedream"]
+    return p.get_available_providers()
 
-    os.makedirs(state.output_dir, exist_ok=True)
-    naming = state.get_naming_settings()
 
-    count = state.count
-
-    # Check queue capacity (approximate — re-checked atomically in the
-    # critical section below; this early-out just avoids the expensive
-    # ref snapshot work when the queue is already obviously full).
-    outstanding_hint = state.get_queue_outstanding()
-    if outstanding_hint + count > state.max_queued_images:
-        return jsonify({
-            "ok": False,
-            "error": f"Queue full ({outstanding_hint}/{state.max_queued_images})",
-            "queue_full": True,
-        })
-
-    # Snapshot settings for this batch — done outside the lock because
-    # ref_image_to_bytes re-encodes images and shouldn't block other callers.
-    # (model was already read at the top of this function.)
-    aspect = state.aspect
-    resolution = state.resolution
-    quality = state.quality
-    custom_w = state.custom_w
-    custom_h = state.custom_h
-    # H1: snapshot refs BEFORE building img_cfg — Auto/freeform needs the
-    # anchor reference's real W×H to compute the gpt-image-2 size.
-    # ref_payloads is slot-indexed: position N-1 holds the bytes for [Image N],
-    # or None for an empty slot. build_user_parts resolves [Image N] against it.
-    ref_snapshots = state.get_effective_ref_images(model)
-    ref_payloads = [
-        state.ref_image_to_bytes(r) if r is not None else None
-        for r in ref_snapshots
-    ]
-    if is_openai:
+def _gen_img_cfg(model, aspect, resolution, quality, custom_w, custom_h, bg_transparent,
+                 ref_snapshots):
+    """The provider-specific size/quality block for one batch — shared by the
+    window and the agent path so the two can never disagree about a size."""
+    if model in OPENAI_MODEL_IDS:
         # H4: measure the first FILLED slot's real dimensions for Auto. PIL
         # .size is an O(1) header read (no pixel decode); guarded for 0-dim.
         anchor = next((r for r in ref_snapshots if r is not None), None)
@@ -4591,26 +4715,27 @@ def start_generate():
         if aspect == "custom":
             # Custom always wins over the reference: send the user's pixels,
             # server-side re-corrected to valid bounds (double-correction).
-            cw, ch, _cnotes = _gpt2_custom_size(state.custom_w, state.custom_h)
+            cw, ch, _cnotes = _gpt2_custom_size(custom_w, custom_h)
             size = "%dx%d" % (cw, ch)
         else:
             size = gpt2_resolve_size(aspect, resolution, ref_size)
-        img_cfg = {"size": size, "quality": openai_clamp_quality(model, state.quality)}
+        img_cfg = {"size": size, "quality": openai_clamp_quality(model, quality)}
         # Transparency is a 2.5-only parameter; gpt-image-2 400s on it. The
         # format goes with it because the API only keeps an alpha channel on
         # png/webp — asking for transparent without it silently returns a
         # filled background.
-        if model in GPT25_MODEL_IDS and state.openai_bg_transparent:
+        if model in GPT25_MODEL_IDS and bg_transparent:
             img_cfg["background"] = "transparent"
             img_cfg["output_format"] = "png"
-    elif is_seedream:
+        return img_cfg
+    if model in SEEDREAM_MODEL_IDS:
         # Seedream size: Custom = explicit WxH (Method 1, clamped to the model's
         # pixel cap). Named aspect / Auto = the resolution LEVEL (Method 2) with
         # the aspect conveyed via the prompt, so we get the official table sizes
         # (e.g. pro 2K 16:9 = 2848x1600) that the explicit-WxH path 400s on
         # (Method-1 has a stricter pixel cap).
         if aspect == "custom":
-            cw, ch, _sn = _seedream_custom_size(model, state.custom_w, state.custom_h)
+            cw, ch, _sn = _seedream_custom_size(model, custom_w, custom_h)
             img_cfg = {"size": "%dx%d" % (cw, ch)}
         else:
             level = resolution if resolution in _SEEDREAM_SIZES.get(model, {}) else _seedream_default_resolution(model)
@@ -4620,37 +4745,230 @@ def start_generate():
         _of = _SEEDREAM_OUTPUT_FORMAT.get(model)
         if _of:
             img_cfg["output_format"] = _of
-    else:
-        # H2: Gemini "auto" = OMIT aspect_ratio so the model auto-matches the
-        # input image ratio. Passing the literal "auto" string crashes
-        # ImageConfig. H9: also omit any value that isn't a valid Gemini enum
-        # for this model (e.g. a GPT-only 9:21/3:1/1:3 left in state after a
-        # model switch) — forwarding it would crash; omitting falls back to the
-        # safe auto-match. Resolution (image_size) is kept independently on Auto.
-        img_cfg = {}
-        if aspect and aspect != "auto" and _gemini_aspect_ok(model, aspect):
-            img_cfg["aspect_ratio"] = aspect
-        # 해상도를 받는 모델인가. 예전엔 "gemini-3" 글자 검사뿐이라, 이름 규칙이 바뀐
-        # gemini-nano-banana-2.1 은 2K/4K 를 골라도 image_size 가 안 실려 늘 기본 해상도로 나왔다.
-        if "gemini-3" in model or _normalize_model_name(model) in _GEMINI_IMAGE_SIZES:
-            # The Gemini API token is "512px", not "0.5K". v1201/02 shipped the
-            # wrong token; translate it here so even a project saved with "0.5K"
-            # (loaded straight into state) can't send the 400-causing value.
-            _size = "512px" if resolution == "0.5K" else resolution
-            # H10: only forward a tier this model actually supports. The lite
-            # model matches the "gemini-3" test above but is 1K-only, so a 2K/4K
-            # value carried over from another model would 400. Omitting the key
-            # lets the model use its own default instead of failing the job.
-            if _gemini_image_size_ok(model, _size):
-                img_cfg["image_size"] = _size
-    ref_paths = list(state.ref_path_list)
-    pinned_ref_paths = [
-        p for i, p in enumerate(state.ref_path_list)
-        if p and i < len(state.ref_pinned) and state.ref_pinned[i]
-    ]
-    fixed_prompt_snapshot = state.fixed_prompt
-    prompt_sections_snapshot = list(state.prompt_sections)
+        return img_cfg
+    # H2: Gemini "auto" = OMIT aspect_ratio so the model auto-matches the
+    # input image ratio. Passing the literal "auto" string crashes
+    # ImageConfig. H9: also omit any value that isn't a valid Gemini enum
+    # for this model (e.g. a GPT-only 9:21/3:1/1:3 left in state after a
+    # model switch) — forwarding it would crash; omitting falls back to the
+    # safe auto-match. Resolution (image_size) is kept independently on Auto.
+    img_cfg = {}
+    if aspect and aspect != "auto" and _gemini_aspect_ok(model, aspect):
+        img_cfg["aspect_ratio"] = aspect
+    # 해상도를 받는 모델인가. 예전엔 "gemini-3" 글자 검사뿐이라, 이름 규칙이 바뀐
+    # gemini-nano-banana-2.1 은 2K/4K 를 골라도 image_size 가 안 실려 늘 기본 해상도로 나왔다.
+    if "gemini-3" in model or _normalize_model_name(model) in _GEMINI_IMAGE_SIZES:
+        # The Gemini API token is "512px", not "0.5K". v1201/02 shipped the
+        # wrong token; translate it here so even a project saved with "0.5K"
+        # (loaded straight into state) can't send the 400-causing value.
+        _size = "512px" if resolution == "0.5K" else resolution
+        # H10: only forward a tier this model actually supports. The lite
+        # model matches the "gemini-3" test above but is 1K-only, so a 2K/4K
+        # value carried over from another model would 400. Omitting the key
+        # lets the model use its own default instead of failing the job.
+        if _gemini_image_size_ok(model, _size):
+            img_cfg["image_size"] = _size
+    return img_cfg
 
+
+def _start_generate_window():
+    # Resolved ONCE. Every `state.x` used to re-resolve the active tab, so a tab
+    # switch landing mid-request could build one batch out of two tabs' values.
+    p = current_project()
+    model = p.model
+    refused = _client_gate(model) or _billing_gate(p)
+    if refused is not None:
+        return refused
+
+    prompt = p.compose_prompt()
+    if not prompt:
+        return jsonify({"ok": False, "error": "Empty prompt"})
+    providers = _providers_for(p, model)
+    if not providers:
+        return jsonify({"ok": False, "error": "No provider available"})
+
+    os.makedirs(p.output_dir, exist_ok=True)
+    count = p.count
+
+    # Check queue capacity (approximate — re-checked atomically in the
+    # critical section below; this early-out just avoids the expensive
+    # ref snapshot work when the queue is already obviously full).
+    outstanding_hint = p.get_queue_outstanding()
+    if outstanding_hint + count > p.max_queued_images:
+        return jsonify({
+            "ok": False,
+            "error": f"Queue full ({outstanding_hint}/{p.max_queued_images})",
+            "queue_full": True,
+        })
+
+    # Snapshot settings for this batch — done outside the lock because
+    # ref_image_to_bytes re-encodes images and shouldn't block other callers.
+    # H1: snapshot refs BEFORE building img_cfg — Auto/freeform needs the
+    # anchor reference's real W×H to compute the gpt-image-2 size.
+    # ref_payloads is slot-indexed: position N-1 holds the bytes for [Image N],
+    # or None for an empty slot. build_user_parts resolves [Image N] against it.
+    ref_snapshots = p.get_effective_ref_images(model)
+    ref_payloads = [p.ref_image_to_bytes(r) if r is not None else None for r in ref_snapshots]
+    img_cfg = _gen_img_cfg(model, p.aspect, p.resolution, p.quality, p.custom_w, p.custom_h,
+                           p.openai_bg_transparent, ref_snapshots)
+    return _enqueue_batch(
+        p, model=model, providers=providers, prompt=prompt, count=count,
+        aspect=p.aspect, resolution=p.resolution, quality=p.quality,
+        custom_w=p.custom_w, custom_h=p.custom_h, img_cfg=img_cfg, ref_payloads=ref_payloads,
+        ref_paths=list(p.ref_path_list),
+        pinned_ref_paths=[x for i, x in enumerate(p.ref_path_list)
+                          if x and i < len(p.ref_pinned) and p.ref_pinned[i]],
+        fixed_prompt=p.fixed_prompt, prompt_sections=list(p.prompt_sections),
+        batch_id=uuid.uuid4().hex[:12], agent=False)
+
+
+def _agent_settings_problem(model, aspect, resolution, quality):
+    """A value the window's menus would never send for this model -> the reason,
+    else None. Refused rather than quietly dropped: a ratio the model does not
+    know used to come back as an auto-ratio image while the gallery recorded the
+    ratio that had been asked for."""
+    if model in OPENAI_MODEL_IDS:
+        if aspect not in ("auto", "custom") and aspect not in GPT2_ASPECTS:
+            return {"error": "bad_aspect", "allowed": ["auto", "custom"] + GPT2_ASPECTS}
+        if resolution not in GPT2_RESOLUTIONS:
+            return {"error": "bad_resolution", "allowed": GPT2_RESOLUTIONS}
+        if quality not in openai_qualities(model):
+            return {"error": "bad_quality", "allowed": openai_qualities(model)}
+        return None
+    if model in SEEDREAM_MODEL_IDS:
+        if aspect == "custom":
+            return None
+        tiers = _SEEDREAM_SIZES.get(model, {})
+        if resolution not in tiers:
+            return {"error": "bad_resolution", "allowed": sorted(tiers)}
+        if aspect != "auto" and aspect not in tiers[resolution]:
+            return {"error": "bad_aspect", "allowed": ["auto", "custom"] + sorted(tiers[resolution])}
+        return None
+    if aspect != "auto" and not _gemini_aspect_ok(model, aspect):
+        ok = sorted(a for a in _GEMINI_ASPECTS_31 if _gemini_aspect_ok(model, a))
+        return {"error": "bad_aspect", "allowed": ["auto"] + ok}
+    if "gemini-3" in model or _normalize_model_name(model) in _GEMINI_IMAGE_SIZES:
+        size = "512px" if resolution == "0.5K" else resolution
+        if not _gemini_image_size_ok(model, size):
+            return {"error": "bad_resolution",
+                    "allowed": sorted(_GEMINI_IMAGE_SIZES.get(_normalize_model_name(model), []))}
+    return None
+
+
+def _agent_refs(p, model, paths):
+    """Load the agent's reference files WITHOUT attaching them to the tab.
+
+    Same rules a drop into the tab meets (add_ref_image_ex): the model's limit,
+    unreadable files, the same picture twice — compared by decoded pixels exactly
+    like _find_identical_ref, so a re-encoded copy is caught on both paths.
+    Refused with the reason, never silently trimmed.
+    Returns (snapshots, payloads, None) or (None, None, error)."""
+    if not isinstance(paths, list):
+        return None, None, {"error": "ref_paths must be a list"}
+    limit = p.get_ref_limit(model)
+    if len(paths) > limit:
+        return None, None, {"error": "ref_limit", "limit": limit, "given": len(paths)}
+    snaps = []
+
+    def _fail(err):
+        for im in snaps:            # do not leave decoded images waiting for GC
+            try:
+                im.close()
+            except Exception:
+                pass
+        return None, None, err
+
+    for i, fp in enumerate(paths):
+        fp = str(fp or "")
+        try:
+            with Image.open(fp) as img:
+                pil = _to_display_image(img)
+        except Exception as e:
+            return _fail({"error": "ref_unreadable", "index": i + 1, "path": fp,
+                          "detail": str(e)[:120]})
+        raw = None
+        for j, other in enumerate(snaps):
+            if (other.size, other.mode) != (pil.size, pil.mode):
+                continue
+            raw = raw if raw is not None else pil.tobytes()
+            if other.tobytes() == raw:
+                pil.close()
+                return _fail({"error": "ref_duplicate", "index": i + 1, "same_as": j + 1})
+        snaps.append(pil)
+    return snaps, [p.ref_image_to_bytes(im) for im in snaps], None
+
+
+def _start_generate_agent(p, d):
+    prompt = str(d.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"ok": False, "error": "Empty prompt"})
+    s = d.get("settings") or {}
+    if not isinstance(s, dict):
+        return jsonify({"ok": False, "error": "settings must be an object"})
+    # Anything left out falls back to what the tab has now — read, never written.
+    model = _live_model_name(str(s.get("model") or p.model))
+    if model not in _ALL_MODEL_IDS:
+        return jsonify({"ok": False, "error": "unknown_model", "model": model})
+    refused = _client_gate(model) or _billing_gate(p)
+    if refused is not None:
+        return refused
+    aspect = str(s.get("aspect") or p.aspect)
+    resolution = str(s.get("resolution") or p.resolution)
+    quality = str(s.get("quality") or p.quality)
+    count = _safe_int(s.get("count"), p.count, lo=1, hi=10)
+    custom_w = _safe_int(s.get("custom_w"), p.custom_w, lo=16, hi=99999)
+    custom_h = _safe_int(s.get("custom_h"), p.custom_h, lo=16, hi=99999)
+    bg_transparent = bool(s.get("openai_bg_transparent", p.openai_bg_transparent))
+    # A value the agent SENT that this model does not take -> refused with the
+    # allowed list. A value it left out came from the tab and may belong to the
+    # tab's own model (a 4K left from Pro, then the agent picks Lite) -> use the
+    # model's plain default, as the window's model switch does, rather than
+    # refusing something the agent never said.
+    for _ in range(4):          # at most one fix per field, then a clean check
+        bad = _agent_settings_problem(model, aspect, resolution, quality)
+        if not bad:
+            break
+        field = bad["error"][len("bad_"):]
+        if s.get(field) not in (None, ""):
+            return jsonify(dict({"ok": False, "model": model, "field": field}, **bad))
+        if field == "aspect":
+            aspect = "auto"
+        elif field == "resolution":
+            resolution = (_seedream_default_resolution(model)
+                          if model in SEEDREAM_MODEL_IDS else "1K")
+        else:
+            quality = "high"
+
+    providers = _providers_for(p, model)
+    if not providers:
+        return jsonify({"ok": False, "error": "No provider available"})
+    os.makedirs(p.output_dir, exist_ok=True)
+    ref_paths = d.get("ref_paths") or []
+    snaps, payloads, err = _agent_refs(p, model, ref_paths)
+    if err:
+        return jsonify(dict({"ok": False}, **err))
+    img_cfg = _gen_img_cfg(model, aspect, resolution, quality, custom_w, custom_h,
+                           bg_transparent, snaps)
+    for im in snaps:
+        try:
+            im.close()
+        except Exception:
+            pass
+    r = _enqueue_batch(
+        p, model=model, providers=providers, prompt=prompt, count=count,
+        aspect=aspect, resolution=resolution, quality=quality,
+        custom_w=custom_w, custom_h=custom_h, img_cfg=img_cfg, ref_payloads=payloads,
+        ref_paths=[str(x) for x in ref_paths], pinned_ref_paths=[],
+        # "Load setup" on an agent image brings its prompt back as one section.
+        fixed_prompt="", prompt_sections=[prompt],
+        batch_id=uuid.uuid4().hex[:12], agent=True)
+    return r
+
+
+def _enqueue_batch(p, *, model, providers, prompt, count, aspect, resolution, quality,
+                   custom_w, custom_h, img_cfg, ref_payloads, ref_paths, pinned_ref_paths,
+                   fixed_prompt, prompt_sections, batch_id, agent):
+    naming = p.get_naming_settings()
     # --- Atomic critical section -----------------------------------------
     # Pre-v2101 the read of is_generating, the reset of counters, and the
     # set of is_generating=True all lived outside any lock. Two rapid
@@ -4661,25 +4979,25 @@ def start_generate():
     # jobs the other worker hadn't picked up yet (the "queue has items but
     # no worker" stall). Everything that reads or writes the shared
     # generator state now happens under pending_jobs_lock.
-    with state.pending_jobs_lock:
+    with p.pending_jobs_lock:
         # If a Stop is in flight, the previous worker is either still
         # draining active futures or already in its teardown finally. Piling
         # new jobs onto pending_jobs right now would race: the worker's
         # cancel-branch teardown would discard those jobs along with the
         # cancelled ones. Refuse cleanly; the user can retry in a moment.
-        if state.cancel_flag:
+        if p.cancel_flag:
             return jsonify({
                 "ok": False,
                 "error": "Stopping previous batch — try again in a moment",
             })
 
-        was_generating = state.is_generating
+        was_generating = p.is_generating
         # Re-check capacity with the real pending_jobs snapshot.
-        current_outstanding = len(state.pending_jobs) + state.active_job_count
-        if current_outstanding + count > state.max_queued_images:
+        current_outstanding = len(p.pending_jobs) + p.active_job_count
+        if current_outstanding + count > p.max_queued_images:
             return jsonify({
                 "ok": False,
-                "error": f"Queue full ({current_outstanding}/{state.max_queued_images})",
+                "error": f"Queue full ({current_outstanding}/{p.max_queued_images})",
                 "queue_full": True,
             })
 
@@ -4688,15 +5006,15 @@ def start_generate():
             # the generator slot BEFORE releasing the lock so any other
             # request arriving mid-setup sees is_generating=True and takes
             # the "queue into existing batch" branch instead.
-            state.queue_count = 0
-            state.done_count = 0
-            state.fail_count = 0
-            state.discarded_count = 0
-            state.is_generating = True
-            state.cancel_flag = False
+            p.queue_count = 0
+            p.done_count = 0
+            p.fail_count = 0
+            p.discarded_count = 0
+            p.is_generating = True
+            p.cancel_flag = False
             base_idx = 0
         else:
-            base_idx = state.queue_count
+            base_idx = p.queue_count
 
         new_jobs = []
         for i in range(count):
@@ -4712,43 +5030,82 @@ def start_generate():
                 "custom_w": custom_w,
                 "custom_h": custom_h,
                 "openai_bg_transparent": bool(img_cfg.get("background") == "transparent"),
-                "billing_team_id": state.billing_team_id,
-                "billing_project_id": state.billing_project_id,
+                "billing_team_id": p.billing_team_id,
+                "billing_project_id": p.billing_project_id,
                 "img_cfg": dict(img_cfg),
                 "naming": dict(naming),
                 "ref_payloads": ref_payloads,
                 "ref_paths": ref_paths,
                 "pinned_ref_paths": pinned_ref_paths,
-                "output_dir": state.output_dir,
-                "fixed_prompt": fixed_prompt_snapshot,
-                "prompt_sections": prompt_sections_snapshot,
+                "output_dir": p.output_dir,
+                "fixed_prompt": fixed_prompt,
+                "prompt_sections": prompt_sections,
                 # Remembered so Load can restore the count the user picked for
                 # this batch (per-item gen_settings used to hardcode 1).
                 "batch_count": count,
+                # Lets a caller find exactly its own images in the gallery.
+                "batch_id": batch_id,
+                "agent": bool(agent),
             })
 
-        state.pending_jobs.extend(new_jobs)
-        state.queue_count += count
-        outstanding_after = len(state.pending_jobs) + state.active_job_count
+        # Opened before the jobs become visible to the worker, so a fast first
+        # result can never arrive for a batch the tally does not know yet.
+        p._batch_open(batch_id, count, agent)
+        p.pending_jobs.extend(new_jobs)
+        p.queue_count += count
+        outstanding_after = len(p.pending_jobs) + p.active_job_count
     # --- End of critical section -----------------------------------------
 
+    who = "Agent: " if agent else ""
     if not was_generating:
         # File counter prep scans the output dir; do it outside the lock.
         # The worker thread is spawned after this returns, so there's no
         # race on file_counter.
-        state.prepare_file_counter(naming)
-        state.log(f"Starting {count} image(s) across {', '.join(state.get_provider_label(p) for p in providers)}")
-        threading.Thread(target=state.gen_worker, daemon=True).start()
+        p.prepare_file_counter(naming)
+        p.log(f"{who}Starting {count} image(s) across {', '.join(p.get_provider_label(x) for x in providers)}")
+        threading.Thread(target=p.gen_worker, daemon=True).start()
     else:
         preview = prompt.replace("\n", " ").strip()
         preview = preview[:56] + ("..." if len(preview) > 56 else "")
-        state.log(f"Queued {count} image(s) (outstanding {outstanding_after}/{state.max_queued_images}) | {preview}")
-
+        p.log(f"{who}Queued {count} image(s) (outstanding {outstanding_after}/{p.max_queued_images}) | {preview}")
+    # The tab strip shows the batch from its first moment, not from the first
+    # finished image — and an agent batch says so on screen.
+    p.push_event({"type": "batch_started", "count": count, "batch_id": batch_id,
+                  "agent": bool(agent), "outstanding": outstanding_after,
+                  "tab": p.display_name()})
     return jsonify({
         "ok": True,
         "count": count,
         "queued": was_generating,
         "outstanding": outstanding_after,
+        "batch_id": batch_id,
+        "pid": p.pid,
+    })
+
+
+@app.route("/api/batch")
+def api_batch():
+    """Where one batch stands: ?pid=&batch_id= (both required, strict).
+
+    For the agent. The window's events are pop-once and belong to the window,
+    and the gallery shows only images that came out — so "asked for 4, see 3"
+    could not tell a failure from an image still rendering. finished=true means
+    nothing more will arrive for this batch."""
+    p = _project_strict(request.args.get("pid", ""))
+    if p is None:
+        return _no_such_tab()
+    bid = request.args.get("batch_id", "")
+    with p.batch_lock:
+        b = p.batches.get(bid)
+        b = dict(b, images=list(b["images"]), errors=list(b["errors"])) if b else None
+    if b is None:
+        return jsonify({"ok": False, "error": "no_such_batch"}), 404
+    pending = max(0, b["count"] - b["done"] - b["failed"] - b["cancelled"])
+    return jsonify({
+        "ok": True, "pid": p.pid, "batch_id": bid, "count": b["count"],
+        "done": b["done"], "failed": b["failed"], "cancelled": b["cancelled"],
+        "pending": pending, "finished": bool(b["finished_at"]),
+        "images": b["images"], "errors": b["errors"],
     })
 
 
@@ -4758,7 +5115,14 @@ def stop_generate():
     # left running in a background tab had no way to be stopped without
     # switching to it first. The tab menu passes the pid.
     d = request.get_json(silent=True) or {}
-    proj = get_project(d.get("pid", "")) or current_project()
+    # A pid that is not open must not fall through to the tab on screen: that
+    # stopped the batch the person was watching instead of the one asked for.
+    if d.get("pid"):
+        proj = _project_strict(d.get("pid"))
+        if proj is None:
+            return _no_such_tab()
+    else:
+        proj = current_project()
     if proj.is_generating:
         proj.cancel_flag = True
         proj.log("Stop requested")
@@ -4843,6 +5207,8 @@ def _project_summary(p):
         # 탭만 봐도 설정이 필요한 탭을 알 수 있다.
         "billing_project_id": p.billing_project_id if p.billing_confirmed else "",
         "billing_team_id": p.billing_team_id if p.billing_confirmed else "",
+        # 생성이 막힌 탭(팀·프로젝트 미확인)을 탭 줄과 에이전트가 바로 알 수 있게.
+        "billing_confirmed": bool(p.billing_confirmed and p.billing_team_id and p.billing_project_id),
         # "saved" means the USER saved it under a name. An autosave file is a
         # crash net, not a save the user made — closing such a tab should still
         # offer to save it properly.
@@ -4859,14 +5225,29 @@ def api_projects():
         order = list(shared.project_order)
         items = [_project_summary(shared.projects[pid]) for pid in order if pid in shared.projects]
         active = shared.active_pid
-    return jsonify({"projects": items, "active": active})
+    # agent_pid: this build lets a caller address a tab by pid (generate with
+    # one-shot values, strict reads, new tab without switching). The studio
+    # connector checks it to tell this build from older ones still out there.
+    return jsonify({"projects": items, "active": active,
+                    "agent_pid": True, "features": ["agent_pid"]})
 
 
 @app.route("/api/projects/new", methods=["POST"])
 def api_projects_new():
     d = request.get_json(silent=True) or {}
-    proj = create_project(title=(d.get("title") or None), activate=True)
+    # activate=false: an agent makes a tab the person asked for without taking
+    # the screen away from what they are doing. The window learns of the new tab
+    # through an event and only redraws its tab strip.
+    # Read the way a JSON caller might send it: false / 0 / "false" / "0" / "no"
+    # all mean "do not switch". Only `False` counted before, so "false" or 0
+    # quietly took the screen.
+    raw = d.get("activate", True)
+    activate = not (raw is False or raw is None or raw == 0
+                    or str(raw).strip().lower() in ("false", "0", "no", "off"))
+    proj = create_project(title=(d.get("title") or None), activate=activate)
     _save_session()
+    if not activate:
+        proj.push_event({"type": "projects_changed"})
     return jsonify({"ok": True, "pid": proj.pid, "active": shared.active_pid})
 
 

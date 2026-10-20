@@ -234,6 +234,22 @@ header {
   justify-content: center;
   flex-shrink: 0;
 }
+/* 팀·프로젝트 미설정 = 생성이 막힌 탭. 누르면 그 탭 대상으로 고르는 창이 열린다. */
+.proj-tab .pt-bill {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: #c97a3a;
+  color: var(--bg);
+  font-size: 10px;
+  font-weight: bold;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.proj-tab .pt-bill:hover { filter: brightness(1.15); }
 /* 드래그로 순서 변경 */
 .proj-tab.pt-dragging { opacity: .45; }
 /* Drop marker. box-shadow only — it must not take up layout space, or the tabs

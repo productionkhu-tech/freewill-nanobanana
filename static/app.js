@@ -477,6 +477,10 @@ function showTabMenu(x, y, p) {
     m.appendChild(b);
   };
   mk("이름 변경 (F2)", () => renameProjectPrompt(p.pid, p.name));
+  // 이 탭으로 옮겨 가지 않고 이 탭의 팀·프로젝트를 고른다 — 에이전트가 "골라 주세요"
+  // 하고 멈춘 탭도 화면을 바꾸지 않고 풀 수 있다.
+  mk(p.billing_confirmed === false ? "팀·프로젝트 고르기… (생성 막힘)" : "팀·프로젝트…",
+     () => openBillingModal(p.pid));
   // The Stop button only reaches the visible tab; without this a background
   // batch could only be stopped by switching to it first.
   if (p.generating) {
@@ -573,10 +577,18 @@ function _makeProjectTab(pid) {
   const nm = document.createElement("span"); nm.className = "pt-name";
   const dt = document.createElement("span"); dt.className = "pt-dirty";
   dt.textContent = "*"; dt.title = "저장하지 않은 변경사항";
+  // 팀·프로젝트를 안 고른 탭 = 생성이 막힌 탭. 툴팁에만 있던 걸 탭 줄에 띄운다.
+  // 누르면 그 탭으로 옮기지 않고 바로 고르는 창이 열린다.
+  const bill = document.createElement("span"); bill.className = "pt-bill";
+  bill.textContent = "!";
+  bill.title = "팀·프로젝트 미설정 — 이 탭은 생성이 막혀 있습니다. 눌러서 고르기";
+  bill.addEventListener("click", (e) => { e.stopPropagation(); openBillingModal(pid); });
+  // A quick double press on "!" must not also start a rename of the tab.
+  bill.addEventListener("dblclick", (e) => { e.stopPropagation(); e.preventDefault(); });
   const bd = document.createElement("span"); bd.className = "pt-badge";
   const x = document.createElement("button"); x.className = "pt-close";
   x.textContent = "×"; x.title = "프로젝트 닫기";
-  tab.append(dot, nm, dt, bd, x);
+  tab.append(dot, nm, dt, bill, bd, x);
 
   // Handlers read tab._p, refreshed on every update — capturing the project
   // object here would go stale as soon as its name or dirty flag changed.
@@ -587,7 +599,7 @@ function _makeProjectTab(pid) {
   // Double-click renames — renames the actual file, so it does not fork the
   // project the way "save as" does.
   tab.addEventListener("dblclick", (e) => {
-    if (e.target.closest(".pt-close")) return;
+    if (e.target.closest(".pt-close") || e.target.closest(".pt-bill")) return;
     e.preventDefault();
     renameProjectPrompt(pid, tab._p ? tab._p.name : "");
   });
@@ -632,6 +644,8 @@ function _updateProjectTab(tab, p) {
   if (nm.textContent !== p.name) nm.textContent = p.name;
 
   tab.querySelector(".pt-dirty").style.display = p.dirty ? "" : "none";
+  // Older servers do not send the flag — show nothing rather than guess.
+  tab.querySelector(".pt-bill").style.display = p.billing_confirmed === false ? "" : "none";
 
   const bd = tab.querySelector(".pt-badge");
   const showBadge = p.unseen_done > 0 && p.pid !== activePid;
@@ -756,11 +770,18 @@ async function confirmRenameProject() {
 // 뜨는 창이라 같이 띄우면 그대로 겹쳐 보인다 — 업데이트 직후 첫 실행에서 매번
 // 걸리는 경로다(안내를 먼저 읽게 두는 게 순서상으로도 맞다).
 let _billAfterNotes = false;
+// 닫기 전에 저장하려고 잠깐 넘어간 탭에는 묻지 않는다 — 곧 닫힐 탭이고, 물으면
+// 저장 창 위에 겹쳐 뜬다.
+let _closingPid = null;
 
 async function promptBillingIfNeeded() {
   try {
-    const st = await api("/api/billing/state");
+    const pid = activePid;
+    if (pid && pid === _closingPid) return;
+    const st = await api(pid ? `/api/billing/state?pid=${encodeURIComponent(pid)}` : "/api/billing/state");
     if (!st || !st.ok || st.confirmed) return;
+    // 답을 기다리는 사이 탭이 바뀌었으면(빠른 전환·닫기) 지금 화면의 탭이 아니다.
+    if (activePid !== pid || (pid && pid === _closingPid)) return;
     const rn = document.getElementById("releaseNotesModal");
     if (rn && !rn.classList.contains("hidden")) { _billAfterNotes = true; return; }
     await openBillingModal();
@@ -836,12 +857,29 @@ async function closeProjectTab(pid) {
     const choice = await askSaveBeforeClose(p.name);
     if (choice === "cancel") return;
     if (choice === "save") {
-      if (activePid !== pid) {
-        await api("/api/projects/switch", { method: "POST", body: { pid } });
-        activePid = pid;
+      const cameFrom = activePid;
+      _closingPid = pid;
+      try {
+        if (activePid !== pid) {
+          // A real switch: the form on screen must become THIS tab's before the
+          // save reads it. Flipping only the server's active tab (as before) made
+          // saveSettings() write the OTHER tab's prompt and settings into the tab
+          // being closed — and then into its project file.
+          await switchProject(pid);
+          if (activePid !== pid) return;   // switch failed -> do not save the wrong form
+        }
+        const saved = await saveActiveProjectQuiet();
+        if (!saved) {
+          // 저장 실패·취소 -> 닫지 않음. 저장하려고 넘어왔던 거라면 보던 탭으로 되돌린다
+          // (안 그러면 닫으려던 탭 화면에 그대로 남는다).
+          if (cameFrom && cameFrom !== pid && projectTabs.some(t => t.pid === cameFrom)) {
+            await switchProject(cameFrom);
+          }
+          return;
+        }
+      } finally {
+        _closingPid = null;
       }
-      const saved = await saveActiveProjectQuiet();
-      if (!saved) return;   // 저장 실패 -> 닫지 않음
     }
   }
   const r = await api("/api/projects/close", { method: "POST", body: { pid } });
@@ -1017,7 +1055,10 @@ async function saveSettings(opts) {
     naming_padding: parseInt(document.getElementById("namingPadding").value),
     gallery_columns: galleryColumns,
   }});
-  if (r && r.ok === false) {
+  // no_such_tab: a late save for a tab that has since been closed. The server
+  // now refuses it instead of writing it into the tab on screen; there is
+  // nothing left to save into, so it is not an error to show.
+  if (r && r.ok === false && r.error !== "no_such_tab") {
     // Surface the failure — silent loss of settings is how users end up
     // fighting the UI for 10 minutes before noticing.
     showToast(r.error || "Settings save failed", "error");
@@ -3769,13 +3810,29 @@ function onBillingTeamChange(preferProject, force) {
 // 창은 **먼저 띄우고** 목록은 뒤따라 받는다. 예전엔 클라우드 왕복이 끝나야
 // 창이 나타나서 누를 때마다 한 박자씩 버벅였다. 캐시로 즉시 그려놓고 최신
 // 목록이 오면 조용히 다시 채운다 — 고른 값은 그대로 유지한다.
-async function openBillingModal() {
+// 이 창이 정하는 탭. null = 화면에 떠 있는 탭(예전 그대로). 탭 오른쪽 클릭의
+// "팀·프로젝트…" 는 그 탭으로 옮겨 가지 않고 그 탭의 값을 고르게 한다.
+let _billTargetPid = null;
+const _BILL_DESC = "탭마다 따로 정할 수 있고, 정하기 전에는 생성이 되지 않습니다.";
+
+async function openBillingModal(pid) {
+  _billTargetPid = (pid && pid !== activePid) ? pid : null;
+  const target = _billTargetPid;
+  const q = target ? "?pid=" + encodeURIComponent(target) : "";
   const m = document.getElementById("billingModal");
   const hint = document.getElementById("billingHint");
+  const desc = document.getElementById("billingDesc");
   if (hint) hint.textContent = "";
+  if (desc) {
+    const t = target ? projectTabs.find(x => x.pid === target) : null;
+    desc.textContent = target
+      ? `'${(t && t.name) || ""}' 탭의 팀·프로젝트를 정합니다. 화면의 탭은 그대로예요.`
+      : _BILL_DESC;
+  }
 
   // 아무것도 고르지 않은 채로 연다. 이 탭이 이미 쓰던 값이 있으면 그것만 되살린다.
-  const cur = _billLastState;
+  // (다른 탭 대상이면 화면 탭의 값을 미리 그리지 않는다 — 엉뚱한 값이 잠깐 보인다.)
+  const cur = target ? null : _billLastState;
   const mine = cur && cur.confirmed ? cur : null;
   if (_billCatalog.teams.length) _fillBillingSelects(mine && mine.team_id, mine && mine.project_id);
   _billRecall(null);
@@ -3787,8 +3844,13 @@ async function openBillingModal() {
   // 고르는 순간에는 최신 목록이어야 한다. 관리자가 방금 뺀 건이 남아 있으면
   // 그대로 골라버리고, 방금 추가한 건은 안 보인다.
   const warn = await loadBillingCatalog(true);
-  const fresh = await api("/api/billing/state");
-  _billLastState = fresh;
+  const fresh = await api("/api/billing/state" + q);
+  if (target && (!fresh || fresh.ok === false)) {
+    closeBillingModal();
+    showToast("그 탭이 이미 닫혔습니다", "warn");
+    return;
+  }
+  if (!target) _billLastState = fresh;
   // 이 탭이 이미 확정해 둔 값만 되살린다. 그 외에는 비워 둔다 — 미리 골라두면
   // 읽지 않고 확정해 버려서, 매번 확인받는 의미가 사라진다.
   const keepTeam = (fresh && fresh.confirmed && fresh.team_id) || "";
@@ -3856,7 +3918,7 @@ function useLastBilling() {
 async function retryBillingCatalog() {
   const hint = document.getElementById("billingHint");
   if (hint) { hint.textContent = "목록을 다시 불러오는 중…"; hint.classList.remove("hint-warn"); }
-  await openBillingModal();
+  await openBillingModal(_billTargetPid);    // 같은 탭을 대상으로 다시 연다
 }
 
 function _focusBillingApply() {
@@ -3886,6 +3948,7 @@ function _billBothChosen() {
 function closeBillingModal() {
   const m = document.getElementById("billingModal");
   if (m) m.classList.add("hidden");
+  _billTargetPid = null;          // 다음에 그냥 열면 다시 화면 탭이 대상이다
 }
 
 // Enter = 적용, Escape = 닫기. 매 실행마다 거치는 창이라 손이 마우스로 갈
@@ -3904,12 +3967,20 @@ async function saveBilling() {
   const team = document.getElementById("billingTeam").value;
   const proj = document.getElementById("billingProject").value;
   if (!team || !proj) { showToast("팀과 프로젝트를 모두 고르세요", "warn"); return; }
-  const d = await api("/api/billing/set", { method: "POST", body: { team_id: team, project_id: proj } });
-  if (!d.ok) { showToast(d.error || "설정 실패", "error"); return; }
+  const target = _billTargetPid;
+  const body = { team_id: team, project_id: proj };
+  if (target) body.pid = target;
+  const d = await api("/api/billing/set", { method: "POST", body });
+  if (!d.ok) {
+    showToast(d.error === "no_such_tab" ? "그 탭이 이미 닫혔습니다" : (d.error || "설정 실패"), "error");
+    return;
+  }
+  const t = target ? projectTabs.find(x => x.pid === target) : null;
   closeBillingModal();
-  await refreshBillingBar();
+  if (!target) await refreshBillingBar();   // 사이드바 표시는 화면 탭의 것이다
   await refreshProjects();        // 탭에 붙는 표시 갱신
-  showToast("이 탭을 " + _billTeamName(team) + " · " + _billProjectName(proj) + " 로 설정했습니다", "success");
+  showToast((target ? `'${(t && t.name) || ""}' 탭을 ` : "이 탭을 ")
+            + _billTeamName(team) + " · " + _billProjectName(proj) + " 로 설정했습니다", "success");
 }
 
 
@@ -4017,9 +4088,20 @@ function scheduleGalleryRefresh() {
 async function pollEvents() {
   const d = await api("/api/events");
   if (!d.events?.length) return;
-  let anyDone = false, anyFailed = false, anyOther = false;
+  let anyDone = false, anyFailed = false, anyOther = false, doneSeen = false;
   let lastDone = 0, lastFailed = 0, lastTotal = 0, lastOutstanding;
   for (const ev of d.events) {
+    // A tab was made without switching to it (an agent, at the person's
+    // request) — only the strip needs to know.
+    if (ev.type === "projects_changed") { anyOther = true; continue; }
+    // A batch started somewhere. The strip shows its dot from this moment, not
+    // from the first finished image; an agent's batch also says so on screen —
+    // nobody should find images they did not know were being made.
+    if (ev.type === "batch_started") {
+      anyOther = true;
+      if (ev.agent) showToast(`에이전트가 '${ev.tab || ""}' 탭에서 ${ev.count}장 생성을 시작했습니다`, "info");
+      continue;
+    }
     // Events carry the project that produced them. Anything from a background
     // tab must NOT touch this screen — it only bumps that tab's badge, which
     // refreshProjects() picks up. Without this, a batch finishing in project B
@@ -4126,7 +4208,13 @@ async function pollEvents() {
       document.getElementById("progressLabel").textContent = `Done  ok ${ev.done || 0}  fail ${ev.failed || 0}`;
       document.getElementById("progressFill").style.width = (ev.done || 0) > 0 ? "100%" : "0%";
       document.getElementById("statusLabel").textContent = `Completed  ${ev.done || 0} image(s) saved`;
-      return;
+      // Was `return`: it threw away every event still in this poll and skipped
+      // the tab-strip refresh below, so the tab's "generating" dot stayed on.
+      doneSeen = true;
+      // Image events BEFORE this "done" belong to the batch that just ended and
+      // must not re-arm the progress UI below. Ones AFTER it (a new batch begun
+      // within the same poll) still count.
+      anyDone = anyFailed = false;
     }
   }
   if (anyDone || anyFailed) {
@@ -4136,7 +4224,7 @@ async function pollEvents() {
   }
   // Progress happened somewhere else — repaint the tab strip (badge/spinner)
   // without disturbing the project on screen.
-  if (anyDone || anyFailed || anyOther) refreshProjects();
+  if (anyDone || anyFailed || anyOther || doneSeen) refreshProjects();
 }
 
 function updateProgress(cur, tot, outstanding) {

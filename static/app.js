@@ -1119,13 +1119,24 @@ const MODEL_SPECS = {
     hint: "Lite: ultra-fast & low-cost. 1K only (2K/4K unsupported).",
     refHint: "3rd-gen models support up to 14 reference images.",
   },
+  // 5.0 Pro / Flash (BytePlus doc 2026-10): 1K / 1.5K / 2K. 1.5K is billed like
+  // 1K (Pro's $0.045 tier, Flash's flat $0.018) and looks better.
   "seedream-5-0-pro-260628": {
     aspects: ["auto","1:1","4:3","3:4","16:9","9:16","3:2","2:3","21:9","custom"],
-    resolutions: ["1K","2K"],
+    resolutions: ["1K","1.5K","2K"],
     counts: ["1","2","3","4","5","6","7","8","9","10"],
     showQuality: false,
     defaultAspect: "16:9", defaultResolution: "2K",
-    hint: "BytePlus Seedream 5.0 Pro - high precision. 1K/2K, png.",
+    hint: "BytePlus Seedream 5.0 Pro - high precision. 1K/1.5K/2K, png. 1.5K costs the same as 1K.",
+    refHint: "Up to 10 reference images. Mention them as 'image 1', 'image 2' in the prompt.",
+  },
+  "seedream-5-0-flash-260915": {
+    aspects: ["auto","1:1","4:3","3:4","16:9","9:16","3:2","2:3","21:9","custom"],
+    resolutions: ["1K","1.5K","2K"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: false,
+    defaultAspect: "16:9", defaultResolution: "2K",
+    hint: "BytePlus Seedream 5.0 Flash - faster and cheaper than Pro ($0.018/image at any size). 1K/1.5K/2K, png.",
     refHint: "Up to 10 reference images. Mention them as 'image 1', 'image 2' in the prompt.",
   },
   "seedream-4-5-251128": {
@@ -1194,6 +1205,7 @@ const MODEL_SPECS = {
 const MODEL_ORDER = Object.keys(MODEL_SPECS);
 const MODEL_LABELS = {
   "seedream-5-0-pro-260628": "seedream-5-0-pro",
+  "seedream-5-0-flash-260915": "seedream-5-0-flash",
   "seedream-4-5-251128": "seedream-4-5",
   "gpt-image-2": "gpt-image-2 (OpenAI)",
   "gpt-image-2.5-flare": "gpt-image-2.5 Flare (Fast)",
@@ -1280,6 +1292,7 @@ const _MODEL_SHORT = {
   "gpt-image-2.5-flare": "GPT Image 2.5 Flare",
   "gpt-image-2.5-sunburst": "GPT Image 2.5 Sunburst",
   "seedream-5-0-pro-260628": "Seedream 5 Pro",
+  "seedream-5-0-flash-260915": "Seedream 5 Flash",
   "seedream-4-5-251128": "Seedream 4.5",
   "reve-create": "Reve 2.1",
 };
@@ -1389,7 +1402,7 @@ function applyModelSpec(model, preserved) {
 // defaultResolution 으로 되돌리면 4K를 지원하는 모델인데도 2K(GPT는 1K)에서 시작해
 // "4K 되는 곳에 갔는데 하위 화질에 갇힌다"는 문제가 생긴다. 두 제보를 모두 만족시키는
 // 규칙은 하나뿐이다 — **새 모델이 낼 수 있는 최고 화질로 맞춘다.**
-const _RES_RANK = { "512px": 0, "1K": 1, "2K": 2, "4K": 3 };
+const _RES_RANK = { "512px": 0, "1K": 1, "1.5K": 1.5, "2K": 2, "4K": 3 };
 function bestResolution(spec) {
   const list = (spec && spec.resolutions) || [];
   if (!list.length) return undefined;
@@ -1590,8 +1603,9 @@ function _fmtPx(n){ return (n/1e6).toFixed(2) + "M px"; }
 // match app.py _SEEDREAM_CUSTOM so the live preview and "최대 화질" button agree
 // with the server's re-correction.
 const _SEEDREAM_CUSTOM_JS = {
-  "seedream-5-0-pro-260628": [921600, 4624220],
-  "seedream-4-5-251128":     [3686400, 16777216],
+  "seedream-5-0-pro-260628":   [921600, 4624220],
+  "seedream-5-0-flash-260915": [921600, 4624220],
+  "seedream-4-5-251128":       [3686400, 16777216],
 };
 function seedreamCustomSize(model, w, h) {
   const b = _SEEDREAM_CUSTOM_JS[model] || _SEEDREAM_CUSTOM_JS["seedream-4-5-251128"];

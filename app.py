@@ -222,20 +222,29 @@ def _gemini_image_size_ok(model, size):
 # the gpt-image-2 path like GPT is isolated from Gemini.
 # ==========================================
 SEEDREAM_BASE_URL = "https://ark.ap-southeast.bytepluses.com/api/v3"
-SEEDREAM_MODEL_IDS = ("seedream-5-0-pro-260628", "seedream-4-5-251128")
-# output_format: pro accepts png/jpeg; 4-5 is jpeg-only (param unsupported -> omit)
+SEEDREAM_MODEL_IDS = ("seedream-5-0-pro-260628", "seedream-5-0-flash-260915", "seedream-4-5-251128")
+# output_format: 5.0 pro/flash accept png/jpeg; 4-5 is jpeg-only (param unsupported -> omit)
 _SEEDREAM_OUTPUT_FORMAT = {
     "seedream-5-0-pro-260628": "png",
+    "seedream-5-0-flash-260915": "png",
     "seedream-4-5-251128": None,
+}
+# 5.0 pro / flash share one table (BytePlus "Seedream 5.0 pro / flash" doc, 2026-10).
+# 1.5K costs the same as 1K (pro: <= 2.61M px tier, flash: flat $0.018) and looks
+# better. We send the LEVEL ("1.5K"), not these pixels - the table says which
+# levels and ratios the model takes; the pixels are what the model maps them to.
+_SEEDREAM_5_SIZES = {
+    "1K": {"1:1": "1024x1024", "4:3": "1152x864", "3:4": "864x1152", "16:9": "1424x800",
+           "9:16": "800x1424", "3:2": "1248x832", "2:3": "832x1248", "21:9": "1568x672"},
+    "1.5K": {"1:1": "1536x1536", "4:3": "1792x1344", "3:4": "1344x1792", "16:9": "2048x1152",
+             "9:16": "1152x2048", "3:2": "1872x1248", "2:3": "1248x1872", "21:9": "2352x1008"},
+    "2K": {"1:1": "2048x2048", "4:3": "2368x1776", "3:4": "1776x2368", "16:9": "2816x1584",
+           "9:16": "1584x2816", "3:2": "2496x1664", "2:3": "1664x2496", "21:9": "3136x1344"},
 }
 # aspect+resolution -> "WxH" (BytePlus official mapping)
 _SEEDREAM_SIZES = {
-    "seedream-5-0-pro-260628": {
-        "1K": {"1:1": "1024x1024", "4:3": "1152x864", "3:4": "864x1152", "16:9": "1312x736",
-               "9:16": "736x1312", "3:2": "1248x832", "2:3": "832x1248", "21:9": "1568x672"},
-        "2K": {"1:1": "2048x2048", "4:3": "2304x1728", "3:4": "1728x2304", "16:9": "2848x1600",
-               "9:16": "1600x2848", "3:2": "2496x1664", "2:3": "1664x2496", "21:9": "3136x1344"},
-    },
+    "seedream-5-0-pro-260628": _SEEDREAM_5_SIZES,
+    "seedream-5-0-flash-260915": _SEEDREAM_5_SIZES,
     "seedream-4-5-251128": {
         "2K": {"1:1": "2048x2048", "4:3": "2304x1728", "3:4": "1728x2304", "16:9": "2848x1600",
                "9:16": "1600x2848", "3:2": "2496x1664", "2:3": "1664x2496", "21:9": "3136x1344"},
@@ -250,6 +259,7 @@ _SEEDREAM_SIZES = {
 # 4,608,000 px, valid, was being cut to 4576x912). Do NOT drop the 1.1025.
 _SEEDREAM_CUSTOM = {
     "seedream-5-0-pro-260628": (921_600, 4_624_220),
+    "seedream-5-0-flash-260915": (921_600, 4_624_220),   # same documented bounds as pro
     "seedream-4-5-251128": (3_686_400, 16_777_216),
 }
 
@@ -328,6 +338,11 @@ def _seedream_endpoint(model):
     if model == "seedream-4-5-251128":
         return os.environ.get("ARK_SEEDREAM_45_ENDPOINT",
                               _ARK_ENDPOINT_DEFAULTS["ARK_SEEDREAM_45_ENDPOINT"])
+    if model == "seedream-5-0-flash-260915":
+        # Only the dola- id is callable (2026-10-22: without it -> 404 NotFound).
+        # Not in _ARK_ENDPOINT_DEFAULTS on purpose: no installer ever wrote an env
+        # variable for it, so the key cleanup has nothing to recognise.
+        return "dola-seedream-5-0-flash-260915"
     return model
 
 
@@ -527,12 +542,13 @@ _ALL_MODEL_IDS = (
     "gemini-nano-banana-2.1",
     "gemini-3.1-flash-lite-image",
     "seedream-5-0-pro-260628",
+    "seedream-5-0-flash-260915",
     "seedream-4-5-251128",
     "gpt-image-2",
     "gpt-image-2.5-sunburst",
     "gpt-image-2.5-flare",
 )
-_RES_TOKENS = {"512px", "1K", "2K", "4K", "auto"}
+_RES_TOKENS = {"512px", "1K", "1.5K", "2K", "4K", "auto"}
 
 
 _MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
@@ -1226,7 +1242,8 @@ class AppState:
             # OpenAI edits 엔드포인트: 가이드 기준 최대 16장 (2.5도 동일).
             return 16
         if m in SEEDREAM_MODEL_IDS:
-            return 10 if m == "seedream-5-0-pro-260628" else 14
+            # 5.0 pro / flash: up to 10 reference images; 4.5: 14.
+            return 14 if m == "seedream-4-5-251128" else 10
         return 3 if m == "gemini-2.5-flash-image" else 14
 
     def _filled_ref_count(self):
@@ -2327,6 +2344,11 @@ class AppState:
         # 4-5 supports batch; force a single image. pro rejects this param -> omit.
         if model == "seedream-4-5-251128":
             extra["sequential_image_generation"] = "disabled"
+        # 5.0 pro / flash: prompt optimisation stays "standard" (higher quality) -
+        # said out loud instead of leaning on the API default. Flash has no other
+        # mode; pro's "fast" trades quality for speed and is not used.
+        if model in ("seedream-5-0-pro-260628", "seedream-5-0-flash-260915"):
+            extra["optimize_prompt_options"] = {"mode": "standard"}
         kwargs = dict(model=_seedream_endpoint(model), prompt=prompt_s, size=size,
                       response_format="b64_json", extra_body=extra)
         if outfmt:  # pro -> "png"; 4-5 -> None (jpeg default, param unsupported)
@@ -4840,7 +4862,7 @@ def _agent_settings_problem(model, aspect, resolution, quality):
             return None
         tiers = _SEEDREAM_SIZES.get(model, {})
         if resolution not in tiers:
-            return {"error": "bad_resolution", "allowed": sorted(tiers)}
+            return {"error": "bad_resolution", "allowed": list(tiers)}   # table order: 1K, 1.5K, 2K
         if aspect != "auto" and aspect not in tiers[resolution]:
             return {"error": "bad_aspect", "allowed": ["auto", "custom"] + sorted(tiers[resolution])}
         return None

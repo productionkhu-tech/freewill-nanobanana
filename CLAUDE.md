@@ -3,7 +3,7 @@
 멀티 프로바이더 AI 이미지 생성 데스크톱 앱 (Flask + pywebview + PyInstaller).
 이 문서 하나로 **구조 · 원리 · 규칙 · 배포 · 관리**를 파악할 수 있게 씁니다. 낡은 내용을 발견하면 즉시 고칠 것.
 
-> 최종 갱신: 2026-10-20 (v2026-10-2001 기준 — 에이전트가 탭을 지정해 보내기)
+> 최종 갱신: 2026-10-22 (v2026-10-2201 기준 — 시드림 5.0 플래시 + 5.0 Pro/Flash 1.5K)
 
 ---
 
@@ -343,7 +343,7 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 | Google Vertex | gemini-3-pro-image 등 | `VERTEX_SA` (서비스계정 JSON → 앱엔 1시간 토큰만) | `GOOGLE_APPLICATION_CREDENTIALS` + `NANOBANANA_PROJECT_ID` |
 | Google AI Studio | 동일 모델군 | `STUDIO_KEY` | `NANOBANANA_STUDIO_KEY` |
 | OpenAI | gpt-image-2 · gpt-image-2.5-sunburst / -flare | `OPENAI_KEY` | `OPENAI_API_KEY` |
-| BytePlus | seedream-5-0-pro / 4-5 | `ARK_KEY` | `ARK_API_KEY` |
+| BytePlus | seedream-5-0-pro / 5-0-flash / 4-5 | `ARK_KEY` | `ARK_API_KEY` |
 
 - **키 교체(로테이션)**: 콘솔에서 새 키 발급 → `printf '%s' "$NEW" | env -u CLOUDFLARE_API_TOKEN npx wrangler secret put STUDIO_KEY`
   (값이 화면·히스토리에 남지 않게 stdin 으로. 클라우드플레어 대시보드 "변수 및 비밀" 에서 바꿔도 같다) →
@@ -370,6 +370,16 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   저장물의 reve-create를 기본 모델로 폴백 (개명 맵 `_MODEL_RENAMES`와 다름 — prefs 키는 건드리지 않음).
   과거 Reve 생성물의 갤러리 배지/라벨은 그대로 표시
 - Seedream 5.0 Pro 커스텀 크기 상한은 `2048²×1.1025 = 4,624,220px` (그냥 2048²로 두면 통과할 크기가 잘림)
+- **Seedream 5.0 Flash** (v2026-10-2201~): 앱 id `seedream-5-0-flash-260915`, **보내는 id 는 `dola-seedream-5-0-flash-260915`**
+  (`_seedream_endpoint`. dola- 없이 보내면 404 NotFound — 2026-10-22 확인. Pro 도 앱 id 와 보내는 id 가 다르다).
+  앱 id 는 `seedream-` 로 시작해야 한다 — 프론트가 그 접두어로 시드림 커스텀 크기 경로를 고른다.
+  Pro 와 같은 크기표(`_SEEDREAM_5_SIZES`)·커스텀 상한·레퍼런스 10장·png. 장당 $0.018(해상도 무관), 레퍼런스 무료.
+  **5.0 Pro / Flash 는 1K · 1.5K · 2K** — 1.5K 는 1K 와 같은 값(Pro 는 2.61M px 이하 $0.045 구간, 1.5K 는 전부 그 아래)인데
+  화질이 낫다. 4.5 는 2K/4K 그대로. 프롬프트 최적화는 5.0 Pro/Flash 에 `optimize_prompt_options={"mode":"standard"}`
+  를 **명시**해서 보낸다(기본값도 standard 지만 바뀌어도 흔들리지 않게. fast 는 Pro 만 되고 화질을 깎는다 — 안 씀).
+  실측(2026-10-22): Flash 1K 15초·1.5K 16:9 → 2048×1152 15초, Pro 1.5K 1:1 → 1536×1536 38초.
+  BytePlus 는 모델마다 콘솔에서 "활성화"가 필요할 수 있다 — 새 모델은 일부러 틀린 size 로 한 번 보내 보면
+  400(크기 오류)=쓸 수 있음 / 404=없음·권한 없음을 **과금 없이** 가를 수 있다
 - **Nano Banana 2.1** = `gemini-nano-banana-2.1` (v2026-10-0701~). **ID 규칙이 바뀌었다** — 이름에 "gemini-3"도
   "3.1"도 없다. 그래서 모델 이름 글자로 기능을 가르면 조용히 틀어진다(예전 `"gemini-3" in model` 검사 때문에
   2K/4K 가 안 실릴 뻔했다). 해상도는 `_GEMINI_IMAGE_SIZES`, 확장 비율(1:4·8:1 등)은 `_GEMINI_EXT_ASPECT_MODELS`

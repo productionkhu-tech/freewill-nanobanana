@@ -28,30 +28,27 @@ let settingsDebounce = null;
 // Init
 // ==========================================
 document.addEventListener("DOMContentLoaded", async () => {
-  await refreshProjects();     // 탭 먼저 — 이후 로드는 활성 프로젝트 기준
-  // The first fetch can race the server's session restore: the boot-time key
-  // refresh does network work BEFORE the tabs are restored, so a fast window
-  // sees only the starter tab and keeps that stale activePid forever — the
-  // tab strip shows the wrong project and project-stamped events get dropped.
-  // Re-sync a couple of times; renderProjectTabs reuses DOM, so an unchanged
-  // list repaints nothing.
-  setTimeout(async () => {
-    const before = activePid;
-    await refreshProjects();
-    if (activePid !== before) await reloadActiveProject();
-  }, 3000);
-  setTimeout(async () => {
-    const before = activePid;
-    await refreshProjects();
-    if (activePid !== before) await reloadActiveProject();
-  }, 8000);
-  // 탭 라벨을 프로젝트 '이름' 으로 보여주려면 목록이 먼저 있어야 한다.
-  loadBillingCatalog(false).then(() => refreshProjects());
-  await loadModelPrefs();      // 드롭다운을 채우기 전에 숨김/기본화질부터
-  await loadSettings();
-  loadVersion();
-  refreshRefs();
-  await refreshGallery();
+  _beginTabOp();               // the first load draws a tab itself — no second reload on top
+  try {
+    await refreshProjects();     // 탭 먼저 — 이후 로드는 활성 프로젝트 기준
+    // The page often comes up before the server's session restore is done (key
+    // setup runs first; a slow PC or a slow disk takes many seconds), so this
+    // first look may be the blank starter tab. The server pushes
+    // projects_changed when the restore ends, and refreshProjects() reloads the
+    // screen whenever the active tab is not the one drawn. (It used to re-sync
+    // only at 3s and 8s: a later restore left the starter on screen for good,
+    // and an earlier refresh moved the tab highlight without the content.)
+    _shownPid = activePid;
+    // 탭 라벨을 프로젝트 '이름' 으로 보여주려면 목록이 먼저 있어야 한다.
+    loadBillingCatalog(false).then(() => refreshProjects());
+    await loadModelPrefs();      // 드롭다운을 채우기 전에 숨김/기본화질부터
+    await loadSettings();
+    loadVersion();
+    refreshRefs();
+    await refreshGallery();
+  } finally {
+    _endTabOp();                 // catches up if the restore moved the tab meanwhile
+  }
   startPolling();
   setupKeyboardShortcuts();
   setupClipboardPaste();
@@ -71,7 +68,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   // 달리 최초 로드는 그 함수를 타지 않아서 여기서 따로 불러야 한다.
   // 업데이트 안내 팝업보다 뒤에 둬서 둘이 겹치지 않게 한다.
   await refreshBillingBar();
-  promptBillingIfNeeded();
+  // Not about the starter tab of a restore still running — it is usually about
+  // to go. refreshProjects() asks once the restore has ended.
+  if (!_serverRestoring) promptBillingIfNeeded();
 });
 
 // Enter = primary action, Escape = cancel. The save / close-save modals
@@ -433,6 +432,25 @@ function hideUpdateOverlay() {
 // is what makes cross-contamination structurally impossible.
 let projectTabs = [];
 let activePid = null;
+// The project whose settings / refs / gallery are drawn right now. Usually the
+// same as activePid; they part when the server moves the active tab by itself
+// (boot restore finishing, a tab an agent opened) — refreshProjects() then
+// reloads the screen.
+let _shownPid = null;
+// >0 while this page is itself switching / opening / making / closing a tab
+// (or loading at boot). Those paths reload the screen themselves; a refresh
+// landing in the middle must not start a second reload — it read /api/refs
+// while the switch was still decoding them and rewrote [Image N] mentions.
+let _localTabOps = 0;
+let _projSeq = 0;              // only the newest /api/projects answer is applied
+let _serverRestoring = false;  // boot restore still running on the server
+let _missedMove = false;       // a refresh saw the server move while an op ran
+function _beginTabOp() { _localTabOps++; }
+function _endTabOp() {
+  // Some ops wait on the person (save before close?) — if the server moved
+  // the active tab meanwhile (restore ended), catch up once the op is over.
+  if (--_localTabOps === 0 && _missedMove) { _missedMove = false; refreshProjects(); }
+}
 // Fixed palette (mirrors _TAB_COLORS on the server). A free colour picker
 // would let the user choose something invisible on the tab background.
 const TAB_COLOR_HEX = {
@@ -519,11 +537,29 @@ window.addEventListener("blur", hideTabMenu);
 })();
 
 async function refreshProjects() {
+  const seq = ++_projSeq;
   const d = await api("/api/projects");
-  if (!d.projects) return;
+  // An older answer arriving after a newer one would put back a stale active tab.
+  if (!d.projects || seq !== _projSeq) return;
+  // The server moved the active tab on its own. Without a reload the strip
+  // highlighted the new tab over the old tab's prompt and gallery — people saw
+  // an empty project until they visited another tab and came back.
+  const differs = _shownPid !== null && d.active && d.active !== _shownPid;
+  if (differs && _localTabOps > 0) _missedMove = true;
+  const moved = differs && _localTabOps === 0;
+  // Typing still waiting in the debounce belongs to the tab it was typed in;
+  // the save reads the form when it fires, so it has to go out before reload.
+  if (moved) {
+    await flushPendingSettings();
+    if (seq !== _projSeq) return;
+  }
+  const restoreEnded = _serverRestoring && !d.restoring;
+  _serverRestoring = !!d.restoring;
   projectTabs = d.projects;
   activePid = d.active;
   renderProjectTabs();
+  if (moved && activePid !== _shownPid) await reloadActiveProject();   // asks team/project itself
+  else if (restoreEnded && _localTabOps === 0) promptBillingIfNeeded(); // held back during restore
 }
 
 // Tab DOM is REUSED across renders, keyed by pid. This used to wipe the strip
@@ -776,6 +812,9 @@ let _closingPid = null;
 
 async function promptBillingIfNeeded() {
   try {
+    // Already asking: a second open reset the choice the person was making.
+    const bm = document.getElementById("billingModal");
+    if (bm && !bm.classList.contains("hidden")) return;
     const pid = activePid;
     if (pid && pid === _closingPid) return;
     const st = await api(pid ? `/api/billing/state?pid=${encodeURIComponent(pid)}` : "/api/billing/state");
@@ -789,6 +828,7 @@ async function promptBillingIfNeeded() {
 }
 
 async function reloadActiveProject() {
+  _shownPid = activePid;     // first, so a refresh landing mid-reload does not start another
   await loadSettings();      // model/aspect/resolution/prompts/naming/output dir
   await refreshRefs();       // reference slots
   await refreshGallery();    // gallery + selection base
@@ -803,12 +843,15 @@ async function reloadActiveProject() {
 
 async function switchProject(pid) {
   if (pid === activePid) return;
-  await flushPendingSettings();   // 지금 탭의 미저장 입력을 먼저 확정
-  const r = await api("/api/projects/switch", { method: "POST", body: { pid } });
-  if (!r.ok) { showToast(r.error || "전환 실패", "error"); return; }
-  activePid = r.active;
-  await reloadActiveProject();
-  await refreshProjects();
+  _beginTabOp();
+  try {
+    await flushPendingSettings();   // 지금 탭의 미저장 입력을 먼저 확정
+    const r = await api("/api/projects/switch", { method: "POST", body: { pid } });
+    if (!r.ok) { showToast(r.error || "전환 실패", "error"); return; }
+    activePid = r.active;
+    await reloadActiveProject();
+    await refreshProjects();
+  } finally { _endTabOp(); }
 }
 
 // Ctrl+Tab / Ctrl+Shift+Tab. Wraps around, and is a no-op with a single tab.
@@ -820,30 +863,41 @@ async function cycleProject(dir) {
 }
 
 async function newProjectTab() {
-  await flushPendingSettings();
-  const r = await api("/api/projects/new", { method: "POST", body: {} });
-  if (!r.ok) { showToast(r.error || "새 프로젝트 실패", "error"); return; }
-  activePid = r.pid;
-  await reloadActiveProject();
-  await refreshProjects();
-  showToast("새 프로젝트", "success");
+  _beginTabOp();
+  try {
+    await flushPendingSettings();
+    const r = await api("/api/projects/new", { method: "POST", body: {} });
+    if (!r.ok) { showToast(r.error || "새 프로젝트 실패", "error"); return; }
+    activePid = r.pid;
+    await reloadActiveProject();
+    await refreshProjects();
+    showToast("새 프로젝트", "success");
+  } finally { _endTabOp(); }
 }
 
 async function openProjectInTab(filepath) {
-  await flushPendingSettings();
-  const r = await api("/api/projects/open", { method: "POST", body: { filepath } });
-  if (!r.ok) { showToast(r.error || "열기 실패", "error"); return false; }
-  activePid = r.pid;
-  await reloadActiveProject();
-  await refreshProjects();
-  showToast(r.already_open ? "이미 열려 있는 프로젝트로 이동" : "프로젝트 열기 완료", "success");
-  return true;
+  _beginTabOp();
+  try {
+    await flushPendingSettings();
+    const r = await api("/api/projects/open", { method: "POST", body: { filepath } });
+    if (!r.ok) { showToast(r.error || "열기 실패", "error"); return false; }
+    activePid = r.pid;
+    await reloadActiveProject();
+    await refreshProjects();
+    showToast(r.already_open ? "이미 열려 있는 프로젝트로 이동" : "프로젝트 열기 완료", "success");
+    return true;
+  } finally { _endTabOp(); }
 }
 
 // Closing asks about saving FIRST, then tells the server to drop the tab.
 // A tab that is still generating is refused server-side rather than silently
 // killing a batch the user is paying for.
 async function closeProjectTab(pid) {
+  _beginTabOp();
+  try { return await _closeProjectTab(pid); } finally { _endTabOp(); }
+}
+
+async function _closeProjectTab(pid) {
   await flushPendingSettings();   // 닫기 전에 이 탭의 입력을 확정 (다른 탭으로 새지 않게)
   await refreshProjects();        // dirty 여부를 최신값으로 판단
   const p = projectTabs.find(t => t.pid === pid);
@@ -5002,6 +5056,7 @@ let _closeDialogOpen = false;
 async function showCloseDialog() {
   if (_closeDialogOpen) return;
   _closeDialogOpen = true;
+  _beginTabOp();     // the walk switches tabs itself and reloads each one
   try {
     // A batch running in ANY tab dies with the process. Before tabs this could
     // not happen unnoticed — the one project you were looking at was the one
@@ -5019,6 +5074,7 @@ async function showCloseDialog() {
     let pending = [];
     try { pending = (await api("/api/projects/unsaved")).projects || []; }
     catch (e) { forceClose(); return; }
+    const cameFrom = activePid;
     for (const p of pending) {
       // Show the user what they are deciding about.
       if (p.pid !== activePid) {
@@ -5034,9 +5090,17 @@ async function showCloseDialog() {
         if (!ok) { _closeDialogOpen = false; return; }   // 저장 실패/취소 -> 종료 중단
       }
     }
+    // The walk switched tabs to show each one, and the server remembers the
+    // active tab in session.json — next launch opened on the last tab asked
+    // about instead of the one the person was working in. Point it back (server
+    // only; the window is about to close, no need to redraw).
+    if (cameFrom && cameFrom !== activePid) {
+      try { await api("/api/projects/switch", { method: "POST", body: { pid: cameFrom } }); } catch (e) {}
+    }
     forceClose();
   } finally {
     _closeDialogOpen = false;
+    _endTabOp();
   }
 }
 

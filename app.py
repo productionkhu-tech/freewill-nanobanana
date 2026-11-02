@@ -779,6 +779,19 @@ class _Shared:
         self.active_pid = None
         self.projects_lock = threading.RLock()
         self._pid_seq = 0
+        # Boot: from init_app() until the session restore has finished, what is
+        # open is only part of last session's tabs. _save_session() holds off
+        # meanwhile (see there) and the restore saves once at the end if asked.
+        self.session_restoring = False
+        self.session_save_wanted = False
+        # Last session's tabs whose folder was not reachable at boot (a network
+        # drive not connected yet). Kept in session.json so they come back next
+        # time instead of being dropped by the first tab action.
+        self.session_unreachable = []
+        # What the person did while the restore ran (see _note_user_tab): tabs
+        # they opened / made / picked, and the last one they put on screen.
+        self.restore_kept = set()
+        self.restore_pick = None
 
     def next_pid(self):
         with self.projects_lock:
@@ -1959,6 +1972,7 @@ class AppState:
             except OSError:
                 pass
         os.replace(tmp, filepath)
+        before = (self.current_project_path, self.autosaved_only)
         had_path = bool(self.current_project_path)
         self.current_project_path = filepath
         self.project_dirty = False
@@ -1968,6 +1982,14 @@ class AppState:
             self.autosaved_only = False
         elif not had_path:
             self.autosaved_only = True
+        if (self.current_project_path, self.autosaved_only) != before:
+            # The tab now lives in another file: a new tab's first autosave after
+            # a batch, Save As, or naming it at close (which deletes the autosave).
+            # session.json only changed on tab actions, so it kept "" or the
+            # deleted path, and the tab did not come back next launch — people
+            # found it only through 프로젝트 열기 (2026-11). Every caller saves
+            # with no lock held, so taking projects_lock here is safe.
+            _save_session()
         return True
 
     def ensure_refs_loaded(self):
@@ -5160,10 +5182,44 @@ def _session_file():
     return os.path.join(_user_data_dir(), "session.json")
 
 
+# One writer at a time, snapshot and write together. Request threads, gen_worker
+# (a tab's first autosave) and the boot thread all save now: two writers shared
+# one .tmp, an older snapshot could land last, and on Windows os.replace fails
+# while another handle has the .tmp open. Lock order: this, then projects_lock —
+# never call _save_session() while holding projects_lock.
+_session_lock = threading.Lock()
+
+
+def _note_user_tab(pid, on_screen=True):
+    """While the boot restore runs, remember a tab the person opened, made or
+    picked. The restore must not drop it as an empty starter, nor pull the
+    screen off it to last session's tab. (Plain attribute writes: called with
+    or without projects_lock held, so it takes no lock of its own.)"""
+    if not shared.session_restoring:
+        return
+    shared.restore_kept.add(pid)
+    if on_screen:
+        shared.restore_pick = pid
+
+
 def _save_session():
     """Remember which tabs were open so a restart can bring them back.
     Only paths are stored — the content already lives in those JSON files
     (unsaved tabs get an autosave path, see _maybe_autosave)."""
+    with _session_lock:
+        if shared.session_restoring:
+            # Restore has not finished: writing now would replace last session's
+            # list with the starter tab plus whatever came back so far (a tab
+            # still loading even shows up with no path). On a PC where boot is
+            # slow, people open a project from the blank screen while restore is
+            # running — and the tabs not yet restored were gone for good
+            # (2026-11). Remember the request; _finish_restore() saves the set.
+            shared.session_save_wanted = True
+            return
+        _write_session_locked()
+
+
+def _write_session_locked():
     try:
         with shared.projects_lock:
             tabs = []
@@ -5179,6 +5235,13 @@ def _save_session():
                              # appeared as the tab title again.
                              "autosaved_only": bool(p.autosaved_only),
                              "active": pid == shared.active_pid})
+            # No file checks here (an offline share can stall each one for
+            # seconds, and this runs on every tab switch) — just skip the ones
+            # that have since been opened by hand.
+            open_now = {os.path.normcase(t["path"]) for t in tabs if t["path"]}
+            for t in shared.session_unreachable:
+                if os.path.normcase(t.get("path") or "") not in open_now:
+                    tabs.append(dict(t, active=False))
         tmp = _session_file() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"tabs": tabs}, f, ensure_ascii=False)
@@ -5250,7 +5313,11 @@ def api_projects():
     # agent_pid: this build lets a caller address a tab by pid (generate with
     # one-shot values, strict reads, new tab without switching). The studio
     # connector checks it to tell this build from older ones still out there.
+    # restoring: the boot restore is still bringing last session's tabs back.
+    # The page holds the team/project prompt until it ends (the starter tab it
+    # would ask about is usually about to go).
     return jsonify({"projects": items, "active": active,
+                    "restoring": bool(shared.session_restoring),
                     "agent_pid": True, "features": ["agent_pid"]})
 
 
@@ -5267,9 +5334,12 @@ def api_projects_new():
     activate = not (raw is False or raw is None or raw == 0
                     or str(raw).strip().lower() in ("false", "0", "no", "off"))
     proj = create_project(title=(d.get("title") or None), activate=activate)
+    _note_user_tab(proj.pid, on_screen=activate)
     _save_session()
-    if not activate:
-        proj.push_event({"type": "projects_changed"})
+    # Always: with activate the server's active tab moved, and a window that
+    # did not make this call (an agent did) must follow — until it did, its
+    # Generate went to the new tab while the old one was on screen.
+    proj.push_event({"type": "projects_changed"})
     return jsonify({"ok": True, "pid": proj.pid, "active": shared.active_pid})
 
 
@@ -5283,6 +5353,7 @@ def api_projects_switch():
         shared.active_pid = pid
         proj = shared.projects[pid]
         proj.unseen_done = 0   # 뱃지 초기화
+    _note_user_tab(pid)
     # Realise a deferred restore now that this tab is going on screen — the
     # frontend asks for /api/refs immediately after switching.
     proj.ensure_refs_loaded()
@@ -5334,6 +5405,23 @@ def api_projects_close():
     return jsonify({"ok": True, "active": active})
 
 
+def _drop_failed_tab(proj, was_active):
+    """Remove a tab whose file would not load and put back the tab that was on
+    screen. It used to fall to the LAST tab — invisible while the page never
+    re-read the active tab, a jump to another project now that it does."""
+    with shared.projects_lock:
+        shared.projects.pop(proj.pid, None)
+        if proj.pid in shared.project_order:
+            shared.project_order.remove(proj.pid)
+        # Only if the failed tab is still the one on screen: if the person
+        # moved to another tab while a slow file loaded, stay there.
+        if shared.active_pid == proj.pid or shared.active_pid not in shared.projects:
+            if was_active in shared.projects:
+                shared.active_pid = was_active
+            else:
+                shared.active_pid = shared.project_order[-1] if shared.project_order else None
+
+
 @app.route("/api/projects/open", methods=["POST"])
 def api_projects_open():
     """Open a saved project file in a NEW tab (or focus it if already open)."""
@@ -5346,19 +5434,21 @@ def api_projects_open():
         with shared.projects_lock:
             shared.active_pid = exist.pid
             exist.unseen_done = 0
+        _note_user_tab(exist.pid)
         _save_session()
+        exist.push_event({"type": "projects_changed"})
         return jsonify({"ok": True, "pid": exist.pid, "already_open": True})
+    with shared.projects_lock:
+        was_active = shared.active_pid
     proj = create_project(activate=True)
     ok, msg = proj.load_project(fp)
     if not ok:
         # Loading failed — don't strand an empty tab the user didn't ask for.
-        with shared.projects_lock:
-            shared.projects.pop(proj.pid, None)
-            if proj.pid in shared.project_order:
-                shared.project_order.remove(proj.pid)
-            shared.active_pid = shared.project_order[-1] if shared.project_order else None
+        _drop_failed_tab(proj, was_active)
         return jsonify({"ok": False, "error": msg})
+    _note_user_tab(proj.pid)
     _save_session()
+    proj.push_event({"type": "projects_changed"})
     return jsonify({"ok": True, "pid": proj.pid, "message": msg})
 
 
@@ -5659,6 +5749,8 @@ def load_project():
     if not fp:
         return jsonify({"ok": False, "error": "No filepath"})
     ok, msg = state.load_project(fp)
+    if ok:
+        _save_session()      # the tab now stands for this file (route unused by the page)
     return jsonify({"ok": ok, "message": msg})
 
 
@@ -5671,20 +5763,20 @@ def upload_project():
     tmp = os.path.join(state.temp_ref_dir, f"_proj_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
     f.save(tmp)
     # Uploaded project goes into its OWN tab, same rule as opening a file.
+    with shared.projects_lock:
+        was_active = shared.active_pid
     proj = create_project(activate=True)
     ok, msg = proj.load_project(tmp)
     if not ok:
-        with shared.projects_lock:
-            shared.projects.pop(proj.pid, None)
-            if proj.pid in shared.project_order:
-                shared.project_order.remove(proj.pid)
-            shared.active_pid = shared.project_order[-1] if shared.project_order else None
+        _drop_failed_tab(proj, was_active)
     else:
         # The temp file is about to be deleted — don't leave the tab pointing
         # at a path that will not exist (it would look "saved" but be gone).
         proj.current_project_path = None
         proj.project_dirty = True
+        _note_user_tab(proj.pid)
         _save_session()
+        proj.push_event({"type": "projects_changed"})
     try:
         os.remove(tmp)
     except Exception:
@@ -6311,46 +6403,110 @@ def copy_ref_to_clipboard(idx):
 # ==========================================
 # Startup
 # ==========================================
-def _restore_session():
+def _read_session_tabs():
+    try:
+        with open(_session_file(), "r", encoding="utf-8") as f:
+            return (json.load(f) or {}).get("tabs", [])
+    except Exception:
+        return []
+
+
+def _probe_session_paths(paths, timeout=4.0):
+    """'ok' / 'gone' (folder there, file not) / 'unreachable' (folder missing)
+    for each path — all at once, and at most `timeout` seconds in all. A share
+    that is down can stall a single check for tens of seconds; one at a time,
+    a dead drive held the whole restore (and every tab save) hostage."""
+    res = {}
+
+    def probe(fp):
+        try:
+            if os.path.isfile(fp):
+                res[fp] = "ok"
+            elif os.path.isdir(os.path.dirname(fp)):
+                res[fp] = "gone"
+            else:
+                res[fp] = "unreachable"
+        except Exception:
+            res[fp] = "unreachable"
+
+    ths = [threading.Thread(target=probe, args=(p,), daemon=True) for p in paths]
+    for th in ths:
+        th.start()
+    end = time.time() + timeout
+    for th in ths:
+        th.join(max(0.0, end - time.time()))
+    done = dict(res)
+    return {p: done.get(p, "unreachable") for p in paths}
+
+
+def _restore_session(tabs=None):
     """Reopen the tabs that were open last time. Missing files are skipped
     silently (the user may have moved or deleted a project between runs) and a
     blank tab is created if nothing could be restored, so the app always comes
-    up with at least one project."""
-    try:
-        with open(_session_file(), "r", encoding="utf-8") as f:
-            tabs = (json.load(f) or {}).get("tabs", [])
-    except Exception:
-        tabs = []
+    up with at least one project.
+
+    `tabs` is the list init_app() read before anything else ran — key setup
+    comes first and can take a while, and the page is already up by then."""
+    if tabs is None:
+        tabs = _read_session_tabs()
+    t0 = time.time()
+    tabs = [t for t in tabs if isinstance(t, dict)]
+    status = _probe_session_paths(list({t.get("path") for t in tabs if t.get("path")}))
     restored, active_pid = 0, None
+    unreachable, newly_missing = [], False
     for t in tabs:
-        fp = (t or {}).get("path") or ""
-        if not fp or not os.path.isfile(fp):
+        fp = t.get("path") or ""
+        if not fp:
             continue
-        already = _find_project_by_path(fp)
-        if already is not None:
-            # Duplicate line in session.json, or the user opened this file
-            # while restore was still working through the list.
+        st = status.get(fp, "unreachable")
+        if st == "gone":
+            continue          # folder there, file not: deleted or moved on purpose
+        if st == "unreachable":
+            # The drive is not connected (yet). Keep the line so the tab comes
+            # back next launch — it used to be dropped, and the first tab action
+            # then erased it from session.json for good. Not forever: a share
+            # that never returns would cost a timeout every boot — two weeks.
+            since = str(t.get("missing_since") or "")[:10]
+            try:
+                age = (datetime.now() - datetime.strptime(since, "%Y-%m-%d")).days
+            except ValueError:
+                since, age, newly_missing = datetime.now().strftime("%Y-%m-%d"), 0, True
+            if age <= 14:
+                unreachable.append({"path": fp, "title": t.get("title") or "",
+                                    "autosaved_only": bool(t.get("autosaved_only")),
+                                    "missing_since": since})
+            continue
+        proj = None
+        try:
+            already = _find_project_by_path(fp)
+            if already is not None:
+                # Duplicate line in session.json, or the user opened this file
+                # while restore was still working through the list.
+                restored += 1
+                if t.get("active"):
+                    active_pid = already.pid
+                continue
+            proj = create_project(activate=False)
+            # Only the tab that will actually be on screen decodes its refs now;
+            # the rest load theirs the moment you switch to them.
+            ok, _msg = proj.load_project(fp, defer_refs=True)
+            if not ok:
+                _drop_tab(proj)
+                continue
+            if t.get("autosaved_only"):
+                # Came back from an autosave, not from a file the user named.
+                proj.autosaved_only = True
+                proj.title = t.get("title") or proj.title
             restored += 1
             if t.get("active"):
-                active_pid = already.pid
-            continue
-        proj = create_project(activate=False)
-        # Only the tab that will actually be on screen decodes its refs now;
-        # the rest load theirs the moment you switch to them.
-        ok, _msg = proj.load_project(fp, defer_refs=True)
-        if not ok:
-            with shared.projects_lock:
-                shared.projects.pop(proj.pid, None)
-                if proj.pid in shared.project_order:
-                    shared.project_order.remove(proj.pid)
-            continue
-        if t.get("autosaved_only"):
-            # Came back from an autosave, not from a file the user named.
-            proj.autosaved_only = True
-            proj.title = t.get("title") or proj.title
-        restored += 1
-        if t.get("active"):
-            active_pid = proj.pid
+                active_pid = proj.pid
+        except Exception as e:
+            # One odd file (say ui_state that is not a dict raises past
+            # load_project's own checks) used to end the whole loop: the tabs
+            # after it never came back, and the next save wrote the short list.
+            state.log(f"restore: skipped {os.path.basename(fp)} ({str(e)[:60]})")
+            if proj is not None:
+                _drop_tab(proj)
     if not restored:
         # No session to restore (first run, or every remembered file is gone).
         # Don't ask — just open the most recent project. Asking was redundant
@@ -6362,24 +6518,28 @@ def _restore_session():
             recents = []
         if recents:
             proj = create_project(activate=False)
-            ok, _msg = proj.load_project(recents[0]["filepath"])
+            try:
+                ok, _msg = proj.load_project(recents[0]["filepath"])
+            except Exception:
+                ok = False
             if ok:
                 restored = 1
                 active_pid = proj.pid
             else:
-                with shared.projects_lock:
-                    shared.projects.pop(proj.pid, None)
-                    if proj.pid in shared.project_order:
-                        shared.project_order.remove(proj.pid)
+                _drop_tab(proj)
     with shared.projects_lock:
+        kept = set(shared.restore_kept)
+        pick = shared.restore_pick
         # A blank starter tab exists before restore runs (the first HTTP hit
         # auto-creates one). Once real tabs came back it is just clutter the
-        # user has to close on every launch — drop it, but only while it is
-        # genuinely untouched.
+        # user has to close on every launch — drop it while it holds nothing.
+        # project_dirty no longer protects it: the boot team/project prompt
+        # alone set it, and the empty starter then stayed on screen.
+        # A tab the person made or opened during the restore is theirs; keep it.
         if restored:
             for pid in list(shared.project_order):
                 p = shared.projects.get(pid)
-                if p is None or p.current_project_path or p.project_dirty:
+                if p is None or pid in kept or p.current_project_path:
                     continue
                 if (p.gallery_items or p.ref_path_list
                         or getattr(p, "_pending_refs", None)
@@ -6391,7 +6551,13 @@ def _restore_session():
                     shared.active_pid = None
         if not shared.project_order:
             create_project()
-        shared.active_pid = active_pid or shared.project_order[0]
+        if pick in shared.projects:
+            # The person opened or clicked a tab while this ran (from the blank
+            # screen of a slow boot): that is what they are looking at — don't
+            # pull the screen away to last session's tab.
+            shared.active_pid = pick
+        else:
+            shared.active_pid = active_pid or shared.project_order[0]
         first = shared.projects.get(shared.active_pid)
     # The tab that comes up on screen needs its refs right away; the others
     # stay deferred until switched to.
@@ -6400,8 +6566,26 @@ def _restore_session():
             first.ensure_refs_loaded()
         except Exception as e:
             state.log(f"ref restore failed: {str(e)[:80]}")
+    shared.session_unreachable = unreachable
+    if unreachable:
+        state.log("%d project(s) not reachable (drive not connected?) - kept for next launch: %s"
+                  % (len(unreachable), ", ".join(os.path.basename(u["path"])
+                                                for u in unreachable)))
+        if newly_missing:
+            # Write the first-missing date down now; otherwise the two-week
+            # clock only starts once some tab action happens to save.
+            with _session_lock:
+                shared.session_save_wanted = True
     if restored:
-        state.log(f"Opened {restored} project(s) at startup")
+        state.log(f"Opened {restored} project(s) at startup ({time.time() - t0:.1f}s)")
+
+
+def _drop_tab(proj):
+    """Take a tab restore made back off the bar (its file would not load)."""
+    with shared.projects_lock:
+        shared.projects.pop(proj.pid, None)
+        if proj.pid in shared.project_order:
+            shared.project_order.remove(proj.pid)
 
 
 # ---- provider keys -----------------------------------------------------------
@@ -6848,12 +7032,39 @@ def _start_usage_flusher():
     threading.Thread(target=_loop, daemon=True).start()
 
 
+def _finish_restore():
+    """End of the boot restore, however it went: tab saves work again, a save
+    that was asked for meanwhile happens now with the whole set, and the page is
+    told — it may have drawn the starter tab long before the restore finished."""
+    with _session_lock:
+        # Flag and "wanted" flip under the lock _save_session checks them under,
+        # so a save that saw "restoring" a moment ago is not lost in between.
+        shared.session_restoring = False
+        wanted, shared.session_save_wanted = shared.session_save_wanted, False
+        shared.restore_kept, shared.restore_pick = set(), None
+        if wanted:
+            _write_session_locked()
+    with shared.projects_lock:
+        p = shared.projects.get(shared.active_pid)
+    if p is not None:
+        p.push_event({"type": "projects_changed", "pid": None})
+
+
 def init_app():
-    state.init_api()
+    # Read last session's tabs BEFORE anything else: key setup comes first and
+    # can take seconds on a slow PC, and a tab action from the page in that
+    # window used to overwrite session.json before the restore ever read it.
+    shared.restore_kept, shared.restore_pick = set(), None
+    shared.session_restoring = True
     try:
-        _restore_session()
-    except Exception as e:
-        state.log(f"session restore failed: {str(e)[:80]}")
+        tabs = _read_session_tabs()
+        state.init_api()
+        try:
+            _restore_session(tabs)
+        except Exception as e:
+            state.log(f"session restore failed: {str(e)[:80]}")
+    finally:
+        _finish_restore()
     _start_usage_flusher()
 
 

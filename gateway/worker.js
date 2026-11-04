@@ -945,7 +945,7 @@ async function syncSheets(env, force) {
   const now = nowIso();
 
   // 시트가 그대로면 D1 에 아무것도 쓰지 않는다. 1분마다 38행씩 덮어쓰면
-  // 하루 5만 건이라 무료 쓰기 한도를 그냥 태운다 — 바뀐 날만 쓰면 사실상 0 이다.
+  // 하루 5만 건이 D1 쓰기 월 포함량에서 그냥 나간다 — 바뀐 날만 쓰면 사실상 0 이다.
   const stamp = (await sha256Hex(JSON.stringify([teamRows, projRows]))).slice(0, 32);
   const prev = await env.USAGE_DB.prepare(
     "SELECT hash, detail, changed_at FROM sync_state WHERE id='sheet'").first();
@@ -1052,9 +1052,10 @@ async function syncSheets(env, force) {
   /*
    * 쓰기는 시트가 몇 줄이든 문장 7개 이하로 끝낸다.
    *
-   * 무료 요금제는 워커 호출 한 번에 D1 쿼리가 50개까지인데, 배치 안의 문장을
-   * 하나씩 세는지는 문서가 분명하지 않다. 행마다 문장을 만들던 예전 방식은
-   * 팀 20 + 프로젝트 25 로 이미 50 가까이 와 있었고, 이관까지 얹으면 넘는다.
+   * 처음엔 워커 호출 한 번에 D1 쿼리 50개라는 한도를 기준으로 짰다. 계정은 Workers Paid 라
+   * (2026-11-04 Billing 확인) 문서상 호출당 1000개이고 db.batch() 는 한 번으로 세니
+   * 지금 이 한도에 걸리는 건 아니다. 행마다 문장을 만들던 예전 방식은
+   * 팀 20 + 프로젝트 25 로 이미 50 가까이 와 있었고, 이관까지 얹으면 더 늘어난다.
    * 그래서 행 목록을 JSON 한 덩어리로 넘기고 json_each 로 펼친다. NOT IN (?,?,…)
    * 으로 id 를 늘어놓던 것도 바인딩 100개 한도에 걸릴 수 있어 같이 바꿨다.
    * (INSERT … SELECT 에 ON CONFLICT 를 붙일 땐 SQLite 문법상 WHERE 가 있어야 한다.)
@@ -2385,8 +2386,8 @@ async function handleAdminUsage(url, env) {
 export default {
   // 하루 한 번 환율을 받아 둔다. 놓친 날은 리포트가 직전 값으로 대체한다.
   /**
-   * 1분마다 도는 크론 하나로 두 가지를 한다 (무료 플랜 크론 한도가 계정당 5개고
-   * 이미 다 써서 두 번째를 못 붙인다).
+   * 1분마다 도는 크론 하나로 두 가지를 한다 (2026-09-16 에 두 번째를 붙이려다 code 10072 로
+   * 거부됐다. 사유는 미확인 — 계정은 Workers Paid, 문서상 한도는 계정당 250개).
    *
    * 시트 동기화: 매분. 일과 중에 프로젝트를 '종료' 로 바꾸면 1분 안에 앱 목록에서
    *   내려가야 한다. 내용이 그대로면 D1 에 아무것도 쓰지 않는다.

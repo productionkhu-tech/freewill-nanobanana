@@ -652,11 +652,10 @@ async function handleAdmin(request, env, path) {
     const today = now.slice(0, 10);
     const sync = await env.USAGE_DB.prepare(
       "SELECT at, ok, detail, changed_at FROM sync_state WHERE id='sheet'").first();
-    // day 인덱스로 최근 며칠만 훑는다. created_at 에는 인덱스가 없어서
-    // 전체 정렬을 걸면 행이 쌓일수록 조회 비용이 그대로 커진다.
+    // created_at 은 워커가 넣을 때 찍으므로 가장 나중에 들어온 행이 곧 마지막 기록이다.
+    // 날짜로 훑으면 화면을 열 때마다 1만 행을 읽는다. rowid 끝에서 한 행만 본다.
     const recent = await env.USAGE_DB.prepare(
-      `SELECT MAX(created_at) AS last_at FROM usage_events
-        WHERE day >= date('now','-7 day')`).first();
+      "SELECT created_at AS last_at FROM usage_events ORDER BY rowid DESC LIMIT 1").first();
     const td = await env.USAGE_DB.prepare(
       `SELECT COUNT(*) AS rows_n, COALESCE(SUM(images),0) AS images
          FROM usage_events WHERE day = ?`).bind(today).first();
@@ -2205,8 +2204,8 @@ const GROUPS = {
 };
 
 /**
- * 한 행(=이미지 한 장)의 비용식. 집계 쿼리와 일별 쿼리가 **같은 문자열**을 쓴다 —
- * 두 벌로 적어두면 언젠가 한쪽만 고쳐져 합계와 그래프가 어긋난다.
+ * 한 묶음의 비용식. e 는 handleAdminUsage 의 묶음(g)이다 — 날짜 · 모델 · 픽셀 · 레퍼런스 수가
+ * 같은 행을 모은 것이라, 토큰과 장수는 합을 곱하고 레퍼런스는 행 수(rows_n)를 곱한다.
  *
  * mode='image' 는 장당가인데 출력 픽셀이 px_threshold 를 넘으면 고화소 단가를 쓰고
  * (seedream-5-0-pro: 2.61M px 초과 $0.09), 레퍼런스는 무료 장수를 뺀 만큼만 붙는다.
@@ -2216,7 +2215,7 @@ const COST_USD = `
     CASE WHEN p.mode='image'
          THEN e.images * (CASE WHEN p.px_threshold > 0 AND e.out_px > p.px_threshold
                                THEN p.per_image_hi ELSE p.per_image END)
-            + MAX(e.ref_images - p.in_free_count, 0) * p.in_per_image
+            + e.rows_n * MAX(e.ref_images - p.in_free_count, 0) * p.in_per_image
          ELSE e.in_text_tokens  * p.in_text_per_m  / 1000000.0
             + e.in_image_tokens * p.in_image_per_m / 1000000.0
             + e.out_tokens      * p.out_per_m      / 1000000.0
@@ -2274,39 +2273,68 @@ async function handleAdminUsage(url, env) {
                   : status === "archived" ? " AND NOT " + LIVE
                   : "";
 
+  /**
+   * 행마다 단가와 환율을 찾으면 쿼리 한 번에 행 수의 6배를 읽는다 (2026-11-04 전체 기간 251,286행).
+   * 행이 쌓일수록 화면이 그만큼 느려지므로, 금액이 달라질 수 있는 칸까지만 먼저 묶고 그 묶음마다
+   * 찾는다. 표와 그래프는 이 결과 하나를 나눠 쓴다 — 쿼리가 하나라 둘의 합계도 어긋날 수 없다.
+   */
   const sql = `
-    SELECT ${col} AS k,
-           COUNT(*)            AS rows_n,
-           SUM(e.images)       AS images,
-           SUM(e.out_tokens)   AS out_tokens,
-           SUM(${COST_USD})    AS cost_usd,
+    WITH g AS (
+      SELECT ${col} AS k, e.day AS day, e.model AS model,
+             e.out_px AS out_px, e.ref_images AS ref_images,
+             CASE WHEN e.images = 0 THEN 1 ELSE 0 END AS failed,
+             COUNT(*)               AS rows_n,
+             SUM(e.images)          AS images,
+             SUM(e.in_text_tokens)  AS in_text_tokens,
+             SUM(e.in_image_tokens) AS in_image_tokens,
+             SUM(e.out_tokens)      AS out_tokens,
+             SUM(e.out_text_tokens) AS out_text_tokens,
+             MAX(e.machine)         AS first_name
+      FROM usage_events e
+      WHERE e.day >= ? AND e.day <= ?${statusSql}
+      GROUP BY 1, 2, 3, 4, 5, 6
+    )
+    SELECT e.k AS k, e.day AS day,
+           SUM(e.rows_n)     AS rows_n,
+           SUM(e.images)     AS images,
+           SUM(e.out_tokens) AS out_tokens,
+           SUM(${COST_USD})  AS cost_usd,
            SUM(${COST_USD} * ${KRW_RATE}) AS cost_krw,
            SUM(CASE WHEN p.model IS NULL OR p.verified=0 THEN e.images ELSE 0 END) AS unpriced,
-           MIN(e.day) AS first_day, MAX(e.day) AS last_day,
-           MAX(e.machine) AS first_name,
-           SUM(CASE WHEN e.images = 0 THEN 1 ELSE 0 END) AS failed_n,
-           SUM(CASE WHEN e.images = 0 THEN ${COST_USD} ELSE 0 END) AS failed_usd,
-           SUM(CASE WHEN e.images = 0 THEN ${COST_USD} * ${KRW_RATE} ELSE 0 END) AS failed_krw
-    FROM usage_events e
+           MAX(e.first_name) AS first_name,
+           SUM(CASE WHEN e.failed = 1 THEN e.rows_n ELSE 0 END) AS failed_n,
+           SUM(CASE WHEN e.failed = 1 THEN ${COST_USD} ELSE 0 END) AS failed_usd,
+           SUM(CASE WHEN e.failed = 1 THEN ${COST_USD} * ${KRW_RATE} ELSE 0 END) AS failed_krw
+    FROM g e
     ${PRICE_JOIN}
     ${FX_JOIN}
-    WHERE e.day >= ? AND e.day <= ?${statusSql}
-    GROUP BY k
-    ORDER BY cost_usd DESC`;
+    GROUP BY e.k, e.day`;
   const r = await env.USAGE_DB.prepare(sql).bind(from, to).all();
-  const rows = r.results || [];
 
-  // 그래프용 일별 추이. 같은 비용식을 쓰므로 막대 합계와 카드 합계가 어긋나지 않는다.
-  const dsql = `
-    SELECT e.day AS day, SUM(e.images) AS images,
-           SUM(${COST_USD}) AS cost_usd,
-           SUM(${COST_USD} * ${KRW_RATE}) AS cost_krw
-    FROM usage_events e
-    ${PRICE_JOIN}
-    ${FX_JOIN}
-    WHERE e.day >= ? AND e.day <= ?${statusSql}
-    GROUP BY e.day ORDER BY e.day`;
-  const dr = await env.USAGE_DB.prepare(dsql).bind(from, to).all();
+  const SUMS = ["rows_n", "images", "out_tokens", "cost_usd", "cost_krw", "unpriced",
+                "failed_n", "failed_usd", "failed_krw"];
+  const byK = new Map(), byDay = new Map();
+  for (const x of (r.results || [])) {
+    let a = byK.get(x.k);
+    if (!a) {
+      a = { k: x.k, first_day: x.day, last_day: x.day, first_name: null };
+      for (const f of SUMS) a[f] = 0;
+      byK.set(x.k, a);
+    }
+    for (const f of SUMS) a[f] += x[f] || 0;
+    if (x.day < a.first_day) a.first_day = x.day;
+    if (x.day > a.last_day) a.last_day = x.day;
+    if (x.first_name != null && (a.first_name == null || x.first_name > a.first_name)) {
+      a.first_name = x.first_name;
+    }
+    let d = byDay.get(x.day);
+    if (!d) byDay.set(x.day, d = { day: x.day, images: 0, cost_usd: 0, cost_krw: 0 });
+    d.images += x.images || 0;
+    d.cost_usd += x.cost_usd || 0;
+    d.cost_krw += x.cost_krw || 0;
+  }
+  const rows = [...byK.values()].sort((a, b) => b.cost_usd - a.cost_usd);
+  const days = [...byDay.values()].sort((a, b) => (a.day < b.day ? -1 : 1));
 
   const total = rows.reduce((a, x) => a + (x.cost_usd || 0), 0);
   const totalKrw = rows.reduce((a, x) => a + (x.cost_krw || 0), 0);
@@ -2347,7 +2375,7 @@ async function handleAdminUsage(url, env) {
     total_images: imgs, unpriced_images: unpriced,
     failed_attempts: failedN, failed_cost_usd: failedUsd, failed_cost_krw: failedKrw,
     usd_krw: fx ? fx.usd_krw : 0, fx_day: fx ? fx.day : null,
-    days: dr.results || [],
+    days,
     rows: rows.map((x) => ({
       ...x, label: names[x.k] || x.k, archived: Boolean(archived[x.k]),
     })),

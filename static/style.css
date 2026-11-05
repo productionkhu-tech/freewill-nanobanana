@@ -2031,10 +2031,16 @@ footer {
   border-radius: 4px;
 }
 .model-cfg-btn:hover { color: var(--accent); }
-.mp-dialog { min-width: 380px; }
+.mp-dialog { min-width: 560px; }
+.mp-q { font-size: 11px; height: 24px; }
+.mp-q:disabled { opacity: .45; }
+.mp-title { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
+.mp-title h2 { margin-bottom: 0; }
+.mp-switch { margin-bottom: 0; cursor: pointer; flex-shrink: 0; }
+.mp-head span.off { opacity: .45; }
 .mp-head, .mp-row {
   display: grid;
-  grid-template-columns: 34px 1fr 132px;
+  grid-template-columns: 34px 1fr 124px 104px;
   align-items: center;
   gap: 6px;
 }

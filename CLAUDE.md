@@ -3,7 +3,7 @@
 멀티 프로바이더 AI 이미지 생성 데스크톱 앱 (Flask + pywebview + PyInstaller).
 이 문서 하나로 **구조 · 원리 · 규칙 · 배포 · 관리**를 파악할 수 있게 씁니다. 낡은 내용을 발견하면 즉시 고칠 것.
 
-> 최종 갱신: 2026-11-05 (v2026-11-0502 기준 — GPT Image 2.6 GIF·SVG 출력, 모델 메뉴 별표, §6.1)
+> 최종 갱신: 2026-11-05 (v2026-11-0503 기준 — 저장한 팀·프로젝트 유지 §2.3, 모델 설정 스위치·시작 Quality §6.1, 에이전트 요청에 앱 값 안 섞음 §2.2, GIF 비교 제외)
 
 ---
 
@@ -126,7 +126,7 @@ NanoBanana.exe 실행
 ```
 | 요청 | 하는 일 |
 |---|---|
-| `GET /api/projects` | `agent_pid: true`·`features:["agent_pid"]`(기능 확인), 탭마다 `pid·name·generating·billing_confirmed` |
+| `GET /api/projects` | `agent_pid: true`·`features:["agent_pid","agent_model_defaults"]`(기능 확인), 탭마다 `pid·name·generating·billing_confirmed` |
 | `POST /api/generate` `{pid, prompt, settings:{model,aspect,resolution,quality,complexity,count,custom_w,custom_h,openai_bg_transparent,output_format,gif_size,gif_frames,gif_frame_ms}, ref_paths:[..]}` | 그 탭에 생성 → `{ok, batch_id, pid, count, queued, outstanding}`. pid 가 없으면 예전 그대로(화면 탭의 입력칸 = 창의 Generate) |
 | `GET /api/batch?pid=&batch_id=` | 그 묶음의 `count·done·failed·cancelled·pending·finished·images·errors`. `finished` 면 더 올 것 없음 |
 | `GET /api/gallery?pid=&strict=1&batch_id=` | 그 묶음의 이미지 (항목마다 `batch_id`) |
@@ -134,12 +134,13 @@ NanoBanana.exe 실행
 | `POST /api/stop {pid}` | 그 탭만 멈춤 |
 | `POST /api/projects/new {title, activate:false}` | 화면을 안 바꾸고 새 탭 (사람이 시켰을 때만). false·0·"false"·"0"·"no"·"off" 다 "안 바꿈" |
 
-- **빠진 설정값**은 그 탭의 지금 값을 읽어 쓴다(쓰지는 않음). 그 값이 고른 모델에 안 맞으면(Pro 의 4K 가 남은 채 Lite 를
-  고름) 모델 기본값(auto / 1K / 시드림 기본 / high) — 창에서 모델을 바꿀 때와 같다. **에이전트가 보낸 값**이 안 맞으면
-  고치지 않고 거절: `bad_aspect|bad_resolution|bad_quality|bad_complexity|bad_output_format|bad_gif_size|bad_gif_frames|bad_gif_frame_ms`
-  + `field` + `allowed`. 화면 메뉴가 막는 값과 같은 기준 (`_agent_settings_problem`). 예전 경로는 모르는 비율을 조용히 빼고 갤러리엔 요청한 비율을 적었다.
+- **에이전트 요청에는 앱 설정이 섞이지 않는다** (2026-11-05 사용자 결정 — "MCP 가 medium 에 갇히면 위험"). 탭의 입력값도, 모델 설정의 시작값·스위치도 읽지 않는다. 보낸 값만 쓰고, 빠진 값은 그 모델의 기본: `quality` 맨 위(2.5·2.6 `max`, gpt-image-2 `high`), `resolution` 맨 위, `aspect` `auto`(GPT 는 레퍼런스가 없으면 `1:1` — auto 는 크기를 OpenAI 에 맡겨 해상도가 버려진다), `count` 1, `complexity` `high`, `output_format` `png`, 투명 끔, GIF `512x512`·9·200. `model` 을 비우면 `unknown_model`, Custom 인데 크기를 비우면 `bad_custom_w`. 탭에서 오는 건 과금·저장 폴더·파일 이름·갤러리뿐
+- **에이전트가 보낸 값**이 안 맞으면
+  고치지 않고 거절: `bad_aspect|bad_resolution|bad_quality|bad_complexity|bad_output_format|bad_gif_size|bad_gif_frames|bad_gif_frame_ms|bad_count|bad_custom_w|bad_custom_h|bad_openai_bg_transparent`
+  + `field` + `allowed`. 숫자 칸도 같다(`count` 50 이 10 으로, `"abc"` 가 탭 값으로 바뀌던 것을 2026-11-05 에 막음). 투명 배경을 켜라고 보냈는데 그 모델에 없으면 거절, `"false"`·`"0"` 은 끄기. 화면 메뉴가 막는 값과 같은 기준 (`_agent_settings_problem`). 예전 경로는 모르는 비율을 조용히 빼고 갤러리엔 요청한 비율을 적었다.
   `output_format` 을 빼면 그 탭의 형식을 따른다 — 탭이 GIF 면 2.6 요청은 `.gif` 로 나온다(갤러리 항목의 `format` 으로 구분)
-- 그 밖의 거절: `unknown_model`, `ref_limit`(모델별 장수), `ref_unreadable`, `ref_duplicate`(픽셀 비교 — 다시 저장한
+- 이 요청에서 쓰지 않은 칸은 답의 `ignored` 에 이름을 적는다(`output_dir`·`fixed_prompt`·오타, GIF 가 아닐 때의 `gif_*`). 탭 설정에 있는 이름은 보내는 쪽이 오타인지 알 수 없어서다
+- 그 밖의 거절: `unknown_model`(은퇴한 `reve-create` 도 — 저장물을 열 때와 달리 기본 모델로 바꿔 생성하지 않는다. 옛 이름 `-preview` 는 같은 모델이라 따라간다), `ref_limit`(모델별 장수), `ref_unreadable`, `ref_duplicate`(픽셀 비교 — 다시 저장한
   사본도 잡힘, 드롭과 같은 규칙), `svg_no_refs`(SVG + 레퍼런스), `Empty prompt`, 큐 가득, 멈추는 중. 거절이면 아무것도 생성되지 않는다
 - 크기 계산은 창·에이전트 모두 `_gen_img_cfg` 하나. 갤러리 "Load setup" 은 에이전트 프롬프트를 섹션 하나로 돌려준다
 - 창 쪽 표시: `batch_started` 이벤트(탭 줄 점이 첫 장이 아니라 시작부터 켜짐. 에이전트 묶음이면 "에이전트가 'X' 탭에서
@@ -147,9 +148,23 @@ NanoBanana.exe 실행
 - **묶음 집계는 메모리에만** (탭마다 최근 50개, 재시작하면 사라짐 → 그땐 갤러리 `batch_id` 로). `_batch_open` 은
   `pending_jobs_lock` 안에서(일이 워커에 보이기 전에). 워커가 끝날 때 못 끝난 묶음 닫기(Stop → cancelled, 사고 →
   failed)도 **같은 락 안에서** — 밖에서 하면 그 틈에 들어온 다음 묶음까지 닫아 버린다
-- **에이전트가 부르면 안 되는 것** (서버가 막지 않는다 — 커넥터 정책으로 막는다): `/api/billing/set`(사람만),
+- **에이전트가 부르면 안 되는 것** (서버가 막지 않는다 — 커넥터 정책으로 막는다): `/api/billing/set`(짐작 금지. 커넥터 `--set-billing` 은 사용자가 대화에서 고른 값만 넣는다, 2026-11-04 사용자 결정),
   `/api/projects/switch`, `POST /api/settings`(입력칸 쓰기), `/api/events`(pop 방식이라 화면 팝업을 가로챈다),
   `/api/status`(화면 탭 기준)
+
+### 2.3 탭의 팀·프로젝트 (Status 칸) — 저장한 값은 유지 (2026-11-05 변경)
+예전엔 켤 때마다 다시 확인받았다(2026-09-16 규칙). 번거롭다는 요청으로 바꿨다.
+```
+파일에 팀·프로젝트 둘 다 있음 → load_project 가 확인된 것으로 되살림 (수동·자동 저장 구분 없음)
+다시 묻는 경우    → 둘 중 하나라도 빔 · 받은 목록에 없음(내려감·삭제) · 새 탭 · 저장 전 탭
+못 받은 목록      → 묻지도 막지도 않음. 디스크 사본(catalog_cache.json, at=0)은 창을 채우는 용도일 뿐,
+                    그 사본에 없다고 "사라졌다" 하지 않는다 (사본보다 새 프로젝트일 수 있다)
+```
+- 판단은 `_billing_check` 하나. 화면·에이전트가 읽는 값은 `_billing_usable`(네트워크 안 탐, 탭 줄이 자주 부른다),
+  생성 직전은 `_billing_gate`(5분 넘은 목록이면 새로 받음). `refreshBillingBar` 는 목록을 먼저 받고 상태를 물어야 한다 —
+  순서가 바뀌면 켤 때 사라진 건을 멀쩡하다고 듣고 묻지 않는다
+- 에이전트: 저장된 탭은 재시작 뒤에도 사람의 재확인 없이 생성된다. **고르는 건 여전히 사람만**, 새 탭은 `needs_billing`
+- 탭 파일을 건네받아 열면 파일에 적힌 팀·프로젝트로 바로 잡힌다(Status 칸에 보인다)
 
 ### 프론트 ↔ 서버
 - 상태는 `AppState` 싱글톤 하나에 전부 (설정·갤러리·ref 슬롯·큐·로그·이벤트)
@@ -388,6 +403,12 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 - **모델 메뉴의 별표** (v2026-11-0502~): 회사별 그룹 + 회사마다 최고 모델 하나 `SOTA_MODELS`(app.js, 지금 `gemini-3-pro-image`·`gpt-image-2.6-sunburst`·`seedream-5-0-pro-260628`).
   표시는 `★` + 강조색 하나(`--accent`), 화면에 "SOTA" 글자는 쓰지 않는다 — 회사별 색과 글자는 사용자가 빼라고 했다, 회사는 그룹 이름이 말한다. 판단으로 고른 값이다 — 구글은 문서가 "premium choice" 라 한 Pro 로,
   2.1 은 "workhorse". 메뉴 순서는 `_MODEL_MENU_ORDER`(OpenAI·시드림은 최신·상위부터). **새 모델을 넣을 때 이 두 목록을 같이 볼 것**
+- **모델 설정의 "모델별 시작 화질" 스위치** (2026-11-05~): 켜짐(기본) = 모델을 바꾸면 그 모델의 시작 화질(`default_res`, 없으면 최고)·Quality 시작값. 꺼짐(`model_prefs.keep_panel=true`) = Ratio·Count 처럼 패널 값 유지 —
+  해상도·Quality·Complexity 모두. 그 모델에 없는 값은 가장 가까운 값으로(`_nearestByRank`, 같은 거리면 높은 쪽: 1K 가 없으면 2K, 1.5K → 2K, 4K → 2K) 옮기고 토스트로 알린다. Quality 를 같이 묶은 건 해상도만 고정하면 모델을 바꿀 때마다 max 로 올라가 값이 새기 때문.
+  사람이 고른 값은 `_panelWant` 에 따로 둔다 — 4K → 시드림 5.0(2K) → Pro 면 4K 로 돌아온다. `loadSettings`·모델 설정 저장·Reset Setup 때 비운다(재시작·탭 전환·Load 뒤엔 그 값부터). 다른 탭을 닫을 땐 안 비운다. 꺼 둔 동안에도 `default_res` 는 지우지 않는다(다시 켜면 그대로). prefs.json 이라 업데이트해도 유지. 표시 체크박스는 스위치와 무관.
+  **숨은 Complexity 칸은 그 탭의 값을 든다**(`_holdHidden`). `saveSettings` 가 숨은 칸도 보내기 때문 — 안 그러면 다른 탭 값이 이 탭에 저장된다. **Quality 는 화면 칸이 아니라 `_qualityPick`(사람이 고른 값)만 저장한다** — 시작값으로 채운 걸 저장하면 고른 값이 되고, 모델에 없어 옮겨 보여 준 값을 저장하면 고른 값이 낮아진다(xhigh → gpt-image-2 의 high 로 굳음).
+- **시작 Quality** (2026-11-05~): 모델 설정의 넷째 칸 `model_prefs.default_quality`, 비우면 그 모델의 맨 위(2.5·2.6 `max`, gpt-image-2 `high`). 규칙은 `openai_start_quality`(서버)·`preferredQuality`(화면) 두 곳이 같아야 한다. **`state.quality == ""` 는 "이 탭이 고른 적 없음"** 이다 — 예전 기본값 `high` 는 고른 high 와 구분이 안 됐다. 저장 파일에도 `""` 와 `quality_chosen` 으로 남는다. 이 칸이 없는 옛 파일은 GPT 모델이면 값을 믿고, 제미나이·시드림이면 고른 적 없음으로 읽는다(옛 기본값·다른 탭 값이 들어 있다). 제미나이·시드림 카드 Load 는 Quality 를 건드리지 않는다. `/api/settings` 는 `quality`(실제 쓸 값)와 `quality_chosen` 을 함께 준다. 스위치 끔: 고른 값이 먼저, 고른 적 없으면 이 값. **에이전트는 이 값도 탭 값도 안 본다**(§2.2). 제미나이·시드림엔 지어내지 않는다(`""` 그대로 기록)
+- **비교에 GIF 는 못 넣는다**(2026-11-05~): 갤러리 "비교"·끌어다 놓기·외부 파일·`?cmp=` 모두 거절, 비교 중 휠·방향키는 GIF 를 건너뛴다(`_isGif`, `_nextNonGif`). 재생은 보통 미리보기에서
 - **GPT 이미지 검열은 `moderation=low`** (`OPENAI_MODERATION`, v2026-09-2801~). 기본값 auto 는 호러 특수분장
   같은 창작물도 자주 막는다. 편집(레퍼런스)은 SDK 에 인자가 없어 `extra_body={"moderation": ...}` 로 보낸다
   (API 레퍼런스에도 있고 다섯 모델 × 생성/편집 실측). low 도 정책 위반은 막는다
@@ -475,7 +496,8 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 | 옛 EXE 가 "API 자격증명 없음" 으로 안 켜짐 | 0801 이전 launcher 의 환경변수 검사 + 키 없는 PC | 최신 EXE 로 교체 (정리된 PC 는 표시값 덕에 옛 EXE 도 켜진다) |
 | 테스트가 개발 PC 환경변수 키를 못 찾음 | 0801 이 이 PC 도 정리함(정상) | 실키 테스트는 게이트웨이 + 일회용 신원(nb-selftest), 끝나면 KV·D1 정리 |
 | Program Files 설치 사용자 | UAC로 자기교체 불가 | 일반 폴더로 이동 안내 |
-| 에이전트 요청이 `needs_billing` | 그 탭 팀·프로젝트 미설정 | 사람이 탭의 "!" 또는 우클릭 "팀·프로젝트…" (탭을 안 옮기고 고름) |
+| 저장한 프로젝트인데 켜자 팀·프로젝트를 다시 물음 | 그 팀·프로젝트가 목록에서 빠짐(시트 종료·관리자 보관) 또는 파일에 값 하나가 빔 | 정상. 창의 안내대로 다시 고름 (§2.3) |
+| 에이전트 요청이 `needs_billing` | 그 탭 팀·프로젝트 미설정 또는 목록에서 빠짐 | 사람이 탭의 "!" 또는 우클릭 "팀·프로젝트…" (탭을 안 옮기고 고름) |
 | 에이전트 요청이 `bad_aspect` 등 | 그 모델이 모르는 값을 보냄 | 응답의 `allowed` 중에서 다시 (§2.2) |
 | `/api/batch` 가 `no_such_batch` | 앱 재시작(집계는 메모리) 또는 그 탭의 최근 50개 밖 | 갤러리 `?batch_id=` 로 찾기 |
 

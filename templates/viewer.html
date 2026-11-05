@@ -530,11 +530,19 @@ function _cmpDropObjUrl() {
   }
 }
 
+// GIF 는 비교에 넣지 않는다. 가운데 선으로 가르는 비교는 정지 그림끼리의 도구이고, 양쪽이 따로
+// 움직이면 어느 순간을 비교하는지 알 수 없다. 재생은 비교가 아닌 보통 미리보기에서 한다.
+const _isGif = p => /\.gif$/i.test(String(p || ""));
+const _GIF_NO_COMPARE = "GIF는 비교할 수 없습니다 — PNG·SVG로 비교해 주세요";
+
 function enterCompare(pathB) {
+  if (_isGif(pathB) || _isGif(currentPath)) { showToast(_GIF_NO_COMPARE); return; }
   const seq = ++_cmpSeq;
   const im = new Image();
   im.onload = () => {
     if (seq !== _cmpSeq) return;   // superseded by a newer compare load
+    // 불러오는 사이 방향키로 왼쪽이 GIF 로 바뀌었을 수 있다.
+    if (_isGif(currentPath)) { showToast(_GIF_NO_COMPARE); return; }
     _cmpDropObjUrl();
     cmp.img = im;
     cmp.path = pathB;
@@ -552,11 +560,16 @@ function enterCompare(pathB) {
 // nature: switching the viewer image or closing the window ends it. The
 // same-scale rule already favors the higher-resolution side.
 function enterCompareExternal(file) {
+  if (file.type === "image/gif" || _isGif(file.name) || _isGif(currentPath)) { showToast(_GIF_NO_COMPARE); return; }
   const seq = ++_cmpSeq;
   const url = URL.createObjectURL(file);
   const im = new Image();
   im.onload = () => {
-    if (seq !== _cmpSeq) { try { URL.revokeObjectURL(url); } catch (_) {} return; }
+    if (seq !== _cmpSeq || _isGif(currentPath)) {
+      try { URL.revokeObjectURL(url); } catch (_) {}
+      if (seq === _cmpSeq) showToast(_GIF_NO_COMPARE);
+      return;
+    }
     _cmpDropObjUrl();
     cmp.objUrl = url;
     cmp.img = im;
@@ -576,6 +589,7 @@ function enterCompareExternal(file) {
 }
 
 function exitCompare() {
+  ++_cmpSeq;   // 아직 불러오는 중인 오른쪽 이미지가 끝나면서 비교를 다시 열지 못하게 한다
   _cmpDropObjUrl();
   cmp.on = false;
   cmp.img = null;
@@ -584,14 +598,24 @@ function exitCompare() {
   fit();
 }
 
+// 비교 중 다음 칸 — GIF 는 건너뛴다. 없으면 -1.
+function _nextNonGif(idx, step) {
+  const n = galleryPaths.length;
+  for (let i = 1; i <= n; i++) {
+    const k = (idx + step * i % n + n * n) % n;
+    if (!_isGif(galleryPaths[k])) return k;
+  }
+  return -1;
+}
+
 // Wheel / arrows while comparing: swap the RIGHT image through the gallery
 // (left stays fixed) — compare one base against many variants.
 function cmpNavigate(step) {
   if (!cmp.on || !galleryPaths.length) return;
   let idx = galleryPaths.indexOf(cmp.path);
   if (idx === -1) idx = 0;
-  idx = (idx + step + galleryPaths.length) % galleryPaths.length;
-  if (galleryPaths[idx] === cmp.path) return;
+  idx = _nextNonGif(idx, step);
+  if (idx === -1 || galleryPaths[idx] === cmp.path) return;
   const p = galleryPaths[idx];
   const seq = ++_cmpSeq;
   const prevPath = cmp.path;   // for rollback if the new one fails to load
@@ -739,6 +763,7 @@ function _applyGalleryData(items) {
     if (galleryPaths.length) {
       const idx = Math.min(Math.max(_lastIdx, 0), galleryPaths.length - 1);
       showToast("보던 이미지가 삭제되어 다른 이미지로 이동합니다");
+      if (cmp.on && _isGif(galleryPaths[idx])) exitCompare();   // 다음 칸이 GIF 면 비교를 끝낸다
       loadImage(galleryPaths[idx]);
     } else {
       showToast("보던 이미지가 삭제되었습니다 — 갤러리가 비어 있습니다");
@@ -897,8 +922,8 @@ function navigate(step) {
   if (!galleryPaths.length) return;
   let idx = galleryPaths.indexOf(currentPath);
   if (idx === -1) idx = 0;
-  idx = (idx + step + galleryPaths.length) % galleryPaths.length;
-  if (galleryPaths[idx] === currentPath) return;   // single image: no flicker-reload
+  idx = cmp.on ? _nextNonGif(idx, step) : (idx + step + galleryPaths.length) % galleryPaths.length;
+  if (idx === -1 || galleryPaths[idx] === currentPath) return;   // single image: no flicker-reload
   loadImage(galleryPaths[idx]);
 }
 
@@ -1058,11 +1083,13 @@ function applyCardDrop(p, px) {
   if (cmp.on) {
     const rc = canvas.getBoundingClientRect();
     const leftSide = (px - rc.left) < canvas.clientWidth / 2;
+    if (_isGif(p)) { showToast(_GIF_NO_COMPARE); return; }
     if (leftSide) { loadImage(p); showToast("기준(왼쪽) 이미지를 교체했습니다"); }
     else enterCompare(p);
     return;
   }
   if (p === currentPath) { showToast("같은 이미지입니다 — 다른 이미지를 끌어다 놓으세요"); return; }
+  if (_isGif(p) || _isGif(currentPath)) { showToast(_GIF_NO_COMPARE); return; }
   enterCompare(p);
   showToast("비교 모드 — 가운데 선 드래그 · 휠 = 커서 쪽 이미지 전환 · Esc = 종료");
 }

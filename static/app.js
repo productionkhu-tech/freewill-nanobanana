@@ -64,7 +64,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     const d = await api("/api/delete-confirm-state");
     _skipDeleteConfirm = !!d.skip;
   } catch (e) { /* ignore */ }
-  // 앱을 켤 때 한 번은 귀속을 확인받는다. 탭 전환 경로(reloadActiveProject)와
+  // 팀·프로젝트가 없거나 목록에서 빠진 탭만 묻는다. 탭 전환 경로(reloadActiveProject)와
   // 달리 최초 로드는 그 함수를 타지 않아서 여기서 따로 불러야 한다.
   // 업데이트 안내 팝업보다 뒤에 둬서 둘이 겹치지 않게 한다.
   await refreshBillingBar();
@@ -938,8 +938,12 @@ async function _closeProjectTab(pid) {
   }
   const r = await api("/api/projects/close", { method: "POST", body: { pid } });
   if (!r.ok) { showToast(r.error || "닫기 실패", "error"); return; }
+  // 다른 탭을 닫았을 뿐이면 화면의 탭은 그대로다. 고른 값의 기억도 그대로 둔다.
+  const stayed = r.active === activePid;
+  const want = _panelWant;
   activePid = r.active;
   await reloadActiveProject();
+  if (stayed) _panelWant = want;
   await refreshProjects();
 }
 
@@ -1003,6 +1007,11 @@ async function saveActiveProjectQuiet() {
 async function loadSettings() {
   const d = await api("/api/settings");
   if (!d.model) return;
+  _panelWant = { ..._PANEL_WANT_EMPTY };   // 이 탭의 값으로 다시 시작한다
+  _qualityPick = d.quality_chosen === false ? "" : (d.quality || "");
+  // 스위치가 켜져 있으면 그 모델에 없는 옛 값을 붙들지 않는다 — 화면과 전송이 시작값으로 맞는다.
+  const _qSpec = getModelSpec(d.model);
+  if (!_modelPrefs.keep_panel && _qualityPick && _qSpec.showQuality && !(_qSpec.qualities || []).includes(_qualityPick)) _qualityPick = "";
   // Rebuild the dropdown around whatever this project uses. A restored project
   // (or a Load from a gallery card) may reference a model the user has since
   // hidden — setting .value on a missing <option> silently keeps the OLD
@@ -1016,7 +1025,8 @@ async function loadSettings() {
     aspect: d.aspect,
     resolution: d.resolution,
     count: String(d.count),
-    quality: d.quality || "high",
+    // 고른 적 없는 탭은 "" — applyModelSpec 이 모델 설정의 값으로 시작한다.
+    quality: _qualityPick,
     complexity: d.complexity || "high",
     output_format: d.output_format || "png",
     gif_size: d.gif_size,
@@ -1092,7 +1102,6 @@ async function flushPendingSettings() {
 async function saveSettings(opts) {
   const sections = [];
   document.querySelectorAll(".prompt-section-box").forEach(el => sections.push(el.value));
-  const qs = document.getElementById("qualitySelect");
   const cx = document.getElementById("complexitySelect");
   const r = await api("/api/settings", { method: "POST", body: {
     auto: !!(opts && opts.auto),
@@ -1102,7 +1111,7 @@ async function saveSettings(opts) {
     model: document.getElementById("modelSelect").value,
     aspect: document.getElementById("aspectSelect").value,
     resolution: document.getElementById("resolutionSelect").value,
-    quality: qs ? qs.value : "high",
+    quality: _qualityPick,   // 화면 값이 아니라 고른 값 — 위 _qualityPick 설명
     complexity: cx && cx.value ? cx.value : "high",
     output_format: document.getElementById("outputFormatSelect").value,
     ...(document.getElementById("gifSizeSelect").value ? {
@@ -1337,12 +1346,13 @@ function isSotaModel(m) {
 function modelLabel(m) {
   return (MODEL_LABELS[m] || m) + (isSotaModel(m) ? " ★" : "");
 }
-let _modelPrefs = { hidden: [], default_res: {} };
+let _modelPrefs = { hidden: [], default_res: {}, default_quality: {}, keep_panel: false };
+const _readModelPrefs = d => ({ hidden: d.hidden || [], default_res: d.default_res || {}, default_quality: d.default_quality || {}, keep_panel: !!d.keep_panel });
 
 async function loadModelPrefs() {
   try {
     const d = await api("/api/model-prefs");
-    if (d && d.ok) _modelPrefs = { hidden: d.hidden || [], default_res: d.default_res || {} };
+    if (d && d.ok) _modelPrefs = _readModelPrefs(d);
   } catch (e) { /* 못 읽으면 아무것도 숨기지 않는다 — 기능이 죽는 쪽보다 낫다 */ }
 }
 
@@ -1392,8 +1402,13 @@ function rebuildModelSelect(keepModel) {
 // (the v2026-08-05 rule that fixed "4K 모델인데 하위 화질에 갇힘"). A loaded
 // project's own stored resolution always beats this — load paths pass explicit
 // values, and this only fills the gaps.
-function preferredResolution(model) {
+// `from`: 불러온 값이 이 모델에 없을 때 그 값. 스위치를 끈 사람에겐 꺼 둔 시작 화질을 쓰지 않고
+// 가장 가까운 값으로 맞춘다.
+function preferredResolution(model, from) {
   const spec = getModelSpec(model);
+  if (_modelPrefs.keep_panel) {
+    return _nearestByRank(spec.resolutions || [], from || _panelWant.resolution, _RES_RANK) || bestResolution(spec);
+  }
   const pref = (_modelPrefs.default_res || {})[migrateModelId(model)];
   if (pref && (spec.resolutions || []).includes(pref)) return pref;
   return bestResolution(spec);
@@ -1408,9 +1423,64 @@ function preferredResolution(model) {
 function preferredQuality(model) {
   const spec = getModelSpec(model);
   const list = spec.qualities || [];
+  if (_modelPrefs.keep_panel && _qualityPick) {
+    const q = _nearestByRank(list, _qualityPick, _QUALITY_RANK);
+    if (q) return q;
+  }
+  // 모델 설정의 시작 Quality. 안 정했으면 그 모델의 맨 위 — 서버의 openai_start_quality 와 같은 규칙.
+  const pref = (_modelPrefs.default_quality || {})[migrateModelId(model)];
+  if (pref && list.includes(pref)) return pref;
   const d = spec.defaultQuality;
   if (d && list.includes(d)) return d;
   return list.length ? list[list.length - 1] : undefined;
+}
+
+// 모델 설정의 스위치를 끈 사람의 방식: Ratio·Count 처럼 패널 값이 모델을 따라가지 않는다.
+// 사람이 고른 값을 화면 값과 따로 둔다 — 4K 로 쓰다 4K 없는 모델에서 2K 가 됐어도, 4K 되는
+// 모델로 돌아오면 4K 로 돌아와야 "한 해상도로 고정" 이다. 탭·프로젝트를 다시 읽으면 비운다.
+const _PANEL_WANT_EMPTY = Object.freeze({ resolution: null, complexity: null });
+let _panelWant = { ..._PANEL_WANT_EMPTY };
+// 이 탭에서 사람이 고른 Quality. "" = 고른 적 없음 → 모델 설정의 시작값을 쓴다.
+// 화면 값과 따로 둔다: 시작값으로 채운 걸 저장하면 고른 값이 되어 버리고, 모델에 없어 옮겨 보여 준
+// 값을 저장하면 고른 값이 낮아진다. 그래서 서버에도 이 값만 보낸다.
+let _qualityPick = "";
+const _QUALITY_RANK = { low: 0, medium: 1, high: 2, xhigh: 3, max: 4 };
+
+// 그 값이 있으면 그 값, 없으면 가장 가까운 값. 같은 거리면 높은 쪽 (1K 가 없으면 2K).
+function _nearestByRank(list, want, ranks) {
+  if (list.includes(want)) return want;
+  const r = ranks[want];
+  if (r === undefined) return null;
+  let best = null, gap = Infinity, bestRank = -1;
+  for (const v of list) {
+    const k = ranks[v];
+    if (k === undefined) continue;
+    const g = Math.abs(k - r);
+    if (g < gap || (g === gap && k > bestRank)) { gap = g; best = v; bestRank = k; }
+  }
+  return best;
+}
+
+// 모델을 바꾸기 직전의 패널 값을 잡아 둔다. Complexity 칸은 숨겨진 모델에서도 이 탭의 값을
+// 들고 있으므로(_holdHidden) 그대로 읽으면 된다. Quality 는 _qualityPick 이 따로 맡는다.
+function _rememberPanel() {
+  [["resolution", "resolutionSelect"], ["complexity", "complexitySelect"]].forEach(([key, selId]) => {
+    if (!_panelWant[key]) _panelWant[key] = document.getElementById(selId).value;
+  });
+}
+
+// 칸이 없는 모델이어도 이 탭의 값을 들고 있는다. saveSettings 가 숨은 칸도 함께 보내므로, 안 그러면
+// 다른 탭에서 쓰던 값이 이 탭에 저장된다.
+function _holdHidden(selId, value) {
+  const sel = document.getElementById(selId);
+  if (!sel || !value) return;
+  if (![...sel.options].some(o => o.value === value)) {
+    const o = document.createElement("option");
+    o.value = value;
+    o.textContent = value;
+    sel.appendChild(o);
+  }
+  sel.value = value;
 }
 
 // The Gemini API token is "512px" (NOT "0.5K" — verified: 0.5K returns 400).
@@ -1627,7 +1697,7 @@ function applyModelSpec(model, preserved) {
   // H8: migrate the wrong "0.5K" token (shipped v1201/02) back to "512px".
   const prefRes = preserved ? migrateResolution(preserved.resolution) : undefined;
   repopulateSelect("aspectSelect",     spec.aspects,     preserved?.aspect, spec.defaultAspect);
-  repopulateSelect("resolutionSelect", spec.resolutions, prefRes,           preferredResolution(model));
+  repopulateSelect("resolutionSelect", spec.resolutions, prefRes,           preferredResolution(model, prefRes));
   const rw = document.getElementById("resolutionWrap");
   if (rw) rw.style.display = (spec.showResolution === false) ? "none" : "";
   repopulateSelect("countSelect",      spec.counts,      preserved?.count);
@@ -1635,7 +1705,10 @@ function applyModelSpec(model, preserved) {
     // From the spec, not a literal here: 2.5 adds xhigh/max, and a hardcoded
     // list would have silently hidden them however the model was registered.
     const quals = spec.qualities || ["low","medium","high","auto"];
-    repopulateSelect("qualitySelect", quals, preserved?.quality, spec.defaultQuality || "high");
+    // preserved.quality 가 "" 이면 이 탭은 고른 적 없다. 비워서 넘기면 repopulateSelect 가
+    // 칸에 남은 값(다른 탭의 것일 수 있다)을 그대로 쓴다.
+    const q = preserved && !preserved.quality ? preferredQuality(model) : preserved?.quality;
+    repopulateSelect("qualitySelect", quals, q, preferredQuality(model));
     const qw = document.getElementById("qualityWrap");
     if (qw) qw.style.display = "";
   } else {
@@ -1648,8 +1721,9 @@ function applyModelSpec(model, preserved) {
   if (spec.complexities) {
     repopulateSelect("complexitySelect", spec.complexities, preserved?.complexity, spec.defaultComplexity);
     if (cxw) cxw.style.display = "";
-  } else if (cxw) {
-    cxw.style.display = "none";
+  } else {
+    if (cxw) cxw.style.display = "none";
+    _holdHidden("complexitySelect", preserved?.complexity);
   }
   // Transparency is for 2.5 and 2.6 only. Hiding the row is not enough — a
   // model without it must not keep a checked box alive in the background, or
@@ -1712,10 +1786,13 @@ function bestResolution(spec) {
 // One screen, one row per model: [show] [name] [starting resolution]. Saved
 // server-side into prefs.json, so it holds across restarts, app updates, and
 // every project tab at once.
+let _mpKeepDraft = false;      // 스위치의 지금 상태. 저장을 눌러야 적용되고 취소하면 버려진다.
+
 function openModelPrefs() {
   const box = document.getElementById("modelPrefsRows");
   if (!box) return;
   box.innerHTML = "";
+  _mpKeepDraft = !!_modelPrefs.keep_panel;
   const hidden = new Set(_modelPrefs.hidden || []);
   const cur = migrateModelId(document.getElementById("modelSelect").value);
   MODEL_ORDER.forEach(m => {
@@ -1747,7 +1824,7 @@ function openModelPrefs() {
     const resList = (spec.resolutions || []).filter(r => r !== "auto");
     if (spec.showResolution === false || resList.length <= 1) {
       // 화질 선택지가 하나뿐인 모델은 고를 게 없다.
-      resSel.disabled = true;
+      resSel.dataset.fixed = "1";
       const o = document.createElement("option");
       o.value = ""; o.textContent = resList.length === 1 ? resList[0] + " 고정" : "—";
       resSel.appendChild(o);
@@ -1764,14 +1841,59 @@ function openModelPrefs() {
       resSel.value = resList.includes(pref) ? pref : "";
     }
 
-    row.append(chk, name, resSel);
+    // 시작 Quality. 칸이 없는 모델은 고를 게 없다.
+    const qSel = document.createElement("select");
+    qSel.className = "mp-q";
+    qSel.dataset.model = m;
+    const qList = spec.showQuality ? (spec.qualities || []) : [];
+    if (!qList.length) {
+      qSel.disabled = true;
+      const o = document.createElement("option");
+      o.value = ""; o.textContent = "—";
+      qSel.appendChild(o);
+    } else {
+      const oTop = document.createElement("option");
+      oTop.value = ""; oTop.textContent = `최대 (${spec.defaultQuality})`;
+      qSel.appendChild(oTop);
+      qList.forEach(q => {
+        const o = document.createElement("option");
+        o.value = q; o.textContent = q;
+        qSel.appendChild(o);
+      });
+      const qPref = (_modelPrefs.default_quality || {})[m] || "";
+      qSel.value = qList.includes(qPref) ? qPref : "";
+    }
+
+    row.append(chk, name, resSel, qSel);
     box.appendChild(row);
   });
+  _syncModelStartToggle();
   document.getElementById("modelPrefsModal").classList.remove("hidden");
 }
 
 function closeModelPrefs() {
   document.getElementById("modelPrefsModal").classList.add("hidden");
+}
+
+function toggleModelStartRes() {
+  _mpKeepDraft = !_mpKeepDraft;
+  _syncModelStartToggle();
+}
+
+// 켜짐 = 모델마다 시작 화질(기본). 꺼짐 = 패널 값 유지. 꺼도 열의 값은 그대로 둔다 —
+// 다시 켜면 돌아와야 하므로 저장할 때도 함께 보낸다.
+function _syncModelStartToggle() {
+  const on = !_mpKeepDraft;
+  const t = document.getElementById("mpStartToggle");
+  t.classList.toggle("active", on);
+  t.setAttribute("aria-checked", String(on));
+  document.getElementById("mpResHead").classList.toggle("off", !on);
+  document.getElementById("mpDesc").textContent = on
+    ? "체크를 끄면 목록에서 숨겨지고, 화질·Quality는 그 모델로 바꿀 때 처음 선택될 값입니다."
+    : "체크를 끄면 목록에서 숨겨집니다. 모델을 바꿔도 패널의 값을 그대로 쓰고, 그 모델에 없는 값이면 가장 가까운 값으로 옮깁니다 (1K → 2K). Quality는 탭에서 고른 적 없을 때만 오른쪽 값으로 시작합니다.";
+  document.querySelectorAll("#modelPrefsRows select.mp-res").forEach(sel => {
+    sel.disabled = !on || !!sel.dataset.fixed;
+  });
 }
 
 async function saveModelPrefs() {
@@ -1784,11 +1906,21 @@ async function saveModelPrefs() {
   }
   const default_res = {};
   box.querySelectorAll("select.mp-res").forEach(sel => {
-    if (!sel.disabled && sel.value) default_res[sel.dataset.model] = sel.value;
+    if (!sel.dataset.fixed && sel.value) default_res[sel.dataset.model] = sel.value;
   });
-  const d = await api("/api/model-prefs", { method: "POST", body: { hidden, default_res } });
+  const default_quality = {};
+  box.querySelectorAll("select.mp-q").forEach(sel => {
+    if (!sel.disabled && sel.value) default_quality[sel.dataset.model] = sel.value;
+  });
+  const d = await api("/api/model-prefs", { method: "POST", body: { hidden, default_res, default_quality, keep_panel: _mpKeepDraft } });
   if (!d.ok) { showToast(d.error || "저장 실패", "error"); return; }
-  _modelPrefs = { hidden: d.hidden || [], default_res: d.default_res || {} };
+  _modelPrefs = _readModelPrefs(d);
+  _panelWant = { ..._PANEL_WANT_EMPTY };   // 지금 화면의 값에서 다시 시작한다
+  // 고른 적 없는 탭은 서버가 시작값을 쓴다 — 방금 바꾼 시작값이 화면에도 보여야 한다.
+  if (!_qualityPick && document.getElementById("qualityWrap").style.display !== "none") {
+    const _q = preferredQuality(document.getElementById("modelSelect").value);
+    if (_q) document.getElementById("qualitySelect").value = _q;
+  }
   // The dropdown reflects the change immediately; the model in use stays put
   // even if it was just hidden (tagged), so nothing on screen breaks.
   rebuildModelSelect(document.getElementById("modelSelect").value);
@@ -1798,17 +1930,44 @@ async function saveModelPrefs() {
 
 function onModelChange() {
   const model = document.getElementById("modelSelect").value;
+  const keep = !!_modelPrefs.keep_panel;
+  if (keep) _rememberPanel();
+  else _qualityPick = "";   // 스위치 켜짐: 모델을 바꾸면 그 모델의 시작값으로 돌아간다
+  const shown = {
+    resolution: document.getElementById("resolutionSelect").value,
+    quality: document.getElementById("qualitySelect").value,
+  };
   // 종횡비는 모델과 무관한 '모양'이므로 유지한다(새 모델이 못 받는 값일 때만
   // repopulateSelect가 기본값으로 떨어뜨린다). 해상도·화질은 새 모델 기준으로
-  // 다시 잡는다 — 등급 이름이 같아도 모델마다 뜻이 다르기 때문.
+  // 다시 잡는다 — 등급 이름이 같아도 모델마다 뜻이 다르기 때문. 단, 모델 설정의
+  // 스위치를 끈 사람에겐 패널 값이 먼저다.
   applyModelSpec(model, {
     resolution: preferredResolution(model),
     quality: preferredQuality(model),
-    complexity: getModelSpec(model).defaultComplexity,
+    complexity: (keep && _panelWant.complexity) || getModelSpec(model).defaultComplexity,
   });
+  if (keep) _toastPanelMoved(model, shown);
   saveSettings();
   // 숨김 모델에서 빠져나왔으면 "(숨김)" 항목을 목록에서 걷어낸다.
   rebuildModelSelect(model);
+}
+
+// 고정해 둔 값이 이 모델에 없어 옮겼으면 말해 준다. 화질이 바뀌면 값도 달라지기 때문이다.
+// `shown`: 바꾸기 직전 화면의 값. 이미 그 값이었으면 새로 바뀐 게 없으니 다시 말하지 않는다.
+function _toastPanelMoved(model, shown) {
+  const spec = getModelSpec(model);
+  const moved = [];
+  const res = document.getElementById("resolutionSelect").value;
+  // Custom 크기와 GIF 는 해상도를 쓰지 않으니 옮겼다고 말할 것도 없다.
+  const resInUse = document.getElementById("resolutionWrap").style.display !== "none" && !customSizeActive();
+  if (resInUse && _panelWant.resolution && res !== _panelWant.resolution && res !== shown.resolution) {
+    moved.push(`${_panelWant.resolution} → ${res}`);
+  }
+  const q = document.getElementById("qualitySelect").value;
+  if (spec.showQuality && _qualityPick && q !== _qualityPick && q !== shown.quality) {
+    moved.push(`${_qualityPick} → ${q}`);
+  }
+  if (moved.length) showToast(`이 모델에 없는 값이라 옮겼습니다: ${moved.join(", ")}`, "warn");
 }
 
 // ==========================================
@@ -2256,6 +2415,9 @@ function updateRemovePromptBtn() {
 }
 
 function resetSetup() {
+  // 리셋 전에 기억해 둔 값은 버린다. 안 그러면 리셋 뒤 모델을 바꿀 때 옛 값으로 튄다.
+  _panelWant = { ..._PANEL_WANT_EMPTY };
+  if (_modelPrefs.keep_panel) _rememberPanel();
   // 기본 모델이 숨겨져 있어도 리셋이 조용히 실패하지 않게 목록부터 재구성.
   rebuildModelSelect("gemini-3-pro-image");
   document.getElementById("modelSelect").value = "gemini-3-pro-image";
@@ -4046,9 +4208,11 @@ async function refreshBillingBar() {
   const bar = document.getElementById("billingBar");
   const txt = document.getElementById("billingBarText");
   if (!bar || !txt) return;
+  // 목록이 먼저다. 서버는 받은 목록으로 "저장된 팀·프로젝트가 아직 있는가" 를 답하므로,
+  // 순서가 바뀌면 켤 때 사라진 건을 멀쩡하다고 듣고 묻지 않고 넘어간다.
+  if (!_billCatalog.teams.length) { try { await loadBillingCatalog(false); } catch (e) {} }
   let st = null;
   try { st = await api("/api/billing/state"); } catch (e) { /* 표시일 뿐이다 */ }
-  if (!_billCatalog.teams.length) { try { await loadBillingCatalog(false); } catch (e) {} }
   _billLastState = st;      // 모달을 즉시 띄울 때 쓸 현재 탭의 값
   const set = st && st.confirmed && st.team_id && st.project_id;
   bar.classList.toggle("needs", !set);
@@ -4071,7 +4235,7 @@ async function loadBillingCatalog(force) {
 }
 
 // 목록의 첫 칸은 **비어 있어야 한다.** 아무거나 미리 골라져 있으면 읽지 않고
-// 확정해 버리고, 그러면 이 창을 매번 띄우는 의미 자체가 없어진다.
+// 확정해 버리고, 그러면 이 창을 띄우는 의미 자체가 없어진다.
 function _billPlaceholder(text) {
   const o = document.createElement("option");
   o.value = ""; o.textContent = text; o.disabled = true; o.selected = true;
@@ -4168,7 +4332,7 @@ async function openBillingModal(pid) {
   }
   if (!target) _billLastState = fresh;
   // 이 탭이 이미 확정해 둔 값만 되살린다. 그 외에는 비워 둔다 — 미리 골라두면
-  // 읽지 않고 확정해 버려서, 매번 확인받는 의미가 사라진다.
+  // 읽지 않고 확정해 버린다.
   const keepTeam = (fresh && fresh.confirmed && fresh.team_id) || "";
   const keepProj = (fresh && fresh.confirmed && fresh.project_id) || "";
   _fillBillingSelects(keepTeam, keepProj);
@@ -4212,7 +4376,11 @@ async function openBillingModal(pid) {
 function _billRecall(st) {
   const row = document.getElementById("billingRecall");
   if (!row) return;
-  if (!st) { row.classList.add("hidden"); row.dataset.team = ""; row.dataset.proj = ""; return; }
+  // 목록에서 빠진 건은 제안하지 않는다. 눌러도 채워지지 않고, 이름 대신 번호가 보인다.
+  const alive = st
+    && (_billCatalog.teams || []).some(t => t.id === st.last_team_id)
+    && (_billCatalog.projects || []).some(p => p.id === _billCanonProject(st.last_project_id));
+  if (!alive) { row.classList.add("hidden"); row.dataset.team = ""; row.dataset.proj = ""; return; }
   row.dataset.team = st.last_team_id;
   row.dataset.proj = st.last_project_id;
   const label = document.getElementById("billingRecallText");
@@ -5169,6 +5337,10 @@ function openCompareSelected() {
     showToast("비교하려면 이미지 2개를 선택하세요 (Ctrl+클릭)", "warn");
     return;
   }
+  if (selectedPaths.some(p => /\.gif$/i.test(p))) {
+    showToast("GIF는 비교할 수 없습니다 — 미리보기에서 재생해 주세요", "warn");
+    return;
+  }
   openViewerWindow(selectedPaths[0], selectedPaths[1]);
 }
 
@@ -5285,6 +5457,11 @@ function showToast(msg, kind = "info") {
 // ==========================================
 // Auto-save settings on change
 // ==========================================
+// 코드가 채울 때는 change 가 나지 않으므로, 여기 오는 건 사람이 직접 고른 값뿐이다.
+// 아래 저장보다 먼저 등록해야 한다 — saveSettings 는 _qualityPick 을 읽어 바로 보낸다.
+document.getElementById("resolutionSelect").addEventListener("change", e => { _panelWant.resolution = e.target.value; });
+document.getElementById("qualitySelect").addEventListener("change", e => { _qualityPick = e.target.value; });
+document.getElementById("complexitySelect").addEventListener("change", e => { _panelWant.complexity = e.target.value; });
 ["aspectSelect", "resolutionSelect", "countSelect", "qualitySelect", "complexitySelect", "namingSwitch",
  "namingPrefix", "namingDelimiter", "namingIndexPrefix", "namingPadding"].forEach(id => {
   const el = document.getElementById(id);

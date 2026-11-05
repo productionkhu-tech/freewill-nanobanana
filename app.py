@@ -108,6 +108,19 @@ def openai_qualities(model):
     return GPT25_QUALITIES if model in GPT_LADDER_MODEL_IDS else GPT2_QUALITIES
 
 
+_QUALITY_TOKENS = {"low", "medium", "high", "xhigh", "max", "auto"}
+
+
+def openai_start_quality(model, prefs=None):
+    """Quality 를 고른 적 없는 탭이 이 모델에서 시작할 값 — 모델 설정의 값, 없으면 그 모델의 맨 위.
+    static/app.js 의 preferredQuality 와 같은 규칙이다(MODEL_SPECS 의 defaultQuality)."""
+    levels = openai_qualities(model)
+    pref = ((prefs or {}).get("default_quality") or {}).get(_normalize_model_name(model))
+    if pref in levels:
+        return pref
+    return "max" if "max" in levels else "high"
+
+
 def openai_formats(model):
     """Output formats this model can return. Every other model and provider stays on
     the one format the rest of the pipeline was built around."""
@@ -687,7 +700,19 @@ def _sanitize_model_prefs(mp):
             v = str(v).strip()
             if _plausible_model_id(k) and v in _RES_TOKENS:
                 default_res[k] = v
-    return {"hidden": hidden, "default_res": default_res}
+    # keep_panel: 모델을 바꿔도 패널의 화질을 유지한다 (모델 설정 오른쪽 위 스위치를 끈 상태).
+    # 꺼 둔 동안에도 default_res 는 지우지 않는다 — 다시 켜면 그대로 돌아와야 한다.
+    keep_panel = isinstance(mp, dict) and mp.get("keep_panel") is True
+    # 모델마다 Quality 를 어디서 시작할지. 그 모델에 없는 값은 쓸 때 걸러진다(openai_start_quality).
+    default_quality = {}
+    raw_q = mp.get("default_quality") if isinstance(mp, dict) else None
+    if isinstance(raw_q, dict):
+        for k, v in list(raw_q.items())[:32]:
+            k = _normalize_model_name(str(k).strip())
+            if _plausible_model_id(k) and isinstance(v, str) and v in _QUALITY_TOKENS:
+                default_quality[k] = v
+    return {"hidden": hidden, "default_res": default_res, "default_quality": default_quality,
+            "keep_panel": keep_panel}
 
 
 
@@ -858,7 +883,7 @@ class _Shared:
         # EXE swap never touches - so neither a restart nor an update resets it.
         #   hidden      : ["gemini-2.5-flash-image", ...]
         #   default_res : {"gemini-3-pro-image": "2K", ...}  ("" = highest)
-        self.model_prefs = {"hidden": [], "default_res": {}}
+        self.model_prefs = {"hidden": [], "default_res": {}, "default_quality": {}, "keep_panel": False}
 
         # Window-level flags
         self.always_on_top = False
@@ -955,7 +980,9 @@ class AppState:
         self.resolution = "4K"
         self.count = 1
         # GPT Image 2 전용 — low/medium/high/auto. Gemini는 무시.
-        self.quality = "high"
+        # "" = 이 탭은 Quality 를 고른 적이 없다 → 모델 설정의 값으로 시작한다(openai_start_quality).
+        # 기본값을 "high" 로 두면 고른 high 와 구분이 안 된다. 고른 값은 껐다 켜도 그대로여야 한다.
+        self.quality = ""
         # GPT Image 2 "Custom" aspect — raw user-entered pixels (pre-correction).
         self.custom_w = 1024
         self.custom_h = 1024
@@ -964,9 +991,8 @@ class AppState:
         # 작업하면 한 번 고른 값으로 전부 뭉뚱그려지기 때문.
         self.billing_team_id = ""
         self.billing_project_id = ""
-        # 확인은 세션 한정이라 일부러 저장하지 않는다. 앱을 새로 켤 때마다
-        # (그리고 새 탭을 열 때마다) 한 번은 눈으로 확인하고 넘어가게 하는 게
-        # 요구사항이고, 그 사이 작업 중에는 다시 묻지 않는다.
+        # 새 탭은 사람이 고르기 전까지 생성이 막힌다. 저장한 적 있는 프로젝트는
+        # load_project 가 저장된 값으로 되살리므로 켤 때마다 다시 묻지 않는다.
         self.billing_confirmed = False
         # GPT Image 2.5 / 2.6 전용 — 배경을 투명하게 받을지. 프로젝트별 설정이라
         # 탭마다 다르게 둘 수 있고, 프로젝트 파일에 함께 저장된다.
@@ -2034,6 +2060,8 @@ class AppState:
                 "aspect": self.aspect,
                 "resolution": self.resolution,
                 "quality": self.quality,
+                # 이 칸이 있는 파일은 quality 를 믿어도 된다(옛 파일 구분은 load_project).
+                "quality_chosen": bool(self.quality),
                 "custom_w": self.custom_w,
                 "custom_h": self.custom_h,
                 "openai_bg_transparent": self.openai_bg_transparent,
@@ -2135,7 +2163,11 @@ class AppState:
         self.model = _live_model_name(ui.get("model", self.model))
         self.aspect = ui.get("aspect", self.aspect)
         self.resolution = ui.get("resolution", self.resolution)
-        self.quality = ui.get("quality", self.quality)
+        self.quality = str(ui.get("quality") or "")
+        # 이전 버전 파일의 제미나이·시드림 탭은 고른 적 없는 값(옛 기본 high, 다른 탭에서 넘어온 값)을
+        # 저장해 두었다. 고른 값으로 읽으면 스위치를 끈 사람이 GPT 로 갈 때 시작값 대신 그 값이 된다.
+        if "quality_chosen" not in ui and self.model not in OPENAI_MODEL_IDS:
+            self.quality = ""
         self.custom_w = _safe_int(ui.get("custom_w"), self.custom_w, lo=16, hi=99999)
         self.custom_h = _safe_int(ui.get("custom_h"), self.custom_h, lo=16, hi=99999)
         self.openai_bg_transparent = bool(ui.get("openai_bg_transparent", False))
@@ -2143,11 +2175,12 @@ class AppState:
         self.output_format = ui.get("output_format") if ui.get("output_format") in GPT26_FORMATS else "png"
         self.gif_size, self.gif_frames, self.gif_frame_ms = gif_clamp(
             ui.get("gif_size"), ui.get("gif_frames"), ui.get("gif_frame_ms"))
-        # 저장된 귀속은 되살리되 '확인' 은 되살리지 않는다. 미리 채워두면
-        # 다시 고를 필요는 없고 확인 한 번이면 끝난다.
-        self.billing_team_id = str(ui.get("billing_team_id", "") or "")
-        self.billing_project_id = str(ui.get("billing_project_id", "") or "")
-        self.billing_confirmed = False
+        # 파일에 둘 다 있으면 사람이 고른 적이 있는 값이다. 켤 때마다 다시 묻지 않는다.
+        # 하나라도 비었으면 깨진 값이라 다시 묻고, 목록에서 빠졌는지는
+        # _billing_usable · _billing_gate 가 본다.
+        self.billing_team_id = str(ui.get("billing_team_id", "") or "").strip()
+        self.billing_project_id = str(ui.get("billing_project_id", "") or "").strip()
+        self.billing_confirmed = bool(self.billing_team_id and self.billing_project_id)
         # Tolerant parse — older projects sometimes have count="" which would
         # raise ValueError and abort load mid-way, losing the whole session.
         try:
@@ -3007,6 +3040,12 @@ class AppState:
                                                 gif_frames=_cfg.get("frame_count"),
                                                 gif_frame_ms=_cfg.get("frame_duration_ms"))
                             card_aspect, card_res = gif_card_labels(_cfg.get("size"), _cfg.get("frame_count"))
+                        elif aspect == "custom" and "x" in str(_cfg.get("size", "")):
+                            # Custom ignores 1K/2K/4K: a 2880x2880 card used to read "1K".
+                            card_res = str(_cfg["size"]).replace("x", "×")
+                        elif _cfg.get("size") == "auto":
+                            # GPT 의 auto + 레퍼런스 없음: 크기를 OpenAI 가 정한다. 고른 등급을 적으면 거짓말이다.
+                            card_res = "auto"
                         self.add_gallery_item(fp, prompt, elapsed, api_used,
                                               aspect=card_aspect, resolution=card_res,
                                               generated_at=gen_at,
@@ -3624,7 +3663,9 @@ def get_settings():
         "model": state.model,
         "aspect": state.aspect,
         "resolution": state.resolution,
-        "quality": state.quality,
+        "quality": state.quality or openai_start_quality(state.model, state.model_prefs),
+        # 위 값이 이 탭이 고른 것인지. 화면은 고른 적 없는 탭을 구분해 모델 설정 값으로 시작한다.
+        "quality_chosen": bool(state.quality),
         "custom_w": state.custom_w,
         "custom_h": state.custom_h,
         "openai_bg_transparent": state.openai_bg_transparent,
@@ -4648,7 +4689,10 @@ def load_setup():
     state.model = _live_model_name(saved.get("model", state.model))
     state.aspect = saved.get("aspect", state.aspect)
     state.resolution = saved.get("resolution", state.resolution)
-    state.quality = saved.get("quality", state.quality)
+    # 제미나이·시드림 카드엔 Quality 라는 설정이 없다. 그 카드를 불러왔다고 탭에서 고른 값을 지우면
+    # GPT 로 돌아왔을 때 말없이 값이 바뀐다.
+    if state.model in OPENAI_MODEL_IDS:
+        state.quality = saved.get("quality", state.quality)
     state.custom_w = _safe_int(saved.get("custom_w"), state.custom_w, lo=16, hi=99999)
     state.custom_h = _safe_int(saved.get("custom_h"), state.custom_h, lo=16, hi=99999)
     state.openai_bg_transparent = bool(saved.get("openai_bg_transparent", False))
@@ -4808,7 +4852,7 @@ def billing_state():
         "tab": state.display_name(),
         "team_id": state.billing_team_id,
         "project_id": state.billing_project_id,
-        "confirmed": bool(state.billing_confirmed),
+        "confirmed": _billing_usable(state),
         # 이 탭에 값이 없을 때 모달이 미리 골라둘 기본값 (이 PC 가 마지막에 쓴 것).
         "last_team_id": state.last_billing_team_id,
         "last_project_id": state.last_billing_project_id,
@@ -4852,7 +4896,7 @@ def _billing_still_valid(team_id, project_id):
 
     목록을 못 받아오면 **통과시킨다.** 네트워크가 잠깐 끊겼다고 생성을 막으면
     집계를 지키려다 정작 일을 못 하게 만드는 셈이다.
-    Returns (ok, missing_label)."""
+    Returns (ok, missing_label, canonical_project_id)."""
     now = time.time()
     data = _catalog_cache.get("data")
     if not data or now - _catalog_cache.get("at", 0) >= 300:
@@ -4862,8 +4906,15 @@ def _billing_still_valid(team_id, project_id):
                     "aliases": d.get("aliases") or {}}
             _catalog_cache["at"] = now
             _catalog_cache["data"] = data
-    if not data:
+    # 디스크에 남은 지난 목록(at=0)은 고르는 창을 채우는 용도다. 그 사본보다 새 프로젝트일
+    # 수 있어 "사라졌다" 의 근거로는 쓰지 않는다.
+    if not data or not _catalog_cache.get("at"):
         return True, "", project_id    # 확인할 방법이 없으면 막지 않는다
+    return _billing_check(data, team_id, project_id)
+
+
+def _billing_check(data, team_id, project_id):
+    """이 목록에 그 팀과 프로젝트가 있는가. Returns (ok, missing_label, canonical_project_id)."""
     # 시트에서 프로젝트 ID(PJ-…)를 붙이며 옛 id 가 새 id 로 이관됐을 수 있다.
     # 그건 "내려간" 게 아니라 같은 프로젝트의 이름표가 바뀐 것이므로 조용히 따라간다.
     # 단, 목록에 그 id 가 그대로 있으면 그게 답이다 — 옛 번호를 새 프로젝트가 다시 쓴
@@ -4877,6 +4928,20 @@ def _billing_still_valid(team_id, project_id):
     if not any(x.get("id") == canon for x in data.get("projects", [])):
         gone.append("프로젝트")
     return (not gone), "·".join(gone), canon
+
+
+def _billing_usable(p):
+    """이 탭이 지금 아는 만큼으로 비용을 쓸 수 있는가 — 화면과 에이전트가 읽는 값.
+
+    탭 줄이 자주 부르므로 네트워크를 타지 않는다. 저장된 팀·프로젝트가 목록에서 빠졌으면
+    생성을 눌러 보기 전에 탭의 "!" 와 Status 칸에 드러나야 한다. 생성 직전의 판단은 여전히
+    _billing_gate 몫이다."""
+    if not (p.billing_confirmed and p.billing_team_id and p.billing_project_id):
+        return False
+    data = _catalog_cache.get("data")
+    if not data or not _catalog_cache.get("at"):
+        return True
+    return _billing_check(data, p.billing_team_id, p.billing_project_id)[0]
 
 
 # --- Generation ---
@@ -5082,12 +5147,15 @@ def _start_generate_window():
     if p.output_format == "svg" and "svg" in openai_formats(model) and any(r is not None for r in ref_snapshots):
         return jsonify({"ok": False, "svg_no_refs": True, "error": SVG_NO_REFS_ERROR})
     ref_payloads = [p.ref_image_to_bytes(r) if r is not None else None for r in ref_snapshots]
-    img_cfg = _gen_img_cfg(model, p.aspect, p.resolution, p.quality, p.custom_w, p.custom_h,
+    # 화면은 GPT 에서 늘 실제 값을 보낸다. 고른 적 없는 탭이 그대로 오면 모델 설정 값으로 시작한다.
+    quality = p.quality or (openai_start_quality(model, p.model_prefs) if model in OPENAI_MODEL_IDS else "")
+    img_cfg = _gen_img_cfg(model, p.aspect, p.resolution, quality, p.custom_w, p.custom_h,
                            p.openai_bg_transparent, ref_snapshots, p.complexity,
                            p.output_format, p.gif_size, p.gif_frames, p.gif_frame_ms)
     return _enqueue_batch(
         p, model=model, providers=providers, prompt=prompt, count=count,
-        aspect=p.aspect, resolution=p.resolution, quality=p.quality,
+        # 카드에는 실제로 보낸 값을 남긴다(xhigh 를 고른 탭이 gpt-image-2 로 보내면 high).
+        aspect=p.aspect, resolution=p.resolution, quality=img_cfg.get("quality", quality),
         custom_w=p.custom_w, custom_h=p.custom_h, img_cfg=img_cfg, ref_payloads=ref_payloads,
         ref_paths=list(p.ref_path_list),
         pinned_ref_paths=[x for i, x in enumerate(p.ref_path_list)
@@ -5126,6 +5194,10 @@ def _agent_settings_problem(model, aspect, resolution, quality):
         if not _gemini_image_size_ok(model, size):
             return {"error": "bad_resolution",
                     "allowed": sorted(_GEMINI_IMAGE_SIZES.get(_normalize_model_name(model), []))}
+    elif resolution != "1K":
+        # 크기를 받지 않는 모델(2.5 Flash)은 늘 1K 다. 다른 값을 그대로 두면 이미지는 1K 인데
+        # 갤러리엔 탭에 남아 있던 4K 가 적힌다.
+        return {"error": "bad_resolution", "allowed": ["1K"]}
     return None
 
 
@@ -5172,44 +5244,88 @@ def _agent_refs(p, model, paths):
     return snaps, [p.ref_image_to_bytes(im) for im in snaps], None
 
 
+def _agent_default_resolution(model):
+    """에이전트가 해상도를 비웠을 때 — 그 모델의 맨 위. 창에서 그 모델로 바꿀 때의 기본과 같다."""
+    if model in OPENAI_MODEL_IDS:
+        return "4K"
+    if model in SEEDREAM_MODEL_IDS:
+        tiers = list(_SEEDREAM_SIZES.get(model) or [])     # table order, lowest first
+        return tiers[-1] if tiers else "2K"
+    tiers = _GEMINI_IMAGE_SIZES.get(_normalize_model_name(model)) or ()
+    return next((t for t in ("4K", "2K", "1K") if t in tiers), "1K")
+
+
 def _start_generate_agent(p, d):
     prompt = str(d.get("prompt") or "").strip()
     if not prompt:
         return jsonify({"ok": False, "error": "Empty prompt"})
-    s = d.get("settings") or {}
+    s = d.get("settings")
+    if s is None:
+        s = {}
     if not isinstance(s, dict):
         return jsonify({"ok": False, "error": "settings must be an object"})
-    # Anything left out falls back to what the tab has now — read, never written.
-    model = _live_model_name(str(s.get("model") or p.model))
+    # 은퇴한 모델을 보내면 기본 모델로 바꿔 주지 않는다. 저장물을 여는 것과 달리 지금 돈을 쓰는
+    # 요청이라, 시키지 않은 모델로 생성하면 안 된다. (옛 이름은 같은 모델이라 그대로 따라간다.)
+    if _normalize_model_name(str(s.get("model") or "")) in _RETIRED_MODEL_FALLBACK:
+        return jsonify({"ok": False, "error": "unknown_model", "model": str(s.get("model"))})
+    # 에이전트의 요청에는 앱 탭·모델 설정의 값이 섞이지 않는다. 사람이 탭에 medium 을 골라 뒀다고 MCP 가
+    # medium 에 갇히면 안 된다. 보낸 값만 쓰고, 안 보낸 값은 그 모델의 기본(화질은 맨 위)이다.
+    # 탭에서 오는 건 과금·저장 폴더·파일 이름·갤러리뿐이다. 모델은 짐작하지 않는다 — 돈이 달린 값이다.
+    if not s.get("model"):
+        return jsonify({"ok": False, "error": "unknown_model", "model": "(모델을 안 보냄)"})
+    model = _live_model_name(str(s.get("model")))
     if model not in _ALL_MODEL_IDS:
         return jsonify({"ok": False, "error": "unknown_model", "model": model})
     refused = _client_gate(model) or _billing_gate(p)
     if refused is not None:
         return refused
-    aspect = str(s.get("aspect") or p.aspect)
-    resolution = str(s.get("resolution") or p.resolution)
-    quality = str(s.get("quality") or p.quality)
-    count = _safe_int(s.get("count"), p.count, lo=1, hi=10)
-    custom_w = _safe_int(s.get("custom_w"), p.custom_w, lo=16, hi=99999)
-    custom_h = _safe_int(s.get("custom_h"), p.custom_h, lo=16, hi=99999)
-    bg_transparent = bool(s.get("openai_bg_transparent", p.openai_bg_transparent))
+    # 비율을 안 보내면 auto. 단 GPT 는 레퍼런스가 없으면 auto 가 크기를 OpenAI 에 맡겨 해상도가 통째로
+    # 버려진다 — 그때는 창의 GPT 기본 비율(1:1)로 보내야 "맨 위 해상도" 가 실제로 적용된다.
+    aspect = str(s.get("aspect") or ("1:1" if model in OPENAI_MODEL_IDS and not d.get("ref_paths") else "auto"))
+    resolution = str(s.get("resolution") or _agent_default_resolution(model))
+    # 칸이 없는 모델(제미나이·시드림)에는 지어내지 않는다 — 기록에 남아 Load 때 고른 값처럼 보인다.
+    quality = str(s.get("quality") or (openai_start_quality(model) if model in OPENAI_MODEL_IDS else ""))
+    # 숫자 칸도 다른 칸과 같다: 보낸 값이 안 맞으면 고치지 않고 거절한다. count 50 이 조용히 10 이 되면
+    # 시킨 것과 다른 장수로 돈이 나간다.
+    numbers = {"count": (1, 1, 10), "custom_w": (1024, 16, 99999), "custom_h": (1024, 16, 99999)}
+    for field, (left_out, lo, hi) in numbers.items():
+        if s.get(field) in (None, ""):
+            numbers[field] = left_out
+            continue
+        n = _safe_int(s.get(field), lo - 1)
+        if not lo <= n <= hi:
+            return jsonify({"ok": False, "model": model, "field": field,
+                            "error": "bad_" + field, "allowed": [lo, hi]})
+        numbers[field] = n
+    count, custom_w, custom_h = numbers["count"], numbers["custom_w"], numbers["custom_h"]
+    # bool("false") 은 참이다 — 문자열로 온 끄기가 투명 배경으로 나갔다. 켜라고 보냈는데 그 모델에 없는
+    # 기능이면 말없이 불투명으로 내지 않고 거절한다.
+    bg_sent = s.get("openai_bg_transparent")
+    if bg_sent in (None, ""):
+        bg_transparent = False
+    else:
+        bg_transparent = not (bg_sent is False or bg_sent == 0
+                              or str(bg_sent).strip().lower() in ("false", "0", "no", "off"))
+        if bg_transparent and model not in GPT_LADDER_MODEL_IDS:
+            return jsonify({"ok": False, "model": model, "field": "openai_bg_transparent",
+                            "error": "bad_openai_bg_transparent", "allowed": []})
     # Sent for a model that does not take it (or an unknown level) -> refused like
-    # any other bad value. Left out -> the tab's value, which _gen_img_cfg only
-    # uses on a model that has this setting.
+    # any other bad value. Left out -> high, which _gen_img_cfg only uses on a model
+    # that has this setting.
     complexity = str(s.get("complexity") or "")
     if complexity and complexity not in openai_complexities(model):
         return jsonify({"ok": False, "model": model, "field": "complexity",
                         "error": "bad_complexity", "allowed": openai_complexities(model)})
-    complexity = complexity or p.complexity
+    complexity = complexity or "high"
     # Same rule for the format and the GIF values: what was sent is checked, what
-    # was left out comes from the tab and is fitted to this model.
+    # was left out is the plain default.
     formats = openai_formats(model)
     output_format = str(s.get("output_format") or "")
     if output_format and output_format not in formats:
         return jsonify({"ok": False, "model": model, "field": "output_format",
                         "error": "bad_output_format", "allowed": formats})
-    output_format = output_format or (p.output_format if p.output_format in formats else "png")
-    gif_size, gif_frames, gif_frame_ms = p.gif_size, p.gif_frames, p.gif_frame_ms
+    output_format = output_format or "png"
+    gif_size, gif_frames, gif_frame_ms = GIF_DEFAULT_SIZE, GIF_DEFAULT_FRAMES, GIF_DEFAULT_FRAME_MS
     if output_format == "gif":
         if s.get("gif_size") not in (None, ""):
             gif_size = str(s.get("gif_size"))
@@ -5227,25 +5343,17 @@ def _start_generate_agent(p, d):
             if not GIF_FRAME_MS_RANGE[0] <= gif_frame_ms <= GIF_FRAME_MS_RANGE[1]:
                 return jsonify({"ok": False, "model": model, "field": "gif_frame_ms",
                                 "error": "bad_gif_frame_ms", "allowed": list(GIF_FRAME_MS_RANGE)})
-    # A value the agent SENT that this model does not take -> refused with the
-    # allowed list. A value it left out came from the tab and may belong to the
-    # tab's own model (a 4K left from Pro, then the agent picks Lite) -> use the
-    # model's plain default, as the window's model switch does, rather than
-    # refusing something the agent never said.
-    for _ in range(4):          # at most one fix per field, then a clean check
-        bad = _agent_settings_problem(model, aspect, resolution, quality)
-        if not bad:
-            break
-        field = bad["error"][len("bad_"):]
-        if s.get(field) not in (None, ""):
-            return jsonify(dict({"ok": False, "model": model, "field": field}, **bad))
-        if field == "aspect":
-            aspect = "auto"
-        elif field == "resolution":
-            resolution = (_seedream_default_resolution(model)
-                          if model in SEEDREAM_MODEL_IDS else "1K")
-        else:
-            quality = "high"
+    # A value the agent SENT that this model does not take -> refused with the allowed
+    # list. What it left out is this model's own default, so it always fits.
+    bad = _agent_settings_problem(model, aspect, resolution, quality)
+    if bad:
+        return jsonify(dict({"ok": False, "model": model, "field": bad["error"][len("bad_"):]}, **bad))
+    # Custom 은 크기가 곧 요청이다 — 안 보낸 크기를 지어내지 않는다.
+    if aspect == "custom":
+        for field in ("custom_w", "custom_h"):
+            if s.get(field) in (None, ""):
+                return jsonify({"ok": False, "model": model, "field": field,
+                                "error": "bad_" + field, "allowed": [16, 99999]})
 
     providers = _providers_for(p, model)
     if not providers:
@@ -5273,7 +5381,17 @@ def _start_generate_agent(p, d):
         # "Load setup" on an agent image brings its prompt back as one section.
         fixed_prompt="", prompt_sections=[prompt],
         batch_id=uuid.uuid4().hex[:12], agent=True)
+    # 이 요청에서 쓰지 않은 칸을 알려 준다. output_dir·fixed_prompt 처럼 탭 설정에 있는 이름은 보내는
+    # 쪽이 오타인지 알 수 없어, 시킨 폴더가 아닌 곳에 저장돼도 아무도 모른다.
+    ignored = sorted(set(s) - _AGENT_SETTINGS - (_AGENT_GIF_SETTINGS if output_format == "gif" else set()))
+    if ignored and r.get_json().get("ok"):
+        return jsonify(dict(r.get_json(), ignored=ignored))
     return r
+
+
+_AGENT_GIF_SETTINGS = {"gif_size", "gif_frames", "gif_frame_ms"}
+_AGENT_SETTINGS = {"model", "aspect", "resolution", "quality", "count", "custom_w", "custom_h",
+                   "openai_bg_transparent", "complexity", "output_format"}
 
 
 def _enqueue_batch(p, *, model, providers, prompt, count, aspect, resolution, quality,
@@ -5546,6 +5664,7 @@ def _find_project_by_path(fp):
 def _project_summary(p):
     with p.gallery_lock:
         images = len(p.gallery_items)
+    billing_ok = _billing_usable(p)
     return {
         "pid": p.pid,
         "name": p.display_name(),
@@ -5560,10 +5679,10 @@ def _project_summary(p):
         "unseen_done": p.unseen_done,
         # 탭에 "어디로 달리는 중인지" 를 띄우기 위한 값. 확인 전이면 빈 값이라
         # 탭만 봐도 설정이 필요한 탭을 알 수 있다.
-        "billing_project_id": p.billing_project_id if p.billing_confirmed else "",
-        "billing_team_id": p.billing_team_id if p.billing_confirmed else "",
+        "billing_project_id": p.billing_project_id if billing_ok else "",
+        "billing_team_id": p.billing_team_id if billing_ok else "",
         # 생성이 막힌 탭(팀·프로젝트 미확인)을 탭 줄과 에이전트가 바로 알 수 있게.
-        "billing_confirmed": bool(p.billing_confirmed and p.billing_team_id and p.billing_project_id),
+        "billing_confirmed": billing_ok,
         # "saved" means the USER saved it under a name. An autosave file is a
         # crash net, not a save the user made — closing such a tab should still
         # offer to save it properly.
@@ -5588,7 +5707,10 @@ def api_projects():
     # would ask about is usually about to go).
     return jsonify({"projects": items, "active": active,
                     "restoring": bool(shared.session_restoring),
-                    "agent_pid": True, "features": ["agent_pid"]})
+                    "agent_pid": True,
+                    # agent_model_defaults: 에이전트 요청의 빠진 값은 탭이 아니라 모델 기본이다(§2.2).
+                    # 옛 앱과 섞여 있는 동안 커넥터가 어느 규칙인지 알 수 있게 한다.
+                    "features": ["agent_pid", "agent_model_defaults"]})
 
 
 @app.route("/api/projects/new", methods=["POST"])
@@ -5927,6 +6049,8 @@ def new_project():
     state.model = "gemini-3-pro-image"
     state.aspect = "16:9"
     state.resolution = "4K"
+    state.quality = ""
+    state.complexity = "high"
     state.count = 1
     state.naming_enabled = False
     with state.file_counter_lock:
@@ -6259,6 +6383,8 @@ def get_model_prefs():
         "ok": True,
         "hidden": list(state.model_prefs.get("hidden", [])),
         "default_res": dict(state.model_prefs.get("default_res", {})),
+        "default_quality": dict(state.model_prefs.get("default_quality", {})),
+        "keep_panel": bool(state.model_prefs.get("keep_panel")),
         "all_models": list(_ALL_MODEL_IDS),
     })
 
@@ -6279,7 +6405,9 @@ def set_model_prefs():
     state.log("Model prefs saved: %d hidden, %d default resolutions"
               % (len(cleaned["hidden"]), len(cleaned["default_res"])))
     return jsonify({"ok": True, "hidden": cleaned["hidden"],
-                    "default_res": cleaned["default_res"]})
+                    "default_res": cleaned["default_res"],
+                    "default_quality": cleaned["default_quality"],
+                    "keep_panel": cleaned["keep_panel"]})
 
 
 @app.route("/api/delete-confirm-state")

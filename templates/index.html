@@ -476,10 +476,17 @@
 
 <div id="modelPrefsModal" class="close-modal hidden">
   <div class="close-dialog mp-dialog">
-    <h2>모델 설정</h2>
-    <p class="close-desc">체크를 끄면 목록에서 숨겨지고, 화질은 그 모델로 바꿀 때 처음 선택될 값입니다.<br>
+    <div class="mp-title">
+      <h2>모델 설정</h2>
+      <div class="toggle-row mp-switch" onclick="toggleModelStartRes()"
+           title="끄면 Ratio·Count처럼 모델을 바꿔도 패널의 화질이 그대로 유지됩니다">
+        <span>모델별 시작 화질</span>
+        <div id="mpStartToggle" class="toggle active" role="switch" aria-label="모델별 시작 화질" aria-checked="true"><div class="toggle-thumb"></div></div>
+      </div>
+    </div>
+    <p class="close-desc"><span id="mpDesc"></span><br>
       모든 프로젝트에 함께 적용되며, 앱을 껐다 켜거나 업데이트해도 유지됩니다.</p>
-    <div class="mp-head"><span>표시</span><span>모델</span><span>시작 화질</span></div>
+    <div class="mp-head"><span>표시</span><span>모델</span><span id="mpResHead">시작 화질</span><span>시작 Quality</span></div>
     <div id="modelPrefsRows" class="mp-rows"></div>
     <p class="hint">숨긴 모델을 쓰던 프로젝트는 계속 그 모델로 동작합니다 — 목록에 "(숨김)"으로 남습니다.</p>
     <div class="close-buttons">

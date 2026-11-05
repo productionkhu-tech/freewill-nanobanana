@@ -3,7 +3,7 @@
 멀티 프로바이더 AI 이미지 생성 데스크톱 앱 (Flask + pywebview + PyInstaller).
 이 문서 하나로 **구조 · 원리 · 규칙 · 배포 · 관리**를 파악할 수 있게 씁니다. 낡은 내용을 발견하면 즉시 고칠 것.
 
-> 최종 갱신: 2026-11-02 (v2026-11-0201 기준 — 세션 복원·저장: 탭이 사라지거나 비어 보이던 문제, §7)
+> 최종 갱신: 2026-11-05 (v2026-11-0501 기준 — GPT Image 2.6 + complexity, §6.1)
 
 ---
 
@@ -14,7 +14,7 @@
   PC 에는 그 윈도우 계정만 풀 수 있는 암호화 파일(출입증·키 사본)만 남는다. 새 PC 는 관리자 승인(4자리 번호). §2.1
 - **프론트**: HTML/CSS/JS를 Flask가 서빙, pywebview(WebView2) 창에서 렌더
 - **백엔드**: Flask 127.0.0.1:5656, `app.py` 단일 파일에 상태+라우트 전부
-- **프로바이더 3사**: Google Gemini(Vertex/Studio) · OpenAI gpt-image-2 / 2.5 · BytePlus Seedream
+- **프로바이더 3사**: Google Gemini(Vertex/Studio) · OpenAI gpt-image-2 / 2.5 / 2.6 · BytePlus Seedream
   (Reve는 2026-09 API 서비스 종료로 제거 — 구 프로젝트의 reve-create는 로드 시 기본 모델로 자동 폴백)
 - **멀티 프로젝트 탭**: 앱 상태는 `_Shared`(앱 전역) + 프로젝트별 `AppState` N개.
   `state`는 "이 요청이 다루는 프로젝트"를 가리키는 프록시라 기존 라우트는 그대로 동작
@@ -127,7 +127,7 @@ NanoBanana.exe 실행
 | 요청 | 하는 일 |
 |---|---|
 | `GET /api/projects` | `agent_pid: true`·`features:["agent_pid"]`(기능 확인), 탭마다 `pid·name·generating·billing_confirmed` |
-| `POST /api/generate` `{pid, prompt, settings:{model,aspect,resolution,quality,count,custom_w,custom_h,openai_bg_transparent}, ref_paths:[..]}` | 그 탭에 생성 → `{ok, batch_id, pid, count, queued, outstanding}`. pid 가 없으면 예전 그대로(화면 탭의 입력칸 = 창의 Generate) |
+| `POST /api/generate` `{pid, prompt, settings:{model,aspect,resolution,quality,complexity,count,custom_w,custom_h,openai_bg_transparent}, ref_paths:[..]}` | 그 탭에 생성 → `{ok, batch_id, pid, count, queued, outstanding}`. pid 가 없으면 예전 그대로(화면 탭의 입력칸 = 창의 Generate) |
 | `GET /api/batch?pid=&batch_id=` | 그 묶음의 `count·done·failed·cancelled·pending·finished·images·errors`. `finished` 면 더 올 것 없음 |
 | `GET /api/gallery?pid=&strict=1&batch_id=` | 그 묶음의 이미지 (항목마다 `batch_id`) |
 | `GET /api/settings?pid=` · `/api/refs?pid=` · `/api/billing/state?pid=` | 그 탭 읽기 (엄격) |
@@ -136,7 +136,7 @@ NanoBanana.exe 실행
 
 - **빠진 설정값**은 그 탭의 지금 값을 읽어 쓴다(쓰지는 않음). 그 값이 고른 모델에 안 맞으면(Pro 의 4K 가 남은 채 Lite 를
   고름) 모델 기본값(auto / 1K / 시드림 기본 / high) — 창에서 모델을 바꿀 때와 같다. **에이전트가 보낸 값**이 안 맞으면
-  고치지 않고 거절: `bad_aspect|bad_resolution|bad_quality` + `field` + `allowed`. 화면 메뉴가 막는 값과 같은 기준
+  고치지 않고 거절: `bad_aspect|bad_resolution|bad_quality|bad_complexity` + `field` + `allowed`. 화면 메뉴가 막는 값과 같은 기준
   (`_agent_settings_problem`). 예전 경로는 모르는 비율을 조용히 빼고 갤러리엔 요청한 비율을 적었다
 - 그 밖의 거절: `unknown_model`, `ref_limit`(모델별 장수), `ref_unreadable`, `ref_duplicate`(픽셀 비교 — 다시 저장한
   사본도 잡힘, 드롭과 같은 규칙), `Empty prompt`, 큐 가득, 멈추는 중. 거절이면 아무것도 생성되지 않는다
@@ -342,7 +342,7 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 |---|---|---|---|
 | Google Vertex | gemini-3-pro-image 등 | `VERTEX_SA` (서비스계정 JSON → 앱엔 1시간 토큰만) | `GOOGLE_APPLICATION_CREDENTIALS` + `NANOBANANA_PROJECT_ID` |
 | Google AI Studio | 동일 모델군 | `STUDIO_KEY` | `NANOBANANA_STUDIO_KEY` |
-| OpenAI | gpt-image-2 · gpt-image-2.5-sunburst / -flare | `OPENAI_KEY` | `OPENAI_API_KEY` |
+| OpenAI | gpt-image-2 · gpt-image-2.5-sunburst / -flare · gpt-image-2.6-sunburst / -flare | `OPENAI_KEY` | `OPENAI_API_KEY` |
 | BytePlus | seedream-5-0-pro / 5-0-flash / 4-5 | `ARK_KEY` | `ARK_API_KEY` |
 
 - **키 교체(로테이션)**: 콘솔에서 새 키 발급 → `printf '%s' "$NEW" | env -u CLOUDFLARE_API_TOKEN npx wrangler secret put STUDIO_KEY`
@@ -362,10 +362,21 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   `openai_clamp_quality()`가 모델이 모르는 값을 `high`로 눌러 400을 막는다.
   **조직 인증 필수** — 미인증이면 403 `organization must be verified`
   (https://platform.openai.com/settings/organization/general → Verify Organization, 반영까지 최대 15분).
-  xhigh/max는 이미지당 토큰이 늘어 비용이 커진다(단가는 gpt-image-2와 동일) → 기본값은 `high` 유지
+  xhigh/max는 이미지당 토큰이 늘어 비용이 커진다(단가는 gpt-image-2와 동일). 앱은 2.5/2.6 을 `max` 로 시작한다
+  (`MODEL_SPECS[].defaultQuality`), 서버가 값을 못 알아볼 때의 폴백만 `high`
+- **GPT Image 2.6 (앱 반영 2026-11-05)**: sunburst(세밀한 작업) / flare(빠른 반복). 크기 규칙·화질 사다리·투명 배경·
+  레퍼런스 16장·파일 50MB·토큰 단가는 2.5 와 같다. `_gpt2_*` 공유, 2.5·2.6 공통 분기는 `GPT_LADDER_MODEL_IDS`, 파일 접두어 `GP26`.
+  **`complexity`(low/medium/high, 기본 high, 추가 요금 없음)는 2.6 전용 — 2.5·gpt-image-2 에 보내면 400.** 그래서
+  `openai_complexities()` 가 빈 목록인 모델엔 img_cfg 에 키 자체가 없다. SDK 에 인자가 없어 `extra_body` 로 보낸다.
+  **토큰이 2.5 와 다른 곳: low·medium.** 1024² low 823(2.5 는 196), medium 1,449(439). high 이상은 같다(1024² max 7,024).
+  에러 메시지의 허용값 목록은 모델 공통이라 믿지 말 것(`none`·`xhigh` 를 나열하지만 2.6 은 400) — 실제로 보내 볼 것.
+  응답·헤더에 모델 id 가 없어 어느 모델이 그렸는지는 보낸 본문으로만 확인된다. **앱에 안 넣은 것(API 는 동작, 2026-11-05 실측)**:
+  GIF(`output_format=gif`, 2.6 만, 2~16장 — 가이드의 64 는 틀림, 내부적으로 시트 한 장이라 시트 크기도 제한을 지켜야 함),
+  SVG(`svg.model` 필수), `markup`(2.5·2.6, 그림 그리는 화면 필요), `safety_identifier`(선택). 지금 파이프라인은 PIL 로 열어
+  PNG 로 저장하므로 GIF·SVG 는 그냥 켜면 첫 프레임만 남거나 깨진다
 - **GPT 이미지 검열은 `moderation=low`** (`OPENAI_MODERATION`, v2026-09-2801~). 기본값 auto 는 호러 특수분장
-  같은 창작물도 자주 막는다. 편집(레퍼런스)은 SDK 에 인자가 없어 `extra_body={"moderation": ...}` 로 보낸다 —
-  문서엔 없지만 API 는 받는다(세 모델 × 생성/편집 실측). low 도 정책 위반은 막는다
+  같은 창작물도 자주 막는다. 편집(레퍼런스)은 SDK 에 인자가 없어 `extra_body={"moderation": ...}` 로 보낸다
+  (API 레퍼런스에도 있고 다섯 모델 × 생성/편집 실측). low 도 정책 위반은 막는다
 - Reve는 2026-09 API 서비스 종료로 v2026-09-0101에서 완전 제거. `_RETIRED_MODEL_FALLBACK`이
   저장물의 reve-create를 기본 모델로 폴백 (개명 맵 `_MODEL_RENAMES`와 다름 — prefs 키는 건드리지 않음).
   과거 Reve 생성물의 갤러리 배지/라벨은 그대로 표시

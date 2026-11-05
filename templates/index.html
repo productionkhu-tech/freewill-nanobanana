@@ -148,11 +148,18 @@
             <option>low</option><option>medium</option><option selected>high</option><option>auto</option>
           </select>
         </div>
+        <!-- GPT Image 2.6 only: how much the model plans before rendering -->
+        <div id="complexityWrap" style="display:none">
+          <label class="field-label" title="렌더링 전에 얼마나 계획할지. low: 배경·간판 교체 같은 간단한 편집 / high: 글자 많은 복잡한 구도. 추가 요금 없음, 높을수록 오래 걸리고 의도치 않은 변경이 생길 수 있음">Complexity</label>
+          <select id="complexitySelect">
+            <option>low</option><option>medium</option><option selected>high</option>
+          </select>
+        </div>
       </div>
 
-      <!-- GPT Image 2.5 only: ask the model for a cut-out (alpha PNG) -->
+      <!-- GPT Image 2.5 / 2.6 only: ask the model for a cut-out (alpha PNG) -->
       <div id="bgTransparentRow" style="display:none">
-        <label class="bg-check" title="GPT Image 2.5 only — returns a cut-out as an alpha PNG">
+        <label class="bg-check" title="GPT Image 2.5 / 2.6 only — returns a cut-out as an alpha PNG">
           <input type="checkbox" id="bgTransparentChk" onchange="onBgTransparentChange(this.checked)"> Transparent background
         </label>
         <p class="hint" id="bgTransparentHint" style="display:none">

@@ -48,7 +48,16 @@ GPT2_MODEL_ID = "gpt-image-2"
 # below is shared rather than duplicated. What is genuinely new is the quality
 # ladder: xhigh and max sit above high.
 GPT25_MODEL_IDS = ("gpt-image-2.5-sunburst", "gpt-image-2.5-flare")
-OPENAI_MODEL_IDS = (GPT2_MODEL_ID,) + GPT25_MODEL_IDS
+# GPT Image 2.6 (2026-11). Same request shape, size rules, quality ladder,
+# transparency, 16 references and token rates as 2.5. New: `complexity`.
+GPT26_MODEL_IDS = ("gpt-image-2.6-sunburst", "gpt-image-2.6-flare")
+# Everything above gpt-image-2: xhigh/max and transparent backgrounds.
+GPT_LADDER_MODEL_IDS = GPT25_MODEL_IDS + GPT26_MODEL_IDS
+OPENAI_MODEL_IDS = (GPT2_MODEL_ID,) + GPT_LADDER_MODEL_IDS
+# How much the model plans before rendering, separate from quality. No fee of
+# its own; the API's own default is "high". 2.6 only in this app, even if an
+# older model turns out to accept it, so their requests stay as they were.
+GPT26_COMPLEXITIES = ["low", "medium", "high"]
 # 13 explicit aspect ratios exposed for gpt-image-2 (all within the API's 3:1
 # cap). "auto" is a UI sentinel resolved before these are used.
 GPT2_ASPECTS = ["1:1", "3:2", "2:3", "4:3", "3:4", "4:5", "5:4",
@@ -65,13 +74,14 @@ GPT25_BACKGROUNDS = ("auto", "transparent", "opaque")
 # 검열 강도. 기본값(auto)은 호러 특수분장·피 묻은 크리처 같은 창작 이미지도 자주 막는다
 # (좀비 캐릭터 시트가 OpenAI 판정에서 고어 0.71 로 걸린 게 계기). low 는 정책 안에서 덜 엄격하게
 # 거를 뿐, 정책 위반은 여전히 막힌다. 편집(레퍼런스 있음)은 SDK 에 인자가 없어 extra_body 로
-# 보낸다 — 문서엔 없지만 API 는 받는다. 2026-09-28 에 세 모델 × 생성/편집 6 조합을 실제로 확인했다.
+# 보낸다 (지금은 API 레퍼런스에도 있다). 2026-09-28 에 세 모델 × 생성/편집 6 조합을, 2026-11-05 에
+# 2.6 두 모델을 실제로 확인했다.
 OPENAI_MODERATION = "low"
 
 
 def openai_qualities(model):
     """Quality ladder for an OpenAI image model."""
-    return GPT25_QUALITIES if model in GPT25_MODEL_IDS else GPT2_QUALITIES
+    return GPT25_QUALITIES if model in GPT_LADDER_MODEL_IDS else GPT2_QUALITIES
 
 
 def openai_clamp_quality(model, quality):
@@ -85,6 +95,12 @@ def openai_clamp_quality(model, quality):
     allowed = openai_qualities(model)
     q = (quality or "").strip()
     return q if q in allowed else "high"
+
+
+def openai_complexities(model):
+    """Complexity levels the app offers for a model. Empty = not sent at all."""
+    return GPT26_COMPLEXITIES if model in GPT26_MODEL_IDS else []
+
 
 # OpenAI gpt-image-2 hard constraints (official docs):
 #   16-multiple edges · max edge <= 3840 · long:short <= 3:1 · 655,360..8,294,400 px
@@ -439,8 +455,10 @@ _USAGE_TOKEN_KEYS = ("in_text_tokens", "in_image_tokens", "out_tokens", "out_tex
 
 def _model_file_prefix(model):
     """Default-naming filename prefix reflecting which model made the image:
-    GP2 (gpt-image-2), GP25 (GPT Image 2.5), SD (BytePlus Seedream),
-    nano (Gemini / Nano Banana)."""
+    GP2 (gpt-image-2), GP25 (GPT Image 2.5), GP26 (GPT Image 2.6),
+    SD (BytePlus Seedream), nano (Gemini / Nano Banana)."""
+    if model in GPT26_MODEL_IDS:
+        return "GP26"
     if model in GPT25_MODEL_IDS:
         return "GP25"
     if model == GPT2_MODEL_ID:
@@ -547,6 +565,8 @@ _ALL_MODEL_IDS = (
     "gpt-image-2",
     "gpt-image-2.5-sunburst",
     "gpt-image-2.5-flare",
+    "gpt-image-2.6-sunburst",
+    "gpt-image-2.6-flare",
 )
 _RES_TOKENS = {"512px", "1K", "1.5K", "2K", "4K", "auto"}
 
@@ -869,9 +889,11 @@ class AppState:
         # (그리고 새 탭을 열 때마다) 한 번은 눈으로 확인하고 넘어가게 하는 게
         # 요구사항이고, 그 사이 작업 중에는 다시 묻지 않는다.
         self.billing_confirmed = False
-        # GPT Image 2.5 전용 — 배경을 투명하게 받을지. 프로젝트별 설정이라
+        # GPT Image 2.5 / 2.6 전용 — 배경을 투명하게 받을지. 프로젝트별 설정이라
         # 탭마다 다르게 둘 수 있고, 프로젝트 파일에 함께 저장된다.
         self.openai_bg_transparent = False
+        # GPT Image 2.6 전용 — 렌더링 전에 얼마나 계획할지. 저장 방식은 위와 같다.
+        self.complexity = "high"
         self.fixed_prompt = ""
         self.prompt_sections = [""]
         self.naming_enabled = False
@@ -1252,7 +1274,8 @@ class AppState:
     def get_ref_limit(self, model=None):
         m = model or self.model
         if m in OPENAI_MODEL_IDS:
-            # OpenAI edits 엔드포인트: 가이드 기준 최대 16장 (2.5도 동일).
+            # OpenAI edits 엔드포인트: 문서 기준 최대 16장, 파일 하나 50MB (2.5·2.6 동일).
+            # 2026-11-05 실측: 멀티파트는 17장도 받지만 문서 밖이라 넘기지 않는다.
             return 16
         if m in SEEDREAM_MODEL_IDS:
             # 5.0 pro / flash: up to 10 reference images; 4.5: 14.
@@ -1927,6 +1950,7 @@ class AppState:
                 "custom_w": self.custom_w,
                 "custom_h": self.custom_h,
                 "openai_bg_transparent": self.openai_bg_transparent,
+                "complexity": self.complexity,
                 "billing_team_id": self.billing_team_id,
                 "billing_project_id": self.billing_project_id,
                 "count": str(self.count),
@@ -2024,6 +2048,7 @@ class AppState:
         self.custom_w = _safe_int(ui.get("custom_w"), self.custom_w, lo=16, hi=99999)
         self.custom_h = _safe_int(ui.get("custom_h"), self.custom_h, lo=16, hi=99999)
         self.openai_bg_transparent = bool(ui.get("openai_bg_transparent", False))
+        self.complexity = ui.get("complexity", "high")
         # 저장된 귀속은 되살리되 '확인' 은 되살리지 않는다. 미리 채워두면
         # 다시 고를 필요는 없고 확인 한 번이면 끝난다.
         self.billing_team_id = str(ui.get("billing_team_id", "") or "")
@@ -2264,6 +2289,11 @@ class AppState:
                     extra["background"] = img_cfg["background"]
                 if img_cfg.get("output_format"):
                     extra["output_format"] = img_cfg["output_format"]
+                # The SDK has no `complexity` argument yet; img_cfg carries it
+                # for 2.6 only, so every other model's request is unchanged.
+                body = {}
+                if img_cfg.get("complexity"):
+                    body["complexity"] = img_cfg["complexity"]
                 if ref_payloads:
                     result = client.images.edit(
                         model=model,
@@ -2272,7 +2302,7 @@ class AppState:
                         size=size,
                         quality=quality,
                         n=1,
-                        extra_body={"moderation": OPENAI_MODERATION},
+                        extra_body=dict(body, moderation=OPENAI_MODERATION),
                         **extra,
                     )
                 else:
@@ -2283,6 +2313,7 @@ class AppState:
                         quality=quality,
                         n=1,
                         moderation=OPENAI_MODERATION,
+                        extra_body=body or None,
                         **extra,
                     )
                 self.log(f"{label} OK ({time.time()-t:.1f}s)")
@@ -2839,6 +2870,7 @@ class AppState:
                             "model": model, "aspect": aspect, "resolution": resolution,
                             "quality": job.get("quality", "high"),
                             "openai_bg_transparent": bool(job.get("openai_bg_transparent")),
+                            "complexity": job.get("complexity", ""),
                             "custom_w": job.get("custom_w"), "custom_h": job.get("custom_h"),
                             "count": saved_count, "output_dir": job["output_dir"],
                             "naming": naming,
@@ -3469,6 +3501,7 @@ def get_settings():
         "custom_w": state.custom_w,
         "custom_h": state.custom_h,
         "openai_bg_transparent": state.openai_bg_transparent,
+        "complexity": state.complexity,
         "count": state.count,
         "output_dir": state.output_dir,
         "fixed_prompt": state.fixed_prompt,
@@ -3488,7 +3521,7 @@ def _settings_fingerprint(proj):
     tell a genuine edit from the page simply re-sending what it already had."""
     return (
         proj.model, proj.aspect, proj.resolution, proj.quality,
-        proj.custom_w, proj.custom_h, proj.openai_bg_transparent, proj.count,
+        proj.custom_w, proj.custom_h, proj.openai_bg_transparent, proj.complexity, proj.count,
         proj.output_dir, proj.fixed_prompt, tuple(proj.prompt_sections or []),
         proj.naming_enabled, proj.naming_prefix, proj.naming_delimiter,
         proj.naming_index_prefix, proj.naming_padding, proj.gallery_columns,
@@ -3524,7 +3557,7 @@ def update_settings():
     # that made a freshly opened project ask to be saved on close even though
     # the user had touched nothing.
     _before = _settings_fingerprint(state)
-    for k in ("model", "aspect", "resolution", "quality", "fixed_prompt",
+    for k in ("model", "aspect", "resolution", "quality", "complexity", "fixed_prompt",
               "naming_prefix", "naming_delimiter", "naming_index_prefix"):
         if k in d and d[k] is not None:
             v = str(d[k])
@@ -4452,6 +4485,7 @@ def load_setup():
     state.custom_w = _safe_int(saved.get("custom_w"), state.custom_w, lo=16, hi=99999)
     state.custom_h = _safe_int(saved.get("custom_h"), state.custom_h, lo=16, hi=99999)
     state.openai_bg_transparent = bool(saved.get("openai_bg_transparent", False))
+    state.complexity = saved.get("complexity") or "high"
     state.count = int(saved.get("count", 1))
     state.output_dir = saved.get("output_dir", state.output_dir)
 
@@ -4740,7 +4774,7 @@ def _providers_for(p, model):
 
 
 def _gen_img_cfg(model, aspect, resolution, quality, custom_w, custom_h, bg_transparent,
-                 ref_snapshots):
+                 ref_snapshots, complexity=""):
     """The provider-specific size/quality block for one batch — shared by the
     window and the agent path so the two can never disagree about a size."""
     if model in OPENAI_MODEL_IDS:
@@ -4764,13 +4798,17 @@ def _gen_img_cfg(model, aspect, resolution, quality, custom_w, custom_h, bg_tran
         else:
             size = gpt2_resolve_size(aspect, resolution, ref_size)
         img_cfg = {"size": size, "quality": openai_clamp_quality(model, quality)}
-        # Transparency is a 2.5-only parameter; gpt-image-2 400s on it. The
-        # format goes with it because the API only keeps an alpha channel on
-        # png/webp — asking for transparent without it silently returns a
-        # filled background.
-        if model in GPT25_MODEL_IDS and bg_transparent:
+        # Transparency is for 2.5 and 2.6; gpt-image-2 400s on it. The format
+        # goes with it because the API only keeps an alpha channel on png/webp —
+        # asking for transparent without it silently returns a filled background.
+        if model in GPT_LADDER_MODEL_IDS and bg_transparent:
             img_cfg["background"] = "transparent"
             img_cfg["output_format"] = "png"
+        # Said out loud even at the API's own default, so a change of default
+        # cannot quietly change what the dropdown means.
+        levels = openai_complexities(model)
+        if levels:
+            img_cfg["complexity"] = complexity if complexity in levels else "high"
         return img_cfg
     if model in SEEDREAM_MODEL_IDS:
         # Seedream size: Custom = explicit WxH (Method 1, clamped to the model's
@@ -4854,7 +4892,7 @@ def _start_generate_window():
     ref_snapshots = p.get_effective_ref_images(model)
     ref_payloads = [p.ref_image_to_bytes(r) if r is not None else None for r in ref_snapshots]
     img_cfg = _gen_img_cfg(model, p.aspect, p.resolution, p.quality, p.custom_w, p.custom_h,
-                           p.openai_bg_transparent, ref_snapshots)
+                           p.openai_bg_transparent, ref_snapshots, p.complexity)
     return _enqueue_batch(
         p, model=model, providers=providers, prompt=prompt, count=count,
         aspect=p.aspect, resolution=p.resolution, quality=p.quality,
@@ -4963,6 +5001,14 @@ def _start_generate_agent(p, d):
     custom_w = _safe_int(s.get("custom_w"), p.custom_w, lo=16, hi=99999)
     custom_h = _safe_int(s.get("custom_h"), p.custom_h, lo=16, hi=99999)
     bg_transparent = bool(s.get("openai_bg_transparent", p.openai_bg_transparent))
+    # Sent for a model that does not take it (or an unknown level) -> refused like
+    # any other bad value. Left out -> the tab's value, which _gen_img_cfg only
+    # uses on a model that has this setting.
+    complexity = str(s.get("complexity") or "")
+    if complexity and complexity not in openai_complexities(model):
+        return jsonify({"ok": False, "model": model, "field": "complexity",
+                        "error": "bad_complexity", "allowed": openai_complexities(model)})
+    complexity = complexity or p.complexity
     # A value the agent SENT that this model does not take -> refused with the
     # allowed list. A value it left out came from the tab and may belong to the
     # tab's own model (a 4K left from Pro, then the agent picks Lite) -> use the
@@ -4992,7 +5038,7 @@ def _start_generate_agent(p, d):
     if err:
         return jsonify(dict({"ok": False}, **err))
     img_cfg = _gen_img_cfg(model, aspect, resolution, quality, custom_w, custom_h,
-                           bg_transparent, snaps)
+                           bg_transparent, snaps, complexity)
     for im in snaps:
         try:
             im.close()
@@ -5074,6 +5120,7 @@ def _enqueue_batch(p, *, model, providers, prompt, count, aspect, resolution, qu
                 "custom_w": custom_w,
                 "custom_h": custom_h,
                 "openai_bg_transparent": bool(img_cfg.get("background") == "transparent"),
+                "complexity": img_cfg.get("complexity", ""),
                 "billing_team_id": p.billing_team_id,
                 "billing_project_id": p.billing_project_id,
                 "img_cfg": dict(img_cfg),

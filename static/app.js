@@ -1016,6 +1016,7 @@ async function loadSettings() {
     resolution: d.resolution,
     count: String(d.count),
     quality: d.quality || "high",
+    complexity: d.complexity || "high",
   });
   // The cut-out toggle rides with the project, so a reopened project (or a
   // setup loaded off a gallery card) comes back asking for the same thing.
@@ -1087,6 +1088,7 @@ async function saveSettings(opts) {
   const sections = [];
   document.querySelectorAll(".prompt-section-box").forEach(el => sections.push(el.value));
   const qs = document.getElementById("qualitySelect");
+  const cx = document.getElementById("complexitySelect");
   const r = await api("/api/settings", { method: "POST", body: {
     auto: !!(opts && opts.auto),
     // Address the project explicitly. A late-firing debounce must not be
@@ -1096,6 +1098,7 @@ async function saveSettings(opts) {
     aspect: document.getElementById("aspectSelect").value,
     resolution: document.getElementById("resolutionSelect").value,
     quality: qs ? qs.value : "high",
+    complexity: cx && cx.value ? cx.value : "high",
     custom_w: parseInt(document.getElementById("customW")?.value) || 1024,
     custom_h: parseInt(document.getElementById("customH")?.value) || 1024,
     count: parseInt(document.getElementById("countSelect").value),
@@ -1239,6 +1242,32 @@ const MODEL_SPECS = {
     hint: "GPT Image 2.5 Heavy — editing precision. Starts at max quality.",
     refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
   },
+  // GPT Image 2.6 (2026-11). Everything 2.5 has, measured the same; what it adds
+  // here is Complexity, how much it plans before rendering (no extra fee).
+  "gpt-image-2.6-flare": {
+    aspects: ["auto","1:1","3:2","2:3","4:3","3:4","4:5","5:4","16:9","9:16","21:9","9:21","3:1","1:3","custom"],
+    resolutions: ["1K","2K","4K"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: true,
+    qualities: ["low","medium","high","xhigh","max","auto"],
+    showBackground: true,
+    complexities: ["low","medium","high"],
+    defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "max", defaultComplexity: "high",
+    hint: "GPT Image 2.6 Fast — quick iteration. Starts at max quality.",
+    refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
+  },
+  "gpt-image-2.6-sunburst": {
+    aspects: ["auto","1:1","3:2","2:3","4:3","3:4","4:5","5:4","16:9","9:16","21:9","9:21","3:1","1:3","custom"],
+    resolutions: ["1K","2K","4K"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: true,
+    qualities: ["low","medium","high","xhigh","max","auto"],
+    showBackground: true,
+    complexities: ["low","medium","high"],
+    defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "max", defaultComplexity: "high",
+    hint: "GPT Image 2.6 Heavy — detailed visual work. Starts at max quality.",
+    refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
+  },
 };
 // (Reve 2.1 removed 2026-09-01 — Reve shut down its API service. Old projects
 // that still say reve-create are remapped server-side to the default model;
@@ -1264,6 +1293,8 @@ const MODEL_LABELS = {
   "gpt-image-2": "gpt-image-2 (OpenAI)",
   "gpt-image-2.5-flare": "gpt-image-2.5 Flare (Fast)",
   "gpt-image-2.5-sunburst": "gpt-image-2.5 Sunburst (Heavy)",
+  "gpt-image-2.6-flare": "gpt-image-2.6 Flare (Fast)",
+  "gpt-image-2.6-sunburst": "gpt-image-2.6 Sunburst (Heavy)",
 };
 let _modelPrefs = { hidden: [], default_res: {} };
 
@@ -1345,6 +1376,8 @@ const _MODEL_SHORT = {
   "gpt-image-2": "GPT Image 2",
   "gpt-image-2.5-flare": "GPT Image 2.5 Flare",
   "gpt-image-2.5-sunburst": "GPT Image 2.5 Sunburst",
+  "gpt-image-2.6-flare": "GPT Image 2.6 Flare",
+  "gpt-image-2.6-sunburst": "GPT Image 2.6 Sunburst",
   "seedream-5-0-pro-260628": "Seedream 5 Pro",
   "seedream-5-0-flash-260915": "Seedream 5 Flash",
   "seedream-4-5-251128": "Seedream 4.5",
@@ -1382,7 +1415,7 @@ function repopulateSelect(id, values, preferred, fallback) {
 
 let _lastRefs = [];                // last /api/refs snapshot (Custom auto-fill reads it)
 
-// 2.5-only cut-out toggle. Off by default and never implied by anything else —
+// Cut-out toggle (2.5 and 2.6). Off by default and never implied by anything else —
 // a transparent PNG is a specific ask, so it is only ever set by this click or
 // restored from a saved project / loaded setup.
 function onBgTransparentChange(v) {
@@ -1424,7 +1457,16 @@ function applyModelSpec(model, preserved) {
     const qw = document.getElementById("qualityWrap");
     if (qw) qw.style.display = "none";
   }
-  // Transparency is a 2.5-only parameter. Hiding the row is not enough — a
+  // Only on models that list levels. The value left behind on other models is
+  // harmless: the server sends complexity on 2.6 only.
+  const cxw = document.getElementById("complexityWrap");
+  if (spec.complexities) {
+    repopulateSelect("complexitySelect", spec.complexities, preserved?.complexity, spec.defaultComplexity);
+    if (cxw) cxw.style.display = "";
+  } else if (cxw) {
+    cxw.style.display = "none";
+  }
+  // Transparency is for 2.5 and 2.6 only. Hiding the row is not enough — a
   // model without it must not keep a checked box alive in the background, or
   // switching away would silently leave the request asking for a cut-out.
   const bgRow = document.getElementById("bgTransparentRow");
@@ -1566,6 +1608,7 @@ function onModelChange() {
   applyModelSpec(model, {
     resolution: preferredResolution(model),
     quality: preferredQuality(model),
+    complexity: getModelSpec(model).defaultComplexity,
   });
   saveSettings();
   // 숨김 모델에서 빠져나왔으면 "(숨김)" 항목을 목록에서 걷어낸다.
@@ -5037,7 +5080,7 @@ function showToast(msg, kind = "info") {
 // ==========================================
 // Auto-save settings on change
 // ==========================================
-["aspectSelect", "resolutionSelect", "countSelect", "qualitySelect", "namingSwitch",
+["aspectSelect", "resolutionSelect", "countSelect", "qualitySelect", "complexitySelect", "namingSwitch",
  "namingPrefix", "namingDelimiter", "namingIndexPrefix", "namingPadding"].forEach(id => {
   const el = document.getElementById(id);
   if (el) el.addEventListener("change", () => saveSettings());

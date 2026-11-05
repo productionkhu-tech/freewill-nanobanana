@@ -1009,6 +1009,7 @@ async function loadSettings() {
   // selection, and every dropdown after it would describe the wrong model.
   rebuildModelSelect(d.model);
   document.getElementById("modelSelect").value = d.model;
+  if (d.gif_limits) _gifLimits = d.gif_limits;
   // 저장된 값을 적용하기 전에 모델 스펙으로 드롭다운을 먼저 재구성 — 그래야
   // 저장된 옵션(GPT-2 quality 등)이 <select>에 실제로 존재함.
   applyModelSpec(d.model, {
@@ -1017,6 +1018,10 @@ async function loadSettings() {
     count: String(d.count),
     quality: d.quality || "high",
     complexity: d.complexity || "high",
+    output_format: d.output_format || "png",
+    gif_size: d.gif_size,
+    gif_frames: d.gif_frames,
+    gif_frame_ms: d.gif_frame_ms,
   });
   // The cut-out toggle rides with the project, so a reopened project (or a
   // setup loaded off a gallery card) comes back asking for the same thing.
@@ -1099,6 +1104,12 @@ async function saveSettings(opts) {
     resolution: document.getElementById("resolutionSelect").value,
     quality: qs ? qs.value : "high",
     complexity: cx && cx.value ? cx.value : "high",
+    output_format: document.getElementById("outputFormatSelect").value,
+    ...(document.getElementById("gifSizeSelect").value ? {
+      gif_size: document.getElementById("gifSizeSelect").value,
+      gif_frames: parseInt(document.getElementById("gifFramesSelect").value),
+      gif_frame_ms: _gifMs(),
+    } : {}),
     custom_w: parseInt(document.getElementById("customW")?.value) || 1024,
     custom_h: parseInt(document.getElementById("customH")?.value) || 1024,
     count: parseInt(document.getElementById("countSelect").value),
@@ -1243,8 +1254,10 @@ const MODEL_SPECS = {
     refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
   },
   // GPT Image 2.6 (2026-11). Everything 2.5 has, measured the same; what it adds
-  // here is Complexity, how much it plans before rendering (no extra fee).
+  // here is Complexity, how much it plans before rendering (no extra fee), and
+  // GIF and SVG output.
   "gpt-image-2.6-flare": {
+    formats: ["png","gif","svg"],
     aspects: ["auto","1:1","3:2","2:3","4:3","3:4","4:5","5:4","16:9","9:16","21:9","9:21","3:1","1:3","custom"],
     resolutions: ["1K","2K","4K"],
     counts: ["1","2","3","4","5","6","7","8","9","10"],
@@ -1257,6 +1270,7 @@ const MODEL_SPECS = {
     refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
   },
   "gpt-image-2.6-sunburst": {
+    formats: ["png","gif","svg"],
     aspects: ["auto","1:1","3:2","2:3","4:3","3:4","4:5","5:4","16:9","9:16","21:9","9:21","3:1","1:3","custom"],
     resolutions: ["1K","2K","4K"],
     counts: ["1","2","3","4","5","6","7","8","9","10"],
@@ -1285,17 +1299,44 @@ const MODEL_SPECS = {
 // settings modal automatically: visible, starting on its highest quality.
 // A second hand-kept list here would be exactly the place a new model gets
 // forgotten.
-const MODEL_ORDER = Object.keys(MODEL_SPECS);
+// Menu order. OpenAI and Seedream run newest and heaviest first, so the two models
+// of one generation sit together under its SOTA. A model missing from this list
+// still shows, at the end of its company's group.
+const _MODEL_MENU_ORDER = [
+  "gemini-3-pro-image", "gemini-2.5-flash-image", "gemini-3.1-flash-image",
+  "gemini-nano-banana-2.1", "gemini-3.1-flash-lite-image",
+  "gpt-image-2.6-sunburst", "gpt-image-2.6-flare",
+  "gpt-image-2.5-sunburst", "gpt-image-2.5-flare", "gpt-image-2",
+  "seedream-5-0-pro-260628", "seedream-5-0-flash-260915", "seedream-4-5-251128",
+];
+const MODEL_ORDER = [..._MODEL_MENU_ORDER, ...Object.keys(MODEL_SPECS).filter(m => !_MODEL_MENU_ORDER.includes(m))];
 const MODEL_LABELS = {
   "seedream-5-0-pro-260628": "seedream-5-0-pro",
   "seedream-5-0-flash-260915": "seedream-5-0-flash",
   "seedream-4-5-251128": "seedream-4-5",
-  "gpt-image-2": "gpt-image-2 (OpenAI)",
   "gpt-image-2.5-flare": "gpt-image-2.5 Flare (Fast)",
   "gpt-image-2.5-sunburst": "gpt-image-2.5 Sunburst (Heavy)",
   "gpt-image-2.6-flare": "gpt-image-2.6 Flare (Fast)",
   "gpt-image-2.6-sunburst": "gpt-image-2.6 Sunburst (Heavy)",
 };
+// Which company a model belongs to, and the one to reach for at each. A judgement
+// call kept in one place so a new release only moves one line here. The mark is the
+// app's one accent colour (style.css): the groups already say which company it is.
+const MODEL_COMPANIES = [
+  { prefix: "gemini-", name: "Google" },
+  { prefix: "gpt-image-", name: "OpenAI" },
+  { prefix: "seedream-", name: "BytePlus Seedream" },
+];
+const SOTA_MODELS = ["gemini-3-pro-image", "gpt-image-2.6-sunburst", "seedream-5-0-pro-260628"];
+function modelCompany(m) {
+  return MODEL_COMPANIES.find(c => String(m || "").startsWith(c.prefix)) || null;
+}
+function isSotaModel(m) {
+  return SOTA_MODELS.includes(migrateModelId(m));
+}
+function modelLabel(m) {
+  return (MODEL_LABELS[m] || m) + (isSotaModel(m) ? " ★" : "");
+}
 let _modelPrefs = { hidden: [], default_res: {} };
 
 async function loadModelPrefs() {
@@ -1316,13 +1357,34 @@ function rebuildModelSelect(keepModel) {
   let ids = MODEL_ORDER.filter(m => !hidden.has(m) || m === keep);
   if (!ids.length) ids = MODEL_ORDER.slice();          // 방어: 전부 숨겨졌으면 무시
   sel.innerHTML = "";
+  // One group per company, in MODEL_ORDER, so the menu answers "which one do I use at
+  // Google / OpenAI / Seedream" at a glance.
+  const groups = new Map();
   ids.forEach(m => {
-    const opt = document.createElement("option");
-    opt.value = m;
-    opt.textContent = (MODEL_LABELS[m] || m) + (hidden.has(m) ? " (숨김)" : "");
-    sel.appendChild(opt);
+    const co = modelCompany(m);
+    const key = co ? co.name : "";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(m);
+  });
+  [...MODEL_COMPANIES.map(c => c.name), ""].filter(name => groups.has(name)).forEach(name => {
+    let parent = sel;
+    if (name) {
+      parent = document.createElement("optgroup");
+      parent.label = name;
+      sel.appendChild(parent);
+    }
+    groups.get(name).forEach(m => {
+      const opt = document.createElement("option");
+      opt.value = m;
+      opt.textContent = modelLabel(m) + (hidden.has(m) ? " (숨김)" : "");
+      if (isSotaModel(m)) opt.className = "model-sota";
+      parent.appendChild(opt);
+    });
   });
   if (ids.includes(keep)) sel.value = keep;
+  // A closed <select> doesn't take its option's colour, so carry it over; otherwise
+  // the mark would vanish the moment a SOTA model is actually picked.
+  sel.classList.toggle("model-sota", isSotaModel(sel.value));
 }
 
 // What a model starts on when the user switches TO it. The user's per-model
@@ -1437,6 +1499,129 @@ function _syncBgHint() {
   hint.style.display = (rowVisible && chk.checked) ? "" : "none";
 }
 
+// GIF / SVG (2.6). The limits come from the server (/api/settings), so the menus
+// and the check on the way out read one table.
+let _gifLimits = { sizes: {}, min_frames: 2, frame_ms: [20, 2000] };
+
+function _fillGifSizes(preferred) {
+  const sel = document.getElementById("gifSizeSelect");
+  const sizes = _gifLimits.order || Object.keys(_gifLimits.sizes || {});
+  const keep = preferred || sel.value;
+  sel.innerHTML = "";
+  sizes.forEach(v => {
+    const o = document.createElement("option");
+    o.value = v;
+    o.textContent = v.replace("x", "×");
+    sel.appendChild(o);
+  });
+  if (sizes.includes(keep)) sel.value = keep;
+}
+
+function _fillGifFrames(preferred) {
+  const sel = document.getElementById("gifFramesSelect");
+  const lo = _gifLimits.min_frames || 2;
+  const hi = (_gifLimits.sizes || {})[document.getElementById("gifSizeSelect").value] || lo;
+  const want = parseInt(preferred) || parseInt(sel.value) || 9;
+  sel.innerHTML = "";
+  for (let n = lo; n <= hi; n++) {
+    const o = document.createElement("option");
+    o.value = String(n);
+    o.textContent = String(n);
+    sel.appendChild(o);
+  }
+  // Same fit as the server: a smaller table can hold fewer frames.
+  sel.value = String(Math.max(lo, Math.min(hi, want)));
+}
+
+function _gifFrameCount() {
+  return parseInt(document.getElementById("gifFramesSelect").value) || 0;
+}
+
+// People think in how long the loop runs; the API takes a time per frame. The length
+// is what stays put when the frame count changes. A GIF keeps delays in hundredths of
+// a second, so the per-frame time lands on 10 ms steps and the hint shows the result.
+function _gifMs() {
+  const frames = _gifFrameCount() || 1;
+  const [lo, hi] = _gifLimits.frame_ms || [20, 2000];
+  const secs = parseFloat(document.getElementById("gifSecInput").value);
+  const ms = secs > 0 ? secs * 1000 / frames : 200;
+  return Math.max(lo, Math.min(hi, Math.round(ms / 10) * 10));
+}
+
+// The box follows what this many frames can do: a length out of range moves to the edge.
+function _fitGifLength() {
+  const el = document.getElementById("gifSecInput");
+  const frames = _gifFrameCount() || 1;
+  const [lo, hi] = _gifLimits.frame_ms || [20, 2000];
+  const min = frames * lo / 1000, max = frames * hi / 1000;
+  el.max = String(max);
+  const secs = parseFloat(el.value);
+  if (!(secs > 0)) el.value = String(+(frames * 200 / 1000).toFixed(2));
+  else if (secs < min) el.value = String(+min.toFixed(2));
+  else if (secs > max) el.value = String(+max.toFixed(2));
+  return max;
+}
+
+// What the file will be, under the menus. For a GIF, the time per frame and the length
+// it really comes to. For an SVG, the two things that differ from every other format
+// and can't be seen in the menus.
+function _syncFormatHint(fmt) {
+  const hint = document.getElementById("formatHint");
+  if (!hint) return;
+  if (fmt === "gif") {
+    const max = _fitGifLength();
+    const frames = _gifFrameCount();
+    const ms = _gifMs();
+    hint.textContent = `${frames}프레임, 프레임당 ${+(ms / 1000).toFixed(2)}초, 한 바퀴 ${+(frames * ms / 1000).toFixed(2)}초. 이 프레임 수로는 최대 ${max}초.`;
+    hint.style.display = "";
+  } else if (fmt === "svg") {
+    hint.textContent = "SVG는 레퍼런스를 함께 보낼 수 없어요. 배경은 기본으로 투명이고, 벡터 변환 비용이 더해져 PNG보다 비싸요.";
+    hint.style.display = "";
+  } else {
+    hint.style.display = "none";
+  }
+}
+
+// Which menus apply. A GIF's frame size IS its size, so the ratio and resolution
+// menus step aside; an SVG is always cut out, so the transparency box does.
+function _syncFormatUI() {
+  const spec = getModelSpec(document.getElementById("modelSelect").value);
+  const sel = document.getElementById("outputFormatSelect");
+  if (!spec.formats) sel.value = "png";
+  const fmt = sel.value;
+  const gif = fmt === "gif";
+  const show = (id, on) => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = on ? "" : "none";
+  };
+  show("formatWrap", !!spec.formats);
+  show("gifSizeWrap", gif);
+  show("gifFramesWrap", gif);
+  show("gifLengthWrap", gif);
+  show("aspectWrap", !gif);
+  show("resolutionWrap", !gif && spec.showResolution !== false);
+  show("bgTransparentRow", !!spec.showBackground && fmt !== "svg");
+  _syncBgHint();
+  _syncFormatHint(fmt);
+  if (typeof toggleCustomWrap === "function") toggleCustomWrap();
+}
+
+function onOutputFormatChange() {
+  _syncFormatUI();
+  saveSettings();
+}
+
+function onGifSizeChange() {
+  _fillGifFrames();
+  _syncFormatHint("gif");
+  saveSettings();
+}
+
+function onGifValueChange() {
+  _syncFormatHint("gif");
+  saveSettings();
+}
+
 function applyModelSpec(model, preserved) {
   const spec = getModelSpec(model);
   // H8: migrate the wrong "0.5K" token (shipped v1201/02) back to "512px".
@@ -1480,7 +1665,10 @@ function applyModelSpec(model, preserved) {
   }
   _syncBgHint();
   const hintEl = document.getElementById("modelHint");
-  if (hintEl) hintEl.textContent = spec.hint;
+  if (hintEl) {
+    const co = isSotaModel(model) ? modelCompany(migrateModelId(model)) : null;
+    hintEl.textContent = (co ? `★ ${co.name}에서 지금 가장 좋은 모델. ` : "") + spec.hint;
+  }
   // Every OpenAI model ignores [Image N] tags, so the warning styling applies
   // to 2.5 as much as to gpt-image-2.
   const isOpenAI = (model || "").indexOf("gpt-image-") === 0;
@@ -1489,8 +1677,15 @@ function applyModelSpec(model, preserved) {
     refHintEl.textContent = spec.refHint;
     refHintEl.classList.toggle("hint-warn", isOpenAI);
   }
-  // Show/hide the Custom pixel inputs for the current model+aspect.
-  if (typeof toggleCustomWrap === "function") toggleCustomWrap();
+  // Format and GIF values. Set before _syncFormatUI, which decides what shows
+  // (and, by way of toggleCustomWrap, the Custom pixel inputs) from them.
+  if (preserved?.output_format) document.getElementById("outputFormatSelect").value = preserved.output_format;
+  _fillGifSizes(preserved?.gif_size);
+  _fillGifFrames(preserved?.gif_frames);
+  if (preserved?.gif_frame_ms) {
+    document.getElementById("gifSecInput").value = String(+(_gifFrameCount() * preserved.gif_frame_ms / 1000).toFixed(2));
+  }
+  _syncFormatUI();
 }
 
 // "1K/2K/4K"는 모델마다 실제 픽셀이 다른 라벨이므로(GPT 4K=8.29M, Seedream 4.5 4K=4096²,
@@ -1537,7 +1732,8 @@ function openModelPrefs() {
     const name = document.createElement("label");
     name.className = "mp-name";
     name.setAttribute("for", chk.id);
-    name.textContent = MODEL_LABELS[m] || m;
+    name.textContent = modelLabel(m);
+    name.classList.toggle("model-sota", isSotaModel(m));
     if (m === cur) {
       const tag = document.createElement("span");
       tag.className = "mp-current";
@@ -1757,6 +1953,8 @@ function updateCustomPreview() {
 function customSizeActive() {
   const model = document.getElementById("modelSelect").value;
   const asp = document.getElementById("aspectSelect").value;
+  // A GIF takes its size from the frame size menu, even with Custom left selected.
+  if (document.getElementById("outputFormatSelect").value === "gif") return false;
   return asp === "custom" && getModelSpec(model).aspects.includes("custom");
 }
 
@@ -3335,6 +3533,13 @@ async function refreshGallery() {
       }
     }, { once: true });
     frame.appendChild(img);
+    // The grid shows a still of a GIF and an SVG looks like any picture, so say so.
+    if (item.format === "gif" || item.format === "svg") {
+      const fmtBadge = document.createElement("span");
+      fmtBadge.className = "card-format-badge";
+      fmtBadge.textContent = item.format.toUpperCase();
+      frame.appendChild(fmtBadge);
+    }
     card.appendChild(frame);
 
     // --- Card body ---

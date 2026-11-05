@@ -3,7 +3,7 @@
 멀티 프로바이더 AI 이미지 생성 데스크톱 앱 (Flask + pywebview + PyInstaller).
 이 문서 하나로 **구조 · 원리 · 규칙 · 배포 · 관리**를 파악할 수 있게 씁니다. 낡은 내용을 발견하면 즉시 고칠 것.
 
-> 최종 갱신: 2026-11-05 (v2026-11-0501 기준 — GPT Image 2.6 + complexity, §6.1)
+> 최종 갱신: 2026-11-05 (v2026-11-0502 기준 — GPT Image 2.6 GIF·SVG 출력, 모델 메뉴 별표, §6.1)
 
 ---
 
@@ -127,7 +127,7 @@ NanoBanana.exe 실행
 | 요청 | 하는 일 |
 |---|---|
 | `GET /api/projects` | `agent_pid: true`·`features:["agent_pid"]`(기능 확인), 탭마다 `pid·name·generating·billing_confirmed` |
-| `POST /api/generate` `{pid, prompt, settings:{model,aspect,resolution,quality,complexity,count,custom_w,custom_h,openai_bg_transparent}, ref_paths:[..]}` | 그 탭에 생성 → `{ok, batch_id, pid, count, queued, outstanding}`. pid 가 없으면 예전 그대로(화면 탭의 입력칸 = 창의 Generate) |
+| `POST /api/generate` `{pid, prompt, settings:{model,aspect,resolution,quality,complexity,count,custom_w,custom_h,openai_bg_transparent,output_format,gif_size,gif_frames,gif_frame_ms}, ref_paths:[..]}` | 그 탭에 생성 → `{ok, batch_id, pid, count, queued, outstanding}`. pid 가 없으면 예전 그대로(화면 탭의 입력칸 = 창의 Generate) |
 | `GET /api/batch?pid=&batch_id=` | 그 묶음의 `count·done·failed·cancelled·pending·finished·images·errors`. `finished` 면 더 올 것 없음 |
 | `GET /api/gallery?pid=&strict=1&batch_id=` | 그 묶음의 이미지 (항목마다 `batch_id`) |
 | `GET /api/settings?pid=` · `/api/refs?pid=` · `/api/billing/state?pid=` | 그 탭 읽기 (엄격) |
@@ -136,10 +136,11 @@ NanoBanana.exe 실행
 
 - **빠진 설정값**은 그 탭의 지금 값을 읽어 쓴다(쓰지는 않음). 그 값이 고른 모델에 안 맞으면(Pro 의 4K 가 남은 채 Lite 를
   고름) 모델 기본값(auto / 1K / 시드림 기본 / high) — 창에서 모델을 바꿀 때와 같다. **에이전트가 보낸 값**이 안 맞으면
-  고치지 않고 거절: `bad_aspect|bad_resolution|bad_quality|bad_complexity` + `field` + `allowed`. 화면 메뉴가 막는 값과 같은 기준
-  (`_agent_settings_problem`). 예전 경로는 모르는 비율을 조용히 빼고 갤러리엔 요청한 비율을 적었다
+  고치지 않고 거절: `bad_aspect|bad_resolution|bad_quality|bad_complexity|bad_output_format|bad_gif_size|bad_gif_frames|bad_gif_frame_ms`
+  + `field` + `allowed`. 화면 메뉴가 막는 값과 같은 기준 (`_agent_settings_problem`). 예전 경로는 모르는 비율을 조용히 빼고 갤러리엔 요청한 비율을 적었다.
+  `output_format` 을 빼면 그 탭의 형식을 따른다 — 탭이 GIF 면 2.6 요청은 `.gif` 로 나온다(갤러리 항목의 `format` 으로 구분)
 - 그 밖의 거절: `unknown_model`, `ref_limit`(모델별 장수), `ref_unreadable`, `ref_duplicate`(픽셀 비교 — 다시 저장한
-  사본도 잡힘, 드롭과 같은 규칙), `Empty prompt`, 큐 가득, 멈추는 중. 거절이면 아무것도 생성되지 않는다
+  사본도 잡힘, 드롭과 같은 규칙), `svg_no_refs`(SVG + 레퍼런스), `Empty prompt`, 큐 가득, 멈추는 중. 거절이면 아무것도 생성되지 않는다
 - 크기 계산은 창·에이전트 모두 `_gen_img_cfg` 하나. 갤러리 "Load setup" 은 에이전트 프롬프트를 섹션 하나로 돌려준다
 - 창 쪽 표시: `batch_started` 이벤트(탭 줄 점이 첫 장이 아니라 시작부터 켜짐. 에이전트 묶음이면 "에이전트가 'X' 탭에서
   N장 생성을 시작했습니다" 토스트), `projects_changed`(탭 줄 다시 그림), 팀·프로젝트 미설정 탭의 "!" 표시
@@ -371,9 +372,22 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   **토큰이 2.5 와 다른 곳: low·medium.** 1024² low 823(2.5 는 196), medium 1,449(439). high 이상은 같다(1024² max 7,024).
   에러 메시지의 허용값 목록은 모델 공통이라 믿지 말 것(`none`·`xhigh` 를 나열하지만 2.6 은 400) — 실제로 보내 볼 것.
   응답·헤더에 모델 id 가 없어 어느 모델이 그렸는지는 보낸 본문으로만 확인된다. **앱에 안 넣은 것(API 는 동작, 2026-11-05 실측)**:
-  GIF(`output_format=gif`, 2.6 만, 2~16장 — 가이드의 64 는 틀림, 내부적으로 시트 한 장이라 시트 크기도 제한을 지켜야 함),
-  SVG(`svg.model` 필수), `markup`(2.5·2.6, 그림 그리는 화면 필요), `safety_identifier`(선택). 지금 파이프라인은 PIL 로 열어
-  PNG 로 저장하므로 GIF·SVG 는 그냥 켜면 첫 프레임만 남거나 깨진다
+  `markup`(2.5·2.6, 그림 그리는 화면 필요), `safety_identifier`(선택)
+- **GIF·SVG 출력 (2.6 전용, v2026-11-0502~, 전부 2026-11-05 실측)**: 형식 메뉴는 2.6 에만, 표는 `GIF_FRAME_SIZES` 하나(화면은 `/api/settings` 의
+  `gif_limits` 로 받는다). 응답을 **PIL 없이 받은 그대로** `.gif`·`.svg` 로 저장한다(`result["raw"]`, PIL 은 GIF 를 첫 프레임으로 뭉개고 SVG 를 못 읽는다).
+  오래된 모델엔 탭에 값이 남아 있어도 안 간다(`openai_formats`).
+  **GIF**: `frame_count` 2~16. `frame_duration_ms` 는 20 아래만 400, 위는 70000 까지 통과(상한 못 찾음, 10ms 단위로 반올림). 앱은 프레임당 2초까지(`GIF_FRAME_MS_RANGE`, 슬라이드쇼를 막는 우리 선택)라
+  최대 32초. 화면은 전체 길이(초)로 받아 프레임 수로 나눈다(`_gifMs`) — 프레임 수를 바꿔도 길이가 유지되고, 저장·전송은 그대로 ms. 요청한 프레임 수 = 파일의 프레임 수. 내부적으로 시트 한 장이라
+  프레임 크기마다 상한이 다르다: 288²·384²·512×288·288×512·512² 는 16, 768² 는 12(13부터 3072² 시트가 한도 초과).
+  **1024² 는 2장도 4096×2048 시트라 전부 400** — 힉스필드 메뉴엔 있지만 거기서도 실패·환불. 힉스필드의 64프레임은 실제로 16프레임만 나온다(같은 크레딧).
+  레퍼런스(edit)·`background=transparent`(투명 픽셀 93%) 됨. 저화질 288² 2장 $0.011, 고화질 512² 9장 $0.076.
+  **SVG**: `svg:{model:"gpt-5.5"}` 필수(`SVG_CONVERT_MODEL`, 화면엔 안 보임). 이미지를 그린 뒤 gpt-5.5 가 벡터로 옮겨 약 1분. **edit 는 `svg` 를 모른다 → 레퍼런스 불가**
+  (`svg_no_refs`, 창에서도 거절 — 몰래 빼고 보내면 레퍼런스를 무시한 그림에 값을 치른다). 배경은 안 시켜도 투명으로 온다. 1024² 저·고화질 약 $0.15, max $0.37, 3840×2160 $0.23.
+  화면: 갤러리는 GIF 첫 프레임·SVG 는 파일 자체 + 형식 배지, 뷰어는 `ImageDecoder` 로 재생(없는 브라우저는 첫 프레임). SVG 응답엔 `Content-Security-Policy: sandbox`
+  (`<img>` 로는 스크립트가 안 돌지만 주소로 직접 열면 돈다). 레퍼런스·복사: GIF 는 첫 프레임, SVG 는 안내 후 거절
+- **모델 메뉴의 별표** (v2026-11-0502~): 회사별 그룹 + 회사마다 최고 모델 하나 `SOTA_MODELS`(app.js, 지금 `gemini-3-pro-image`·`gpt-image-2.6-sunburst`·`seedream-5-0-pro-260628`).
+  표시는 `★` + 강조색 하나(`--accent`), 화면에 "SOTA" 글자는 쓰지 않는다 — 회사별 색과 글자는 사용자가 빼라고 했다, 회사는 그룹 이름이 말한다. 판단으로 고른 값이다 — 구글은 문서가 "premium choice" 라 한 Pro 로,
+  2.1 은 "workhorse". 메뉴 순서는 `_MODEL_MENU_ORDER`(OpenAI·시드림은 최신·상위부터). **새 모델을 넣을 때 이 두 목록을 같이 볼 것**
 - **GPT 이미지 검열은 `moderation=low`** (`OPENAI_MODERATION`, v2026-09-2801~). 기본값 auto 는 호러 특수분장
   같은 창작물도 자주 막는다. 편집(레퍼런스)은 SDK 에 인자가 없어 `extra_body={"moderation": ...}` 로 보낸다
   (API 레퍼런스에도 있고 다섯 모델 × 생성/편집 실측). low 도 정책 위반은 막는다
@@ -403,6 +417,10 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   (`out_tokens`), 출력 **텍스트·생각**(`out_text_tokens`). Gemini 는 `candidates` 중 IMAGE 가 아닌 부분(Studio 에서
   100~450토큰)과 `thoughts_token_count`(장당 200~1,500)를 텍스트·생각 단가로 청구한다 — 이미지 단가의 1/4~1/20.
   네 칸의 합 = `total_token_count`. OpenAI 는 `output_tokens_details`, Seedream 은 `input_images`(레퍼런스 수)
+- **SVG 의 gpt-5.5 변환비는 `usage` 밖 `svg_usage` 로 온다(이미지값의 대여섯 배).** 같은 줄의 `in_text_tokens`·`out_tokens` 에 합친다 — gpt-5.5 단가(입력 $5, 출력 $30)가
+  2.6 의 텍스트 입력·이미지 출력과 같아 금액이 정확히 맞는다(`reasoning_tokens` 는 output 안에 있다). **gpt-5.5 단가가 바뀌거나 모델을 바꾸면 이 합치기를 다시 봐야 한다.**
+  OpenAI 청구서엔 `gpt-5.5-2026-04-23, input/output` 줄로 따로 찍힌다. 공개 트래커·주간 리포트는 2026-11-05 부터 이 줄을 `gpt-5.5 (SVG 변환)` 으로 센다(양쪽 `is_counted_line`).
+  **이 키는 이미지 전용이 아니다** — 9/24 에 SVG 와 무관한 gpt-5.5 $0.64 가 있어 날짜로 잘랐다. 같은 키로 gpt-5.5 를 다른 데 쓰면 SVG 변환비로 잡히니 다른 키로 할 것
 - **이미지 없이 끝난 Gemini 응답도 청구된다.** 한 장을 만들기까지의 모든 시도(무이미지 재시도, Studio↔Vertex
   전환)를 합산하고, 끝내 실패·취소돼도 청구된 토큰은 `images=0` 행으로 남긴다. 오류(4xx/5xx)는 청구 안 됨 → 안 남김
 - 게이트웨이: `usage_events.out_text_tokens`, `prices.out_text_per_m`(gateway/usage3.sql). `COST_USD` 가 둘을 곱한다.

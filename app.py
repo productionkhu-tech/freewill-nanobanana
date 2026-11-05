@@ -49,7 +49,7 @@ GPT2_MODEL_ID = "gpt-image-2"
 # ladder: xhigh and max sit above high.
 GPT25_MODEL_IDS = ("gpt-image-2.5-sunburst", "gpt-image-2.5-flare")
 # GPT Image 2.6 (2026-11). Same request shape, size rules, quality ladder,
-# transparency, 16 references and token rates as 2.5. New: `complexity`.
+# transparency, 16 references and token rates as 2.5. New: `complexity`, GIF and SVG.
 GPT26_MODEL_IDS = ("gpt-image-2.6-sunburst", "gpt-image-2.6-flare")
 # Everything above gpt-image-2: xhigh/max and transparent backgrounds.
 GPT_LADDER_MODEL_IDS = GPT25_MODEL_IDS + GPT26_MODEL_IDS
@@ -58,6 +58,30 @@ OPENAI_MODEL_IDS = (GPT2_MODEL_ID,) + GPT_LADDER_MODEL_IDS
 # its own; the API's own default is "high". 2.6 only in this app, even if an
 # older model turns out to accept it, so their requests stay as they were.
 GPT26_COMPLEXITIES = ["low", "medium", "high"]
+# Output files other than PNG, 2.6 only (measured against the API 2026-11-05).
+GPT26_FORMATS = ["png", "gif", "svg"]
+# A GIF is drawn as one sheet and cut into frames, so the sheet has to fit the
+# pixel budget as well. size -> most frames. frame_count is 2..16 at any size (the
+# API's own error says so; 17 and up is refused, and the file holds exactly what
+# was asked for). 768x768 stops at 12 because 13 needs a 3072x3072 sheet.
+# 1024x1024 is not here at all: even 2 frames asks for a 4096x2048 sheet, so every
+# count is refused, whatever other apps' menus offer.
+GIF_FRAME_SIZES = {"288x288": 16, "384x384": 16, "512x288": 16, "288x512": 16,
+                   "512x512": 16, "768x768": 12}
+GIF_MIN_FRAMES = 2
+GIF_DEFAULT_SIZE = "512x512"
+GIF_DEFAULT_FRAMES = 9          # the API's own default
+GIF_DEFAULT_FRAME_MS = 200
+# Below 20 the API refuses. Above, it took everything tried up to 70000; 2000 is this
+# app's own choice, since past two seconds a frame a GIF is a slideshow. That makes the
+# longest loop 32 seconds (16 frames). A GIF keeps delays in hundredths of a second, so
+# values land on 10 ms steps (222 came back as 220).
+GIF_FRAME_MS_RANGE = (20, 2000)
+# An SVG is drawn first, then this model turns the picture into vectors. The API
+# requires it (svg.model) and bills it on top of the image, in `svg_usage`.
+# The image edit endpoint refuses `svg`, so an SVG cannot take references.
+SVG_CONVERT_MODEL = "gpt-5.5"
+SVG_NO_REFS_ERROR = "SVG는 레퍼런스와 함께 보낼 수 없습니다 — 레퍼런스를 비우거나 형식을 PNG·GIF로 바꿔 주세요"
 # 13 explicit aspect ratios exposed for gpt-image-2 (all within the API's 3:1
 # cap). "auto" is a UI sentinel resolved before these are used.
 GPT2_ASPECTS = ["1:1", "3:2", "2:3", "4:3", "3:4", "4:5", "5:4",
@@ -82,6 +106,51 @@ OPENAI_MODERATION = "low"
 def openai_qualities(model):
     """Quality ladder for an OpenAI image model."""
     return GPT25_QUALITIES if model in GPT_LADDER_MODEL_IDS else GPT2_QUALITIES
+
+
+def openai_formats(model):
+    """Output formats this model can return. Every other model and provider stays on
+    the one format the rest of the pipeline was built around."""
+    return GPT26_FORMATS if model in GPT26_MODEL_IDS else ["png"]
+
+
+def gif_clamp(size, frames, frame_ms):
+    """Always a combination the API takes: size, frames, frame_ms."""
+    size = size if size in GIF_FRAME_SIZES else GIF_DEFAULT_SIZE
+    frames = _safe_int(frames, GIF_DEFAULT_FRAMES, lo=GIF_MIN_FRAMES, hi=GIF_FRAME_SIZES[size])
+    lo_ms, hi_ms = GIF_FRAME_MS_RANGE
+    return size, frames, _safe_int(frame_ms, GIF_DEFAULT_FRAME_MS, lo=lo_ms, hi=hi_ms)
+
+
+def _size_px(size):
+    """Pixels in a "WxH" string, 0 when it isn't one (the API's "auto")."""
+    try:
+        w, h = str(size).lower().split("x")
+        return int(w) * int(h)
+    except (ValueError, AttributeError):
+        return 0
+
+
+def gif_card_labels(size, frames):
+    """What a GIF's gallery card shows: its real ratio (so the card has the right
+    shape) and its frame size and count, in place of the tab's ratio and 1K/2K/4K."""
+    w, h = (int(x) for x in str(size).split("x"))
+    d = math.gcd(w, h)
+    return "%d:%d" % (w // d, h // d), "%d×%d · %d프레임" % (w, h, frames)
+
+
+def _file_output_px(fmt, raw, size):
+    """Pixels of a file kept as the API sent it, or None if it isn't that format.
+    Refused here because a bad file would otherwise reach the gallery as a broken card."""
+    if fmt == "gif":
+        try:
+            with Image.open(io.BytesIO(raw)) as im:
+                return im.size[0] * im.size[1] if im.format == "GIF" else None
+        except Exception:
+            return None
+    if fmt == "svg":
+        return _size_px(size) if b"<svg" in raw[:4096] else None
+    return None
 
 
 def openai_clamp_quality(model, quality):
@@ -383,8 +452,14 @@ def _modality_tokens(details, name):
     return n
 
 
-def _extract_usage(provider, result_obj, pil=None):
+def _extract_usage(provider, result_obj, pil=None, file_px=None):
     """프로바이더가 '청구 근거'로 돌려준 사용량을 그대로 옮긴다 (2026-10-07 실측 기준).
+
+    file_px: PIL 을 거치지 않고 파일 그대로 저장하는 결과(GIF·SVG)의 픽셀 수. None 이면 파일이 없다.
+    SVG: 벡터 변환에 쓴 gpt-5.5 토큰이 usage 밖의 svg_usage 로 따로 온다(이미지값의 대여섯 배).
+    같은 줄에 합친다 — gpt-5.5 단가(입력 $5, 출력 $30)가 2.6 의 텍스트 입력·이미지 출력 단가와
+    같아서 금액이 정확히 맞고, 사람이 고른 모델 하나로 찍힌다. 단가가 달라지면 나눠야 한다.
+    reasoning_tokens 는 output_tokens 안에 들어 있다(실측: total = input + output).
 
     Gemini  : 입력은 prompt_tokens_details 로 텍스트/이미지를 나누고, 출력 중 이미지는
               candidates_tokens_details 의 IMAGE 다. candidates 의 나머지(응답 텍스트 -
@@ -397,7 +472,7 @@ def _extract_usage(provider, result_obj, pil=None):
     어느 쪽이든 없으면 0 으로 둔다 - 비용 추정이 틀리는 건 고칠 수 있지만,
     여기서 예외가 나 생성이 실패하는 건 되돌릴 수 없다."""
     u = {"in_text_tokens": 0, "in_image_tokens": 0, "out_tokens": 0, "out_text_tokens": 0,
-         "images": 1 if pil is not None else 0, "out_px": 0}
+         "images": 1 if (pil is not None or file_px is not None) else 0, "out_px": int(file_px or 0)}
     try:
         if pil is not None and getattr(pil, "size", None):
             u["out_px"] = int(pil.size[0]) * int(pil.size[1])
@@ -445,6 +520,10 @@ def _extract_usage(provider, result_obj, pil=None):
             u["in_image_tokens"] = int(get(ind, "image_tokens") or 0)
         else:
             u["in_text_tokens"] = int(get(raw, "input_tokens") or 0)
+        su = get(result_obj, "svg_usage")
+        if su:
+            u["in_text_tokens"] += int(get(su, "input_tokens") or 0)
+            u["out_tokens"] += int(get(su, "output_tokens") or 0)
     except Exception:
         pass
     return u
@@ -894,6 +973,11 @@ class AppState:
         self.openai_bg_transparent = False
         # GPT Image 2.6 전용 — 렌더링 전에 얼마나 계획할지. 저장 방식은 위와 같다.
         self.complexity = "high"
+        # GPT Image 2.6 전용 — 결과 파일 형식과 GIF 설정. 저장 방식은 위와 같다.
+        self.output_format = "png"
+        self.gif_size = GIF_DEFAULT_SIZE
+        self.gif_frames = GIF_DEFAULT_FRAMES
+        self.gif_frame_ms = GIF_DEFAULT_FRAME_MS
         self.fixed_prompt = ""
         self.prompt_sections = [""]
         self.naming_enabled = False
@@ -1421,6 +1505,9 @@ class AppState:
             if slot is None and self._filled_ref_count() >= limit:
                 self.log(f"Max {limit} reference images")
                 return False, "limit"
+            if _is_svg_path(filepath):
+                self.log("SVG cannot be a reference")
+                return False, "svg"
             try:
                 with Image.open(filepath) as img:
                     # Preserve alpha — PNG logos/icons should stay as
@@ -1694,7 +1781,7 @@ class AppState:
                 pass
             return fp
 
-    def make_filename(self, seed, naming=None, model=None):
+    def make_filename(self, seed, naming=None, model=None, ext="png"):
         s = naming or self.get_naming_settings()
         if s["enabled"]:
             # Atomic read-increment-use under a lock. Without this, two
@@ -1709,10 +1796,10 @@ class AppState:
             idx_prefix = (s.get("index_prefix") or "").strip()
             number_part = f"{idx_prefix}{num}" if idx_prefix else num
             if middle:
-                return f"{prefix}_{middle}_{number_part}.png"
-            return f"{prefix}_{number_part}.png"
+                return f"{prefix}_{middle}_{number_part}.{ext}"
+            return f"{prefix}_{number_part}.{ext}"
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return f"{_model_file_prefix(model or self.model)}_{ts}_{seed}.png"
+        return f"{_model_file_prefix(model or self.model)}_{ts}_{seed}.{ext}"
 
     def prepare_file_counter(self, naming=None):
         s = naming or self.get_naming_settings()
@@ -1726,11 +1813,11 @@ class AppState:
         strict_pattern = re.compile(
             rf"^{re.escape(s['prefix'])}"
             rf"(?:_{re.escape(s['delimiter'])})?"
-            rf"_{re.escape(s.get('index_prefix', ''))}(\d+)\.png$",
+            rf"_{re.escape(s.get('index_prefix', ''))}(\d+)\.(?:png|gif|svg)$",
             re.IGNORECASE,
         )
         loose_pattern = re.compile(
-            rf"^{re.escape(s['prefix'])}.*?(\d+)\.png$",
+            rf"^{re.escape(s['prefix'])}.*?(\d+)\.(?:png|gif|svg)$",
             re.IGNORECASE,
         )
         max_num = 0
@@ -1951,6 +2038,10 @@ class AppState:
                 "custom_h": self.custom_h,
                 "openai_bg_transparent": self.openai_bg_transparent,
                 "complexity": self.complexity,
+                "output_format": self.output_format,
+                "gif_size": self.gif_size,
+                "gif_frames": self.gif_frames,
+                "gif_frame_ms": self.gif_frame_ms,
                 "billing_team_id": self.billing_team_id,
                 "billing_project_id": self.billing_project_id,
                 "count": str(self.count),
@@ -2049,6 +2140,9 @@ class AppState:
         self.custom_h = _safe_int(ui.get("custom_h"), self.custom_h, lo=16, hi=99999)
         self.openai_bg_transparent = bool(ui.get("openai_bg_transparent", False))
         self.complexity = ui.get("complexity", "high")
+        self.output_format = ui.get("output_format") if ui.get("output_format") in GPT26_FORMATS else "png"
+        self.gif_size, self.gif_frames, self.gif_frame_ms = gif_clamp(
+            ui.get("gif_size"), ui.get("gif_frames"), ui.get("gif_frame_ms"))
         # 저장된 귀속은 되살리되 '확인' 은 되살리지 않는다. 미리 채워두면
         # 다시 고를 필요는 없고 확인 한 번이면 끝난다.
         self.billing_team_id = str(ui.get("billing_team_id", "") or "")
@@ -2289,11 +2383,12 @@ class AppState:
                     extra["background"] = img_cfg["background"]
                 if img_cfg.get("output_format"):
                     extra["output_format"] = img_cfg["output_format"]
-                # The SDK has no `complexity` argument yet; img_cfg carries it
+                # The SDK has none of these arguments yet; img_cfg carries them
                 # for 2.6 only, so every other model's request is unchanged.
                 body = {}
-                if img_cfg.get("complexity"):
-                    body["complexity"] = img_cfg["complexity"]
+                for k in ("complexity", "frame_count", "frame_duration_ms", "svg"):
+                    if img_cfg.get(k):
+                        body[k] = img_cfg[k]
                 if ref_payloads:
                     result = client.images.edit(
                         model=model,
@@ -2332,7 +2427,25 @@ class AppState:
                     return {"status": "failed", "index": idx, "seed": seed,
                             "error": "OpenAI returned no b64_json (url mode unsupported)",
                             "elapsed": time.time() - start}
-                pil = _to_display_image(Image.open(io.BytesIO(base64.b64decode(b64))))
+                raw = base64.b64decode(b64)
+                fmt = img_cfg.get("output_format")
+                if fmt in ("gif", "svg"):
+                    # Kept byte for byte. PIL would flatten a GIF to its first frame and
+                    # cannot read an SVG at all.
+                    px = _file_output_px(fmt, raw, getattr(result, "size", None) or size)
+                    if px is None:
+                        self.log(f"[{idx+1}] OpenAI returned a file that is not {fmt}")
+                        # Not retried: this attempt is already billed and asking again
+                        # is not likely to change what the model does with this request.
+                        return {"status": "failed", "index": idx, "seed": seed,
+                                "error": f"OpenAI returned an invalid {fmt} file",
+                                "elapsed": time.time() - start, "api_used": "openai",
+                                "usage": _extract_usage("openai", result)}
+                    return {"status": "success", "index": idx, "seed": seed,
+                            "image": None, "raw": raw, "ext": fmt,
+                            "elapsed": time.time() - start, "api_used": "openai",
+                            "usage": _extract_usage("openai", result, file_px=px)}
+                pil = _to_display_image(Image.open(io.BytesIO(raw)))
                 return {"status": "success", "index": idx, "seed": seed,
                         "image": pil, "elapsed": time.time() - start,
                         "api_used": "openai",
@@ -2834,10 +2947,14 @@ class AppState:
                         elapsed = result["elapsed"]
                         api_used = result["api_used"]
                         seed = result["seed"]
-                        fn = self.make_filename(seed, naming, model)
+                        fn = self.make_filename(seed, naming, model, result.get("ext") or "png")
                         fp = self.reserve_filepath(job["output_dir"], fn)
                         fn = os.path.basename(fp)
-                        self.save_generated_image(pil, fp, prompt, model)
+                        if result.get("raw") is not None:
+                            with open(fp, "wb") as f:
+                                f.write(result["raw"])
+                        else:
+                            self.save_generated_image(pil, fp, prompt, model)
                         self.done_count += 1
 
                         gen_at = datetime.now().isoformat(timespec="seconds")
@@ -2879,9 +2996,19 @@ class AppState:
                             # Which request made it — an agent finds its own images by this.
                             "batch_id": job.get("batch_id", ""),
                             "agent": bool(job.get("agent")),
+                            "output_format": job.get("output_format") or "png",
                         }
+                        # A GIF ignores the tab's ratio and 1K/2K/4K: Load gets those
+                        # back as they were, while the card shows what the file really is.
+                        card_aspect, card_res = aspect, resolution
+                        _cfg = job.get("img_cfg") or {}
+                        if job.get("output_format") == "gif":
+                            gen_settings.update(gif_size=_cfg.get("size"),
+                                                gif_frames=_cfg.get("frame_count"),
+                                                gif_frame_ms=_cfg.get("frame_duration_ms"))
+                            card_aspect, card_res = gif_card_labels(_cfg.get("size"), _cfg.get("frame_count"))
                         self.add_gallery_item(fp, prompt, elapsed, api_used,
-                                              aspect=aspect, resolution=resolution,
+                                              aspect=card_aspect, resolution=card_res,
                                               generated_at=gen_at,
                                               generation_settings=gen_settings)
                         self._batch_note(job.get("batch_id"), "done", filepath=fp)
@@ -3502,6 +3629,14 @@ def get_settings():
         "custom_h": state.custom_h,
         "openai_bg_transparent": state.openai_bg_transparent,
         "complexity": state.complexity,
+        "output_format": state.output_format,
+        "gif_size": state.gif_size,
+        "gif_frames": state.gif_frames,
+        "gif_frame_ms": state.gif_frame_ms,
+        # One table: the page's menus are filled from this, not from a copy in app.js.
+        # "order" because JSON sorts the keys, and 288x512 is not next after 288x288.
+        "gif_limits": {"sizes": GIF_FRAME_SIZES, "order": list(GIF_FRAME_SIZES),
+                       "min_frames": GIF_MIN_FRAMES, "frame_ms": list(GIF_FRAME_MS_RANGE)},
         "count": state.count,
         "output_dir": state.output_dir,
         "fixed_prompt": state.fixed_prompt,
@@ -3522,6 +3657,7 @@ def _settings_fingerprint(proj):
     return (
         proj.model, proj.aspect, proj.resolution, proj.quality,
         proj.custom_w, proj.custom_h, proj.openai_bg_transparent, proj.complexity, proj.count,
+        proj.output_format, proj.gif_size, proj.gif_frames, proj.gif_frame_ms,
         proj.output_dir, proj.fixed_prompt, tuple(proj.prompt_sections or []),
         proj.naming_enabled, proj.naming_prefix, proj.naming_delimiter,
         proj.naming_index_prefix, proj.naming_padding, proj.gallery_columns,
@@ -3578,6 +3714,15 @@ def update_settings():
         state.naming_enabled = bool(d.get("naming_enabled"))
     if "openai_bg_transparent" in d:
         state.openai_bg_transparent = bool(d.get("openai_bg_transparent"))
+    if d.get("output_format") in GPT26_FORMATS:
+        state.output_format = d["output_format"]
+    if "gif_size" in d or "gif_frames" in d or "gif_frame_ms" in d:
+        # A value that makes no sense keeps what the tab had, then the combination
+        # is fitted to the size (a smaller size can hold fewer frames).
+        state.gif_size, state.gif_frames, state.gif_frame_ms = gif_clamp(
+            d.get("gif_size") if d.get("gif_size") in GIF_FRAME_SIZES else state.gif_size,
+            _safe_int(d.get("gif_frames"), state.gif_frames),
+            _safe_int(d.get("gif_frame_ms"), state.gif_frame_ms))
     if "naming_padding" in d:
         state.naming_padding = _safe_int(d.get("naming_padding"), state.naming_padding, lo=1, hi=5)
     if "prompt_sections" in d:
@@ -3877,6 +4022,7 @@ _REF_ADD_ERRORS = {
     "duplicate": "이미 추가된 이미지입니다",
     "limit": "레퍼런스 개수가 가득 찼습니다",
     "unreadable": "이미지를 읽을 수 없습니다",
+    "svg": "SVG는 레퍼런스로 쓸 수 없습니다 — PNG·GIF 이미지를 써 주세요",
 }
 
 
@@ -4056,7 +4202,9 @@ def get_gallery():
             # Hoisted out of generation_settings the same way `model` is — the
             # listing deliberately doesn't ship the whole settings blob, and the
             # grid needs this one bit to put a checkerboard behind a cut-out.
-            "transparent": bool(item.get("generation_settings", {}).get("openai_bg_transparent")),
+            # An SVG comes back with an empty background unless asked otherwise.
+            "transparent": bool(item.get("generation_settings", {}).get("openai_bg_transparent")) or _is_svg_path(fp),
+            "format": os.path.splitext(fp)[1].lstrip(".").lower(),
             "generated_at": item.get("generated_at", ""),
             "favorite": fp in state.favorites,
             "batch_id": gs.get("batch_id", ""),
@@ -4172,7 +4320,22 @@ def serve_gallery_image():
     fp = request.args.get("path", "")
     if not fp or not _is_path_allowed(fp):
         return "", 404
-    return send_file(fp, mimetype="image/png")
+    return _send_gallery_file(fp)
+
+
+def _is_svg_path(fp):
+    return str(fp or "").lower().endswith(".svg")
+
+
+def _send_gallery_file(fp):
+    """A gallery file with the type its name says. An <img> never runs an SVG's
+    scripts, but opening the address directly would, on the app's own origin — so
+    even a file the model wrote is served unable to do anything but draw."""
+    if _is_svg_path(fp):
+        resp = send_file(fp, mimetype="image/svg+xml")
+        resp.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+        return resp
+    return send_file(fp, mimetype="image/gif" if fp.lower().endswith(".gif") else "image/png")
 
 
 # --- Viewer -> main window bridge -----------------------------------------
@@ -4298,6 +4461,8 @@ def serve_gallery_thumb():
     size = max(32, min(size, 2048))
     if not fp or not _is_path_allowed(fp):
         return "", 404
+    if _is_svg_path(fp):
+        return _send_gallery_file(fp)       # PIL can't read it; the browser scales it anyway
     try:
         with Image.open(fp) as img:
             # A cut-out has to stay a cut-out here too. JPEG carries no alpha,
@@ -4453,6 +4618,8 @@ def replace_ref_from_path(idx):
     fp = d.get("filepath", "")
     if not fp or not os.path.exists(fp):
         return jsonify({"ok": False, "error": "File not found"})
+    if _is_svg_path(fp):
+        return jsonify({"ok": False, "error": _REF_ADD_ERRORS["svg"]})
     with state.ref_lock:
         if not (0 <= idx < len(state.ref_path_list)):
             return jsonify({"ok": False, "error": "Invalid slot"})
@@ -4486,6 +4653,12 @@ def load_setup():
     state.custom_h = _safe_int(saved.get("custom_h"), state.custom_h, lo=16, hi=99999)
     state.openai_bg_transparent = bool(saved.get("openai_bg_transparent", False))
     state.complexity = saved.get("complexity") or "high"
+    # A card saved before this existed is a PNG. A PNG card leaves the GIF settings
+    # as they are; only a GIF knows what they were.
+    state.output_format = saved.get("output_format") if saved.get("output_format") in GPT26_FORMATS else "png"
+    if saved.get("gif_size"):
+        state.gif_size, state.gif_frames, state.gif_frame_ms = gif_clamp(
+            saved.get("gif_size"), saved.get("gif_frames"), saved.get("gif_frame_ms"))
     state.count = int(saved.get("count", 1))
     state.output_dir = saved.get("output_dir", state.output_dir)
 
@@ -4774,9 +4947,19 @@ def _providers_for(p, model):
 
 
 def _gen_img_cfg(model, aspect, resolution, quality, custom_w, custom_h, bg_transparent,
-                 ref_snapshots, complexity=""):
+                 ref_snapshots, complexity="", output_format="png",
+                 gif_size=None, gif_frames=None, gif_frame_ms=None):
     """The provider-specific size/quality block for one batch — shared by the
     window and the agent path so the two can never disagree about a size."""
+    if model in OPENAI_MODEL_IDS and output_format == "gif" and "gif" in openai_formats(model):
+        # The frame size is the size. The ratio and resolution menus don't apply.
+        size, frames, frame_ms = gif_clamp(gif_size, gif_frames, gif_frame_ms)
+        img_cfg = {"size": size, "quality": openai_clamp_quality(model, quality),
+                   "output_format": "gif", "frame_count": frames, "frame_duration_ms": frame_ms,
+                   "complexity": complexity if complexity in openai_complexities(model) else "high"}
+        if bg_transparent:
+            img_cfg["background"] = "transparent"
+        return img_cfg
     if model in OPENAI_MODEL_IDS:
         # H4: measure the first FILLED slot's real dimensions for Auto. PIL
         # .size is an O(1) header read (no pixel decode); guarded for 0-dim.
@@ -4801,7 +4984,11 @@ def _gen_img_cfg(model, aspect, resolution, quality, custom_w, custom_h, bg_tran
         # Transparency is for 2.5 and 2.6; gpt-image-2 400s on it. The format
         # goes with it because the API only keeps an alpha channel on png/webp —
         # asking for transparent without it silently returns a filled background.
-        if model in GPT_LADDER_MODEL_IDS and bg_transparent:
+        # An SVG already comes back with an empty background, so the box has no say there.
+        if output_format == "svg" and "svg" in openai_formats(model):
+            img_cfg["output_format"] = "svg"
+            img_cfg["svg"] = {"model": SVG_CONVERT_MODEL}
+        elif model in GPT_LADDER_MODEL_IDS and bg_transparent:
             img_cfg["background"] = "transparent"
             img_cfg["output_format"] = "png"
         # Said out loud even at the API's own default, so a change of default
@@ -4890,9 +5077,14 @@ def _start_generate_window():
     # ref_payloads is slot-indexed: position N-1 holds the bytes for [Image N],
     # or None for an empty slot. build_user_parts resolves [Image N] against it.
     ref_snapshots = p.get_effective_ref_images(model)
+    # Refused rather than sent without them: dropping a reference the person can
+    # see on screen would make a picture that ignores it, at the full price.
+    if p.output_format == "svg" and "svg" in openai_formats(model) and any(r is not None for r in ref_snapshots):
+        return jsonify({"ok": False, "svg_no_refs": True, "error": SVG_NO_REFS_ERROR})
     ref_payloads = [p.ref_image_to_bytes(r) if r is not None else None for r in ref_snapshots]
     img_cfg = _gen_img_cfg(model, p.aspect, p.resolution, p.quality, p.custom_w, p.custom_h,
-                           p.openai_bg_transparent, ref_snapshots, p.complexity)
+                           p.openai_bg_transparent, ref_snapshots, p.complexity,
+                           p.output_format, p.gif_size, p.gif_frames, p.gif_frame_ms)
     return _enqueue_batch(
         p, model=model, providers=providers, prompt=prompt, count=count,
         aspect=p.aspect, resolution=p.resolution, quality=p.quality,
@@ -5009,6 +5201,32 @@ def _start_generate_agent(p, d):
         return jsonify({"ok": False, "model": model, "field": "complexity",
                         "error": "bad_complexity", "allowed": openai_complexities(model)})
     complexity = complexity or p.complexity
+    # Same rule for the format and the GIF values: what was sent is checked, what
+    # was left out comes from the tab and is fitted to this model.
+    formats = openai_formats(model)
+    output_format = str(s.get("output_format") or "")
+    if output_format and output_format not in formats:
+        return jsonify({"ok": False, "model": model, "field": "output_format",
+                        "error": "bad_output_format", "allowed": formats})
+    output_format = output_format or (p.output_format if p.output_format in formats else "png")
+    gif_size, gif_frames, gif_frame_ms = p.gif_size, p.gif_frames, p.gif_frame_ms
+    if output_format == "gif":
+        if s.get("gif_size") not in (None, ""):
+            gif_size = str(s.get("gif_size"))
+            if gif_size not in GIF_FRAME_SIZES:
+                return jsonify({"ok": False, "model": model, "field": "gif_size",
+                                "error": "bad_gif_size", "allowed": list(GIF_FRAME_SIZES)})
+        most = GIF_FRAME_SIZES[gif_size]
+        if s.get("gif_frames") not in (None, ""):
+            gif_frames = _safe_int(s.get("gif_frames"), 0)
+            if not GIF_MIN_FRAMES <= gif_frames <= most:
+                return jsonify({"ok": False, "model": model, "field": "gif_frames",
+                                "error": "bad_gif_frames", "allowed": [GIF_MIN_FRAMES, most]})
+        if s.get("gif_frame_ms") not in (None, ""):
+            gif_frame_ms = _safe_int(s.get("gif_frame_ms"), 0)
+            if not GIF_FRAME_MS_RANGE[0] <= gif_frame_ms <= GIF_FRAME_MS_RANGE[1]:
+                return jsonify({"ok": False, "model": model, "field": "gif_frame_ms",
+                                "error": "bad_gif_frame_ms", "allowed": list(GIF_FRAME_MS_RANGE)})
     # A value the agent SENT that this model does not take -> refused with the
     # allowed list. A value it left out came from the tab and may belong to the
     # tab's own model (a 4K left from Pro, then the agent picks Lite) -> use the
@@ -5034,11 +5252,14 @@ def _start_generate_agent(p, d):
         return jsonify({"ok": False, "error": "No provider available"})
     os.makedirs(p.output_dir, exist_ok=True)
     ref_paths = d.get("ref_paths") or []
+    if output_format == "svg" and ref_paths:
+        return jsonify({"ok": False, "model": model, "field": "ref_paths", "error": "svg_no_refs"})
     snaps, payloads, err = _agent_refs(p, model, ref_paths)
     if err:
         return jsonify(dict({"ok": False}, **err))
     img_cfg = _gen_img_cfg(model, aspect, resolution, quality, custom_w, custom_h,
-                           bg_transparent, snaps, complexity)
+                           bg_transparent, snaps, complexity,
+                           output_format, gif_size, gif_frames, gif_frame_ms)
     for im in snaps:
         try:
             im.close()
@@ -5121,6 +5342,8 @@ def _enqueue_batch(p, *, model, providers, prompt, count, aspect, resolution, qu
                 "custom_h": custom_h,
                 "openai_bg_transparent": bool(img_cfg.get("background") == "transparent"),
                 "complexity": img_cfg.get("complexity", ""),
+                # img_cfg says "png" too, for a cut-out; this is about the file's kind.
+                "output_format": img_cfg.get("output_format") if img_cfg.get("output_format") in ("gif", "svg") else "png",
                 "billing_team_id": p.billing_team_id,
                 "billing_project_id": p.billing_project_id,
                 "img_cfg": dict(img_cfg),
@@ -6413,6 +6636,8 @@ def copy_to_clipboard():
     fp = d.get("filepath", "")
     if not fp or not os.path.exists(fp):
         return jsonify({"ok": False, "error": "File not found"})
+    if _is_svg_path(fp):
+        return jsonify({"ok": False, "error": "SVG는 이미지로 복사할 수 없습니다 — 폴더에서 파일을 써 주세요"})
     try:
         with Image.open(fp) as img:
             img.load()

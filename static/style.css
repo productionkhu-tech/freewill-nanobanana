@@ -583,6 +583,18 @@ textarea.prompt-box { min-height: 82px; }
 }
 .settings-grid label { font-size: 9px; }
 .settings-grid select { height: 32px; font-size: 11px; border-radius: 6px; }
+.settings-grid input[type="number"] {
+  width: 100%;
+  height: 32px;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 11px;
+  font-family: inherit;
+  padding: 0 10px;
+  box-sizing: border-box;
+}
 
 /* GPT-2 Custom pixel input */
 /* Stands in for the Resolution dropdown while Custom pixels are in use.
@@ -1312,6 +1324,31 @@ textarea.prompt-box { min-height: 82px; }
   max-width: 100% !important;
   object-fit: contain;
   background: #111113;
+}
+
+/* The model to reach for at each company: one accent, the groups already name the company.
+   Options and group labels are set explicitly because they otherwise inherit the closed
+   select's colour, which turned every group label accent-coloured. */
+#modelSelect.model-sota { color: var(--accent); font-weight: 600; }
+#modelSelect optgroup { color: var(--text2); font-weight: 600; font-style: normal; }
+#modelSelect option { color: var(--text); font-weight: 400; }
+#modelSelect option.model-sota { color: var(--accent); font-weight: 600; }
+.mp-name.model-sota { color: var(--accent); }
+
+/* GIF / SVG mark on a card. */
+.card-format-badge {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 14px;
+  letter-spacing: 0.04em;
+  pointer-events: none;
 }
 
 /* Cut-out generations (background: transparent). Against the flat card colour

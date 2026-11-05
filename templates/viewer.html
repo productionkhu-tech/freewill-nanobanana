@@ -759,8 +759,46 @@ function applyPromptFor(fp) {
   box.classList.toggle("empty", !txt);
 }
 
+// A canvas only ever paints one frame of an <img>, so a GIF is decoded frame by
+// frame and state.img is swapped on a timer. Fit, zoom, pan and the wipe all keep
+// working because a frame is drawn like any other image. Where ImageDecoder doesn't
+// exist (older browsers on a Mac) the first frame simply stays on screen.
+let _gif = null;
+async function playGif(seq, filepath) {
+  if (typeof ImageDecoder === "undefined") return;
+  try {
+    const r = await fetch(`/api/gallery/image?path=${encodeURIComponent(filepath)}`);
+    const dec = new ImageDecoder({ data: await r.arrayBuffer(), type: "image/gif" });
+    await dec.tracks.ready;
+    const total = dec.tracks.selectedTrack.frameCount;
+    if (total < 2) { dec.close(); return; }
+    const frames = [];
+    for (let i = 0; i < total; i++) {
+      const { image } = await dec.decode({ frameIndex: i });
+      // VideoFrame.duration is in microseconds.
+      frames.push({ bmp: await createImageBitmap(image), ms: Math.max(20, (image.duration || 200000) / 1000) });
+      image.close();
+      if (seq !== _loadSeq) { dec.close(); return; }   // moved on while decoding
+    }
+    dec.close();
+    const g = _gif = { timer: null };
+    let i = 0;
+    const tick = () => {
+      if (_gif !== g) return;
+      state.img = frames[i].bmp;
+      render();
+      g.timer = setTimeout(tick, frames[i].ms);
+      i = (i + 1) % frames.length;
+    };
+    tick();
+  } catch (e) {
+    console.warn("gif playback unavailable", e);
+  }
+}
+
 function loadImage(filepath) {
   const seq = ++_loadSeq;
+  if (_gif) { clearTimeout(_gif.timer); _gif = null; }
   currentPath = filepath;
   // Trust the cached snapshot when we have one. Previously this was forced to
   // false and only the network reply could restore it, which also meant the
@@ -790,6 +828,7 @@ function loadImage(filepath) {
       fit();
     }
     updateActButtons();   // corner panel dims come from the loaded image
+    if (/\.gif$/i.test(filepath)) playGif(seq, filepath);
   };
   img.onerror = () => {
     if (seq !== _loadSeq) return;

@@ -117,7 +117,7 @@
       <!-- Settings -->
       <div class="section-title">Settings</div>
       <div class="settings-grid">
-        <div>
+        <div id="aspectWrap">
           <label class="field-label">Aspect Ratio</label>
           <select id="aspectSelect">
             <option>1:1</option><option>2:3</option><option>3:2</option><option>3:4</option>
@@ -155,7 +155,27 @@
             <option>low</option><option>medium</option><option selected>high</option>
           </select>
         </div>
+        <!-- GPT Image 2.6 only: PNG, a looping GIF or an editable SVG -->
+        <div id="formatWrap" style="display:none">
+          <label class="field-label" title="결과 파일 형식. GIF: 반복 재생 애니메이션 / SVG: 크기를 키워도 깨지지 않는 벡터">Format</label>
+          <select id="outputFormatSelect" onchange="onOutputFormatChange()">
+            <option value="png" selected>PNG</option><option value="gif">GIF</option><option value="svg">SVG</option>
+          </select>
+        </div>
+        <div id="gifSizeWrap" style="display:none">
+          <label class="field-label" title="프레임 한 장의 크기. 768×768은 12프레임까지">Frame Size</label>
+          <select id="gifSizeSelect" onchange="onGifSizeChange()"></select>
+        </div>
+        <div id="gifFramesWrap" style="display:none">
+          <label class="field-label">Frames</label>
+          <select id="gifFramesSelect" onchange="onGifValueChange()"></select>
+        </div>
+        <div id="gifLengthWrap" style="display:none">
+          <label class="field-label" title="GIF가 한 번 도는 전체 길이(초). 프레임 수를 바꿔도 이 길이를 유지하고, 프레임당 시간은 알아서 맞춰집니다">Length (sec)</label>
+          <input type="number" id="gifSecInput" min="0.1" step="0.1" onchange="onGifValueChange()">
+        </div>
       </div>
+      <p class="hint" id="formatHint" style="display:none"></p>
 
       <!-- GPT Image 2.5 / 2.6 only: ask the model for a cut-out (alpha PNG) -->
       <div id="bgTransparentRow" style="display:none">

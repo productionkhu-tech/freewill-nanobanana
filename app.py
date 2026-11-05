@@ -115,9 +115,11 @@ def openai_start_quality(model, prefs=None):
     """Quality 를 고른 적 없는 탭이 이 모델에서 시작할 값 — 모델 설정의 값, 없으면 그 모델의 맨 위.
     static/app.js 의 preferredQuality 와 같은 규칙이다(MODEL_SPECS 의 defaultQuality)."""
     levels = openai_qualities(model)
-    pref = ((prefs or {}).get("default_quality") or {}).get(_normalize_model_name(model))
-    if pref in levels:
-        return pref
+    # 모델 설정의 스위치를 끄면 이 칸도 쉰다 — 화면에서 함께 꺼져 있다.
+    if prefs and not prefs.get("keep_panel"):
+        pref = (prefs.get("default_quality") or {}).get(_normalize_model_name(model))
+        if pref in levels:
+            return pref
     return "max" if "max" in levels else "high"
 
 

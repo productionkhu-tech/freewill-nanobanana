@@ -1427,8 +1427,8 @@ function preferredQuality(model) {
     const q = _nearestByRank(list, _qualityPick, _QUALITY_RANK);
     if (q) return q;
   }
-  // 모델 설정의 시작 Quality. 안 정했으면 그 모델의 맨 위 — 서버의 openai_start_quality 와 같은 규칙.
-  const pref = (_modelPrefs.default_quality || {})[migrateModelId(model)];
+  // 모델 설정의 시작 Quality. 스위치를 껐거나 안 정했으면 그 모델의 맨 위 — 서버의 openai_start_quality 와 같은 규칙.
+  const pref = _modelPrefs.keep_panel ? "" : (_modelPrefs.default_quality || {})[migrateModelId(model)];
   if (pref && list.includes(pref)) return pref;
   const d = spec.defaultQuality;
   if (d && list.includes(d)) return d;
@@ -1847,7 +1847,7 @@ function openModelPrefs() {
     qSel.dataset.model = m;
     const qList = spec.showQuality ? (spec.qualities || []) : [];
     if (!qList.length) {
-      qSel.disabled = true;
+      qSel.dataset.fixed = "1";
       const o = document.createElement("option");
       o.value = ""; o.textContent = "—";
       qSel.appendChild(o);
@@ -1888,10 +1888,11 @@ function _syncModelStartToggle() {
   t.classList.toggle("active", on);
   t.setAttribute("aria-checked", String(on));
   document.getElementById("mpResHead").classList.toggle("off", !on);
+  document.getElementById("mpQualityHead").classList.toggle("off", !on);
   document.getElementById("mpDesc").textContent = on
     ? "체크를 끄면 목록에서 숨겨지고, 화질·Quality는 그 모델로 바꿀 때 처음 선택될 값입니다."
-    : "체크를 끄면 목록에서 숨겨집니다. 모델을 바꿔도 패널의 값을 그대로 쓰고, 그 모델에 없는 값이면 가장 가까운 값으로 옮깁니다 (1K → 2K). Quality는 탭에서 고른 적 없을 때만 오른쪽 값으로 시작합니다.";
-  document.querySelectorAll("#modelPrefsRows select.mp-res").forEach(sel => {
+    : "체크를 끄면 목록에서 숨겨집니다. 모델을 바꿔도 패널의 값을 그대로 쓰고, 그 모델에 없는 값이면 가장 가까운 값으로 옮깁니다 (1K → 2K). Quality를 고른 적 없으면 최대 화질로 시작합니다.";
+  document.querySelectorAll("#modelPrefsRows select.mp-res, #modelPrefsRows select.mp-q").forEach(sel => {
     sel.disabled = !on || !!sel.dataset.fixed;
   });
 }
@@ -1910,7 +1911,7 @@ async function saveModelPrefs() {
   });
   const default_quality = {};
   box.querySelectorAll("select.mp-q").forEach(sel => {
-    if (!sel.disabled && sel.value) default_quality[sel.dataset.model] = sel.value;
+    if (!sel.dataset.fixed && sel.value) default_quality[sel.dataset.model] = sel.value;
   });
   const d = await api("/api/model-prefs", { method: "POST", body: { hidden, default_res, default_quality, keep_panel: _mpKeepDraft } });
   if (!d.ok) { showToast(d.error || "저장 실패", "error"); return; }

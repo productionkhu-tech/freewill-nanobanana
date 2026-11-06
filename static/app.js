@@ -1148,6 +1148,8 @@ async function saveSettings(opts) {
 // aspects[0] === "auto" is the UI sentinel (shown as "Auto"); its select value
 // is the lowercase "auto" the backend keys on. defaultAspect/Resolution are the
 // value SELECTED by default and the fallback when a loaded value isn't offered.
+// refLimit is the server's get_ref_limit in numbers: the screen asks the server, the
+// studio connector reads it from this table before it sends. Keep the two equal.
 const MODEL_SPECS = {
   "gemini-2.5-flash-image": {
     aspects: ["auto","1:1","2:3","3:2","3:4","4:3","4:5","5:4","9:16","16:9","21:9"],
@@ -1156,6 +1158,7 @@ const MODEL_SPECS = {
     showQuality: false,
     defaultAspect: "16:9", defaultResolution: "1K",
     hint: "10 RPM limit — auto-throttled to ~8 RPM",
+    refLimit: 3,
     refHint: "Flash model supports up to 3 reference images.",
   },
   "gemini-3-pro-image": {
@@ -1165,6 +1168,7 @@ const MODEL_SPECS = {
     showQuality: false,
     defaultAspect: "16:9", defaultResolution: "2K",
     hint: "10 RPM limit — auto-throttled to ~8 RPM",
+    refLimit: 14,
     refHint: "3rd-gen models support up to 14 reference images.",
   },
   "gemini-3.1-flash-image": {
@@ -1174,6 +1178,7 @@ const MODEL_SPECS = {
     showQuality: false,
     defaultAspect: "16:9", defaultResolution: "2K",
     hint: "10 RPM limit — auto-throttled to ~8 RPM",
+    refLimit: 14,
     refHint: "3rd-gen models support up to 14 reference images.",
   },
   // Nano Banana 2.1 (2026-10). NB2 의 후속 — 비율은 NB2 와 같고(1:8 등 확장 포함),
@@ -1185,6 +1190,7 @@ const MODEL_SPECS = {
     showQuality: false,
     defaultAspect: "16:9", defaultResolution: "2K",
     hint: "Nano Banana 2.1 — thinking high. 10 RPM limit — auto-throttled to ~8 RPM",
+    refLimit: 14,
     refHint: "3rd-gen models support up to 14 reference images.",
   },
   "gemini-3.1-flash-lite-image": {
@@ -1194,6 +1200,7 @@ const MODEL_SPECS = {
     showQuality: false,
     defaultAspect: "16:9", defaultResolution: "1K",
     hint: "Lite: ultra-fast & low-cost. 1K only (2K/4K unsupported).",
+    refLimit: 14,
     refHint: "3rd-gen models support up to 14 reference images.",
   },
   // 5.0 Pro / Flash (BytePlus doc 2026-10): 1K / 1.5K / 2K. 1.5K is billed like
@@ -1205,6 +1212,7 @@ const MODEL_SPECS = {
     showQuality: false,
     defaultAspect: "16:9", defaultResolution: "2K",
     hint: "BytePlus Seedream 5.0 Pro - high precision. 1K/1.5K/2K, png. 1.5K costs the same as 1K.",
+    refLimit: 10,
     refHint: "Up to 10 reference images. Mention them as 'image 1', 'image 2' in the prompt.",
   },
   "seedream-5-0-flash-260915": {
@@ -1214,6 +1222,7 @@ const MODEL_SPECS = {
     showQuality: false,
     defaultAspect: "16:9", defaultResolution: "2K",
     hint: "BytePlus Seedream 5.0 Flash - faster and cheaper than Pro ($0.018/image at any size). 1K/1.5K/2K, png.",
+    refLimit: 10,
     refHint: "Up to 10 reference images. Mention them as 'image 1', 'image 2' in the prompt.",
   },
   "seedream-4-5-251128": {
@@ -1223,6 +1232,7 @@ const MODEL_SPECS = {
     showQuality: false,
     defaultAspect: "16:9", defaultResolution: "2K",
     hint: "BytePlus Seedream 4.5 - jpeg. 2K/4K.",
+    refLimit: 14,
     refHint: "Up to 14 reference images. Mention them as 'image 1', 'image 2' in the prompt.",
   },
   "gpt-image-2": {
@@ -1233,6 +1243,7 @@ const MODEL_SPECS = {
     qualities: ["low","medium","high","auto"],
     defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "high",
     hint: "OpenAI Image API — generation may take up to ~2 min.",
+    refLimit: 16,
     refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
   },
   // GPT Image 2.5 (2026-09-08). Same size rules as gpt-image-2 to the digit,
@@ -1249,6 +1260,7 @@ const MODEL_SPECS = {
     showBackground: true,
     defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "max",
     hint: "GPT Image 2.5 Fast — quick everyday generation. Starts at max quality.",
+    refLimit: 16,
     refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
   },
   "gpt-image-2.5-sunburst": {
@@ -1260,6 +1272,7 @@ const MODEL_SPECS = {
     showBackground: true,
     defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "max",
     hint: "GPT Image 2.5 Heavy — editing precision. Starts at max quality.",
+    refLimit: 16,
     refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
   },
   // GPT Image 2.6 (2026-11). Everything 2.5 has, measured the same; what it adds
@@ -1276,6 +1289,7 @@ const MODEL_SPECS = {
     complexities: ["low","medium","high"],
     defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "max", defaultComplexity: "high",
     hint: "GPT Image 2.6 Fast — quick iteration. Starts at max quality.",
+    refLimit: 16,
     refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
   },
   "gpt-image-2.6-sunburst": {
@@ -1289,6 +1303,7 @@ const MODEL_SPECS = {
     complexities: ["low","medium","high"],
     defaultAspect: "1:1", defaultResolution: "1K", defaultQuality: "max", defaultComplexity: "high",
     hint: "GPT Image 2.6 Heavy — detailed visual work. Starts at max quality.",
+    refLimit: 16,
     refHint: "Auto matches the 1st reference's ratio. [Image N] tags don't work — describe refs in the prompt.",
   },
 };

@@ -3,7 +3,7 @@
 멀티 프로바이더 AI 이미지 생성 데스크톱 앱 (Flask + pywebview + PyInstaller).
 이 문서 하나로 **구조 · 원리 · 규칙 · 배포 · 관리**를 파악할 수 있게 씁니다. 낡은 내용을 발견하면 즉시 고칠 것.
 
-> 최종 갱신: 2026-11-05 (v2026-11-0504 기준 — 저장한 팀·프로젝트 유지 §2.3, 모델 설정 스위치·시작 Quality §6.1, 에이전트 요청에 앱 값 안 섞음 §2.2, GIF 비교 제외)
+> 최종 갱신: 2026-11-06 (v2026-11-0601 기준 — 호출자 batch_id·실패의 과금 표시·check_only·연결 대기 탭 §2.2, 200 뒤 실패도 사용량 기록 §6.1.1, 격리 시험 승인 요청 차단 규칙 17)
 
 ---
 
@@ -126,9 +126,9 @@ NanoBanana.exe 실행
 ```
 | 요청 | 하는 일 |
 |---|---|
-| `GET /api/projects` | `agent_pid: true`·`features:["agent_pid","agent_model_defaults"]`(기능 확인), 탭마다 `pid·name·generating·billing_confirmed` |
-| `POST /api/generate` `{pid, prompt, settings:{model,aspect,resolution,quality,complexity,count,custom_w,custom_h,openai_bg_transparent,output_format,gif_size,gif_frames,gif_frame_ms}, ref_paths:[..]}` | 그 탭에 생성 → `{ok, batch_id, pid, count, queued, outstanding}`. pid 가 없으면 예전 그대로(화면 탭의 입력칸 = 창의 Generate) |
-| `GET /api/batch?pid=&batch_id=` | 그 묶음의 `count·done·failed·cancelled·pending·finished·images·errors`. `finished` 면 더 올 것 없음 |
+| `GET /api/projects` | `agent_pid: true`·`features:["agent_pid","agent_model_defaults","caller_batch_id","batch_billing","check_only","waiting_tabs"]`(기능 확인), 탭마다 `pid·name·generating·billing_confirmed`, `waiting_tabs:[{name,path,missing_since}]`(드라이브가 안 붙어 못 연 지난 탭 — pid 없음, 같은 이름으로 새로 만들면 둘이 된다) |
+| `POST /api/generate` `{pid, prompt, settings:{model,aspect,resolution,quality,complexity,count,custom_w,custom_h,openai_bg_transparent,output_format,gif_size,gif_frames,gif_frame_ms}, ref_paths:[..], batch_id?, check_only?}` | 그 탭에 생성 → `{ok, batch_id, pid, count, queued, outstanding, sends, custom_changed?}`(`sends` = 프로바이더에 실제로 나갈 값). pid 가 없으면 예전 그대로(화면 탭의 입력칸 = 창의 Generate), 단 `batch_id`·`check_only` 를 pid 없이 보내면 `pid_required` |
+| `GET /api/batch?pid=&batch_id=` | 그 묶음의 `count·done·failed·cancelled·pending·finished·preparing·billed·billed_failed·billing_unknown·images·errors`. `finished` 면 더 올 것 없음 |
 | `GET /api/gallery?pid=&strict=1&batch_id=` | 그 묶음의 이미지 (항목마다 `batch_id`) |
 | `GET /api/settings?pid=` · `/api/refs?pid=` · `/api/billing/state?pid=` | 그 탭 읽기 (엄격) |
 | `POST /api/stop {pid}` | 그 탭만 멈춤 |
@@ -145,6 +145,11 @@ NanoBanana.exe 실행
 - 크기 계산은 창·에이전트 모두 `_gen_img_cfg` 하나. 갤러리 "Load setup" 은 에이전트 프롬프트를 섹션 하나로 돌려준다
 - 창 쪽 표시: `batch_started` 이벤트(탭 줄 점이 첫 장이 아니라 시작부터 켜짐. 에이전트 묶음이면 "에이전트가 'X' 탭에서
   N장 생성을 시작했습니다" 토스트), `projects_changed`(탭 줄 다시 그림), 팀·프로젝트 미설정 탭의 "!" 표시
+- **호출자가 만드는 `batch_id`** (2026-11-06~, 영문·숫자·`-`·`_` 8~64자, **앱 전체에서 하나**): 연결이 끊겨도 돈이 두 번 안 나가게 하는 칸. 받자마자 `_batch_claims` 로 잡는다(레퍼런스 인코딩 전, 4K 12장이면 30초 가까이 걸린다) — 그동안 `/api/batch` 는 `preparing:true`. 이미 쓴 id 면 생성 없이 `{ok, duplicate:true, preparing, batch_id, pid, count}`. 열린 탭 전부의 집계·갤러리에서 찾는다(재시작하면 pid 가 새로 매겨져 같은 pid 가 다른 탭일 수 있다 — 그 탭 과금으로 또 만들면 안 된다). 답의 `pid` 가 있는 곳. 거절된 요청은 잡은 id 를 놓는다 → `no_such_batch` 면 같은 id 로 다시 보내도 안전. 잡아 둔 id 를 탭의 `batches` 에 넣지 말 것 — 앞 워커가 끝날 때 닫아 버린다. **안 끝난 묶음은 50개 정리에서 밀어내지 않는다**(`count` 1 묶음 51개가 큐에 있으면 첫 id 를 잃고 두 번 생성됐다). **레퍼런스 인코딩을 큐 뒤로 옮기지는 않았다**(돈 나가는 경로를 건드리는 데 비해 이 칸으로 문제가 이미 풀린다)
+- **`/api/batch` 의 돈** (2026-11-06~, 장 단위): `billed` 값이 나간 장, `billed_failed` 그중 실패·취소, `billing_unknown` 실패·취소인데 모르는 장(시간 초과·끊김, 사용량 없는 200, 워커 사고, SDK 가 안에서 다시 시도한 끝의 오류 — 앞 시도가 안 보인다). **실패한 묶음을 다시 보내도 돈이 더 안 나가는 건 뒤의 둘이 모두 0 일 때뿐이다.** PNG 라고 공짜가 아니다 — 제미나이는 이미지 없이 끝나도 청구된다(§6.1.1). 판단은 `_ImageAttempts`·`_result_charge`·`_may_have_billed`. OpenAI SDK 의 자체 재시도(`max_retries` 기본 2)는 그대로 두고 `x-stainless-retry-count` 로 알아본다 — 끄면 재시도 간격이 앱 쪽 10초대로 바뀐다
+- **`check_only`** (2026-11-06~): 실제 생성과 같은 검사(거절 답도 똑같다)를 하고 `{ok, check_only:true, pid, model, count, aspect, resolution, quality, sends, custom_changed?, ignored, outstanding, queue_full, stopping}` 만 돌려준다. 생성·큐·묶음·탭·이벤트·과금 선택 전부 그대로(`_billing_gate(write=False)`), 폴더도 안 만들고 PNG 인코딩도 안 한다. `false·0·"false"·"0"·"no"·"off"` 외엔 전부 켬(돈이 안 나가는 쪽으로 읽는다). 큐가 찼거나 멈추는 중이면 값은 맞으니 거절하지 않고 `queue_full`·`stopping` 으로 알린다 — 그 상태로 보내면 잠깐 거절된다
+- **본문을 못 읽으면 `bad_json`** (2026-11-06~). 창은 본문 없이 보낸다. 예전엔 깨진 JSON·`text/plain` 이 빈 요청으로 읽혀 창의 Generate 로 떨어졌다 — 화면 탭에서 진짜 생성된다. Content-Type 은 안 본다(`force=True`)
+- **커넥터는 `features` 를 보고 보낼 것.** 옛 앱은 `batch_id`·`check_only` 를 모르고 **그대로 생성해 돈이 나간다**
 - **묶음 집계는 메모리에만** (탭마다 최근 50개, 재시작하면 사라짐 → 그땐 갤러리 `batch_id` 로). `_batch_open` 은
   `pending_jobs_lock` 안에서(일이 워커에 보이기 전에). 워커가 끝날 때 못 끝난 묶음 닫기(Stop → cancelled, 사고 →
   failed)도 **같은 락 안에서** — 밖에서 하면 그 틈에 들어온 다음 묶음까지 닫아 버린다
@@ -262,7 +267,10 @@ gen_worker:
     v2026-08-0501까지 백그라운드 탭 배치가 자동 업데이트에 통째로 날아갔다
 17. **테스트 스크립트로 app.py를 import 할 땐 `NANOBANANA_DATA_DIR` + 임시 프로젝트 폴더 필수.**
     안 하면 `_save_session()`이 사용자의 실제 `~/.nanobanana/session.json`을 덮어써
-    다음 실행 때 열려 있던 탭이 전부 바뀐다 (2026-08-07 실제로 발생)
+    다음 실행 때 열려 있던 탭이 전부 바뀐다 (2026-08-07 실제로 발생).
+    이 변수가 걸리면 사용량 업로드·평문 정리·**승인 요청**이 꺼진다. 다시 켜는 건 각각 `NANOBANANA_USAGE_UPLOAD=1`·
+    `NANOBANANA_SCRUB=1`·`NANOBANANA_ENROLL=1`. 승인 요청은 2026-11-06 부터다(`nb_gateway.enroll_blocked`) — 그 전 빌드에선 격리 시험의 `init_app` 한 번마다
+    실제 게이트웨이로 `/enroll/request` 가 나갔다(11/5 커넥터 시험에서 10건, 발급 0건, 1시간 뒤 만료). 그래도 시험에선 `A._init_keys = lambda: None` 을 먼저 걸 것
 18. **UI 목록을 `innerHTML = ""`로 통째로 다시 그리지 말 것.** 갤러리·탭 스트립은 이미지가
     완성될 때마다 갱신되므로 전체 재생성은 화면 깜빡임 + 썸네일 재요청 + 드래그 취소를 부른다.
     키(파일경로 / pid) 기반으로 DOM을 재사용할 것
@@ -402,7 +410,7 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   (`<img>` 로는 스크립트가 안 돌지만 주소로 직접 열면 돈다). 레퍼런스·복사: GIF 는 첫 프레임, SVG 는 안내 후 거절
 - **모델 메뉴의 별표** (v2026-11-0502~): 회사별 그룹 + 회사마다 최고 모델 하나 `SOTA_MODELS`(app.js, 지금 `gemini-3-pro-image`·`gpt-image-2.6-sunburst`·`seedream-5-0-pro-260628`).
   표시는 `★` + 강조색 하나(`--accent`), 화면에 "SOTA" 글자는 쓰지 않는다 — 회사별 색과 글자는 사용자가 빼라고 했다, 회사는 그룹 이름이 말한다. 판단으로 고른 값이다 — 구글은 문서가 "premium choice" 라 한 Pro 로,
-  2.1 은 "workhorse". 메뉴 순서는 `_MODEL_MENU_ORDER`(OpenAI·시드림은 최신·상위부터). **새 모델을 넣을 때 이 두 목록을 같이 볼 것**
+  2.1 은 "workhorse". 메뉴 순서는 `_MODEL_MENU_ORDER`(OpenAI·시드림은 최신·상위부터). **새 모델을 넣을 때 이 두 목록을 같이 볼 것** — `MODEL_SPECS[].refLimit`(커넥터가 보내기 전에 읽는다)도 `get_ref_limit` 과 같게 넣을 것
 - **모델 설정의 "모델별 시작 화질" 스위치** (2026-11-05~): 켜짐(기본) = 모델을 바꾸면 그 모델의 시작 화질(`default_res`, 없으면 최고)·Quality 시작값. 꺼짐(`model_prefs.keep_panel=true`) = Ratio·Count 처럼 패널 값 유지 —
   해상도·Quality·Complexity 모두. 그 모델에 없는 값은 가장 가까운 값으로(`_nearestByRank`, 같은 거리면 높은 쪽: 1K 가 없으면 2K, 1.5K → 2K, 4K → 2K) 옮기고 토스트로 알린다. Quality 를 같이 묶은 건 해상도만 고정하면 모델을 바꿀 때마다 max 로 올라가 값이 새기 때문.
   사람이 고른 값은 `_panelWant` 에 따로 둔다 — 4K → 시드림 5.0(2K) → Pro 면 4K 로 돌아온다. `loadSettings`·모델 설정 저장·Reset Setup 때 비운다(재시작·탭 전환·Load 뒤엔 그 값부터). 다른 탭을 닫을 땐 안 비운다. 꺼 둔 동안에도 `default_res` 는 지우지 않는다(다시 켜면 그대로). prefs.json 이라 업데이트해도 유지. 표시 체크박스는 스위치와 무관.
@@ -444,6 +452,8 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   **이 키는 이미지 전용이 아니다** — 9/24 에 SVG 와 무관한 gpt-5.5 $0.64 가 있어 날짜로 잘랐다. 같은 키로 gpt-5.5 를 다른 데 쓰면 SVG 변환비로 잡히니 다른 키로 할 것
 - **이미지 없이 끝난 Gemini 응답도 청구된다.** 한 장을 만들기까지의 모든 시도(무이미지 재시도, Studio↔Vertex
   전환)를 합산하고, 끝내 실패·취소돼도 청구된 토큰은 `images=0` 행으로 남긴다. 오류(4xx/5xx)는 청구 안 됨 → 안 남김
+- **OpenAI·시드림도 200 을 받은 뒤의 실패를 남긴다** (2026-11-06~, 셋 다 `_ImageAttempts`). 예전엔 GIF·SVG 파일이 깨진 경우만 남고, 빈 응답·못 읽는 PNG 는 값이 나갔는데 기록이 없었다.
+  토큰 과금은 `images=0`, **시드림은 장수 과금이라 `generated_images` 를 그대로 둔다** — 0 으로 두면 공짜로 집계된다(`COST_USD` 가 images × 장당가). 그래서 시드림의 이런 행은 리포트의 `failed` 로 안 잡힌다. 파일을 못 읽어 픽셀을 모르니(`out_px=0`) 5.0 Pro 2K 도 낮은 구간 단가로 잡힌다(장당 $0.045 적게, 드문 경우라 그대로 둠)
 - 게이트웨이: `usage_events.out_text_tokens`, `prices.out_text_per_m`(gateway/usage3.sql). `COST_USD` 가 둘을 곱한다.
   워커는 `images=0` 을 1 로 바꾸지 않는다. 리포트의 `failed_attempts`/`failed_cost_*` 는 합계에 이미 들어 있는 몫을 보여줄 뿐
 - 새 모델을 넣을 땐 **텍스트·생각 단가까지** 단가표에 넣을 것(가격 페이지의 "text and thinking" 줄)
@@ -499,7 +509,7 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 | 저장한 프로젝트인데 켜자 팀·프로젝트를 다시 물음 | 그 팀·프로젝트가 목록에서 빠짐(시트 종료·관리자 보관) 또는 파일에 값 하나가 빔 | 정상. 창의 안내대로 다시 고름 (§2.3) |
 | 에이전트 요청이 `needs_billing` | 그 탭 팀·프로젝트 미설정 또는 목록에서 빠짐 | 사람이 탭의 "!" 또는 우클릭 "팀·프로젝트…" (탭을 안 옮기고 고름) |
 | 에이전트 요청이 `bad_aspect` 등 | 그 모델이 모르는 값을 보냄 | 응답의 `allowed` 중에서 다시 (§2.2) |
-| `/api/batch` 가 `no_such_batch` | 앱 재시작(집계는 메모리) 또는 그 탭의 최근 50개 밖 | 갤러리 `?batch_id=` 로 찾기 |
+| `/api/batch` 가 `no_such_batch` | 안 들어갔거나 거절됨, 앱 재시작(집계는 메모리), 또는 그 탭의 최근 50개 밖 | 갤러리 `?batch_id=` 로 찾기. 호출자 id 면 같은 id 로 다시 보내도 두 번 안 만든다 |
 
 ---
 

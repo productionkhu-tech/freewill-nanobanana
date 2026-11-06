@@ -391,6 +391,13 @@ def was_cut_off(data_dir):
     return bool(meta.get("dropped_at")) and not meta.get("token")
 
 
+def enroll_blocked():
+    """Isolated data folder = a test (CLAUDE.md rule 17): it has no token, so every run
+    would ask the real gateway to let this PC in. NANOBANANA_ENROLL=1 when that is the
+    point of the test."""
+    return bool(os.environ.get("NANOBANANA_DATA_DIR")) and os.environ.get("NANOBANANA_ENROLL") != "1"
+
+
 def enroll(data_dir, url, app_version="", log=None):
     """Ticket enrolment: trade the ticket for a personal token and keep it.
 
@@ -400,6 +407,8 @@ def enroll(data_dir, url, app_version="", log=None):
         if log:
             log(m)
 
+    if enroll_blocked():
+        return None, "gateway: enrollment off (isolated data dir)"
     tk = ticket()
     if not tk:
         return None, "gateway: no ticket on this machine"    # WHY_NO_TICKET
@@ -588,6 +597,8 @@ def request_enrollment(data_dir, app_version=""):
     """Ask the admin to let this PC in. Reuses this PC's own open request (so a
     restart keeps the same number). Returns {"code", "req_id", ...}.
     Raises GatewayError."""
+    if enroll_blocked():
+        raise GatewayError("isolated", "enrollment off (isolated data dir)")
     url = gateway_url(data_dir)
     if not url:
         raise GatewayError("no_url", "gateway address not found")

@@ -547,6 +547,73 @@ def _extract_usage(provider, result_obj, pil=None, file_px=None):
 _USAGE_TOKEN_KEYS = ("in_text_tokens", "in_image_tokens", "out_tokens", "out_text_tokens")
 
 
+def _may_have_billed(e):
+    """이 예외로 끝난 시도에 값이 나갔을 수 있나. HTTP 오류 상태(4xx/5xx)는 프로바이더가 답하고 거절한 것이라
+    청구되지 않는다. 그 밖(시간 초과·끊김)은 요청이 나갔는데 답을 못 받은 것이라 여기서는 알 수 없다."""
+    if hasattr(e, "no_answer"):     # call_api 가 삼킨 시도까지 합쳐 알려 준다
+        return bool(e.no_answer)
+    if str(e) == "Cancelled":       # 멈춤: 이번 시도는 나가지 않았다
+        return False
+    code = getattr(e, "status_code", None) or getattr(e, "code", None)
+    if not (isinstance(code, int) and 400 <= code < 600):
+        return True
+    # OpenAI SDK(시드림도 같은 SDK)는 시간 초과·429·5xx 를 안에서 다시 시도하고 마지막 오류만 보여 준다.
+    # 다시 시도한 끝의 오류면 앞 시도가 어땠는지 여기서는 보이지 않는다.
+    headers = getattr(getattr(e, "request", None), "headers", None) or {}
+    return headers.get("x-stainless-retry-count", "0") != "0"
+
+
+class _ImageAttempts:
+    """한 장을 만드느라 프로바이더에 든 값 — 그 장의 시도 전부의 합.
+
+    값은 결과가 아니라 요청에 붙는다. 200 을 받은 시도는 그 뒤에 파일이 깨져 실패해도 이미 청구됐고, 답을 못 받은
+    시도는 청구됐는지 알 수 없다. 사용량 기록과 /api/batch 가 이걸 본다. images 는 그림이 나왔을 때의 1 이거나
+    프로바이더가 센 장 수(시드림 generated_images — 장수로 청구한다)라, 토큰 과금 모델의 실패는 0 장으로 남는다."""
+
+    def __init__(self):
+        self.used, self.api, self.lost = None, "", False
+
+    def add(self, api, resp, pil=None):
+        u = _extract_usage(api, resp, pil)
+        if self.used is None:
+            self.used = u
+        else:
+            for k in _USAGE_TOKEN_KEYS + ("images",):
+                self.used[k] += u[k]
+            self.used["out_px"] = u["out_px"]
+        self.api = api
+        return self.used
+
+    def image(self, api, resp, pil=None, file_px=None):
+        """add 로 이미 더한 응답에서 그림이 나왔다 — 토큰은 그대로 두고 장 수와 픽셀만 적는다."""
+        u = _extract_usage(api, resp, pil, file_px)
+        self.used["images"] = max(self.used["images"], u["images"])
+        self.used["out_px"] = u["out_px"]
+        return self.used
+
+    def saw(self, e):
+        if _may_have_billed(e):
+            self.lost = True
+
+    def end(self, r):
+        """실패·취소로 끝날 때 — 이미 청구된 시도가 있으면 그 사용량을 달고 나간다."""
+        if r.get("status") != "success":
+            if self.used is not None:
+                r["usage"] = dict(self.used)
+                r.setdefault("api_used", self.api)
+            if self.lost:
+                r["maybe_billed"] = True
+        return r
+
+
+def _result_charge(result):
+    """실패·취소로 끝난 한 장에 값이 나갔나: "yes" | "unknown"(답을 못 받았거나 사용량 없는 200) | None."""
+    u = result.get("usage")
+    if u and any(u.get(k) for k in _USAGE_TOKEN_KEYS + ("images",)):
+        return "yes"
+    return "unknown" if (u is not None or result.get("maybe_billed")) else None
+
+
 def _model_file_prefix(model):
     """Default-naming filename prefix reflecting which model made the image:
     GP2 (gpt-image-2), GP25 (GPT Image 2.5), GP26 (GPT Image 2.6),
@@ -1271,6 +1338,7 @@ class AppState:
 
     def call_api(self, model, contents, config, preferred_provider=None):
         errors = []
+        no_answer = False       # a provider got the request and we never heard back
         providers = self.build_provider_order(preferred_provider)
         for i, provider in enumerate(providers):
             client = self.get_provider_client(provider)
@@ -1279,7 +1347,10 @@ class AppState:
             limiter = self.get_provider_limiter(provider)
             _wait_t = time.time()
             if limiter and not limiter.acquire(should_cancel=lambda: self.cancel_flag):
-                raise RuntimeError("Cancelled")
+                # The provider before this one may have timed out: keep that on the way out.
+                stopped = RuntimeError("Cancelled")
+                stopped.no_answer = no_answer
+                raise stopped
             # Every image in a batch is dispatched at once, but the shared
             # per-provider limiter releases them one at a time (Gemini: 8/min).
             # Saying so makes the very different per-image times on the cards
@@ -1299,6 +1370,7 @@ class AppState:
                 err_text = str(e)
                 self.log(f"{label} failed ({time.time()-t:.1f}s): {err_text[:80]}")
                 errors.append(f"{provider}: {err_text[:120]}")
+                no_answer = no_answer or _may_have_billed(e)
                 if provider == "vertex" and "invalid_grant" in err_text.lower():
                     self.disable_vertex_for_session("invalid_grant")
                 if i < len(providers) - 1 and self.should_fallback(provider, err_text):
@@ -1306,10 +1378,11 @@ class AppState:
                     self.log(f"-> {self.get_provider_label(next_p)} fallback")
                     continue
                 break
-        if not errors:
-            # No client at all (the PC was cut off mid-batch, or keys never arrived).
-            raise RuntimeError(_no_client_error("Gemini"))
-        raise RuntimeError(f"All providers failed: {'; '.join(errors)}")
+        # No client at all (the PC was cut off mid-batch, or keys never arrived).
+        failure = RuntimeError(f"All providers failed: {'; '.join(errors)}" if errors
+                               else _no_client_error("Gemini"))
+        failure.no_answer = no_answer
+        raise failure
 
     def extract_image_from_response(self, resp):
         if not (resp.candidates and resp.candidates[0].content and resp.candidates[0].content.parts):
@@ -2396,18 +2469,19 @@ class AppState:
         max_retries = 5
         delay = 10
         start = time.time()
+        tries = _ImageAttempts()
         for attempt in range(max_retries):
             if self.cancel_flag:
-                return {"status": "cancelled", "index": idx, "seed": seed}
+                return tries.end({"status": "cancelled", "index": idx, "seed": seed})
             limiter = self.openai_rate_limiter
             if limiter and not limiter.acquire(should_cancel=lambda: self.cancel_flag):
-                return {"status": "cancelled", "index": idx, "seed": seed}
+                return tries.end({"status": "cancelled", "index": idx, "seed": seed})
             keys_before = _keys_rt["ids"]
             # Read per attempt: a key reload may have swapped it, or a cut-off dropped it.
             client = self.client_openai
             if client is None:
-                return {"status": "failed", "index": idx, "seed": seed,
-                        "error": _no_client_error("OpenAI"), "elapsed": time.time() - start}
+                return tries.end({"status": "failed", "index": idx, "seed": seed,
+                                  "error": _no_client_error("OpenAI"), "elapsed": time.time() - start})
             try:
                 self.log(f"{label} requesting...")
                 t = time.time()
@@ -2447,21 +2521,23 @@ class AppState:
                         **extra,
                     )
                 self.log(f"{label} OK ({time.time()-t:.1f}s)")
+                # From here on it is paid for, whatever happens to the file.
+                tries.add("openai", result)
                 data_list = getattr(result, "data", None) or []
                 if not data_list:
                     self.log(f"[{idx+1}] No image in OpenAI response (attempt {attempt+1})")
                     if attempt < max_retries - 1:
                         if not self.sleep_with_cancel(3):
-                            return {"status": "cancelled", "index": idx, "seed": seed}
+                            return tries.end({"status": "cancelled", "index": idx, "seed": seed})
                         continue
-                    return {"status": "failed", "index": idx, "seed": seed,
-                            "error": "No image in response",
-                            "elapsed": time.time() - start}
+                    return tries.end({"status": "failed", "index": idx, "seed": seed,
+                                      "error": "No image in response",
+                                      "elapsed": time.time() - start})
                 b64 = getattr(data_list[0], "b64_json", None)
                 if not b64:
-                    return {"status": "failed", "index": idx, "seed": seed,
-                            "error": "OpenAI returned no b64_json (url mode unsupported)",
-                            "elapsed": time.time() - start}
+                    return tries.end({"status": "failed", "index": idx, "seed": seed,
+                                      "error": "OpenAI returned no b64_json (url mode unsupported)",
+                                      "elapsed": time.time() - start})
                 raw = base64.b64decode(b64)
                 fmt = img_cfg.get("output_format")
                 if fmt in ("gif", "svg"):
@@ -2472,23 +2548,23 @@ class AppState:
                         self.log(f"[{idx+1}] OpenAI returned a file that is not {fmt}")
                         # Not retried: this attempt is already billed and asking again
                         # is not likely to change what the model does with this request.
-                        return {"status": "failed", "index": idx, "seed": seed,
-                                "error": f"OpenAI returned an invalid {fmt} file",
-                                "elapsed": time.time() - start, "api_used": "openai",
-                                "usage": _extract_usage("openai", result)}
+                        return tries.end({"status": "failed", "index": idx, "seed": seed,
+                                          "error": f"OpenAI returned an invalid {fmt} file",
+                                          "elapsed": time.time() - start})
                     return {"status": "success", "index": idx, "seed": seed,
                             "image": None, "raw": raw, "ext": fmt,
                             "elapsed": time.time() - start, "api_used": "openai",
-                            "usage": _extract_usage("openai", result, file_px=px)}
+                            "usage": tries.image("openai", result, file_px=px)}
                 pil = _to_display_image(Image.open(io.BytesIO(raw)))
                 return {"status": "success", "index": idx, "seed": seed,
                         "image": pil, "elapsed": time.time() - start,
                         "api_used": "openai",
-                        "usage": _extract_usage("openai", result, pil)}
+                        "usage": tries.image("openai", result, pil)}
             except Exception as e:
                 err = str(e)
                 if err == "Cancelled":
-                    return {"status": "cancelled", "index": idx, "seed": seed}
+                    return tries.end({"status": "cancelled", "index": idx, "seed": seed})
+                tries.saw(e)
                 elapsed = time.time() - start
                 # OpenAI SDK는 "Connection error." 한 줄로 뭉개므로 예외 체인을 풀어 로그.
                 detail = f"{type(e).__name__}: {err}"
@@ -2511,12 +2587,12 @@ class AppState:
                     wt = delay + random.uniform(2, 8)
                     self.log(f"[{idx+1}] Retryable error. Wait {wt:.0f}s (retry {attempt+1}/{max_retries})")
                     if not self.sleep_with_cancel(wt):
-                        return {"status": "cancelled", "index": idx, "seed": seed}
+                        return tries.end({"status": "cancelled", "index": idx, "seed": seed})
                     delay = min(delay * 2, 120)
                     continue
-                return {"status": "failed", "index": idx, "seed": seed,
-                        "error": detail[:300], "elapsed": elapsed}
-        return {"status": "cancelled", "index": idx, "seed": seed}
+                return tries.end({"status": "failed", "index": idx, "seed": seed,
+                                  "error": detail[:300], "elapsed": elapsed})
+        return tries.end({"status": "cancelled", "index": idx, "seed": seed})
 
     def _generate_one_image_seedream(self, job, prompt, ref_payloads, model, img_cfg):
         idx = job["index"]
@@ -2558,42 +2634,46 @@ class AppState:
         max_retries = 5
         delay = 10
         start = time.time()
+        tries = _ImageAttempts()
         for attempt in range(max_retries):
             if self.cancel_flag:
-                return {"status": "cancelled", "index": idx, "seed": seed}
+                return tries.end({"status": "cancelled", "index": idx, "seed": seed})
             limiter = self.seedream_rate_limiter
             if limiter and not limiter.acquire(should_cancel=lambda: self.cancel_flag):
-                return {"status": "cancelled", "index": idx, "seed": seed}
+                return tries.end({"status": "cancelled", "index": idx, "seed": seed})
             keys_before = _keys_rt["ids"]
             client = self.client_seedream
             if client is None:
-                return {"status": "failed", "index": idx, "seed": seed,
-                        "error": _no_client_error("Seedream"), "elapsed": time.time() - start}
+                return tries.end({"status": "failed", "index": idx, "seed": seed,
+                                  "error": _no_client_error("Seedream"), "elapsed": time.time() - start})
             try:
                 self.log(f"{label} requesting...")
                 t = time.time()
                 result = client.images.generate(**kwargs)
                 self.log(f"{label} OK ({time.time()-t:.1f}s)")
+                # From here on it is paid for, whatever happens to the file.
+                tries.add("seedream", result)
                 data_list = getattr(result, "data", None) or []
                 if not data_list:
                     if attempt < max_retries - 1:
                         if not self.sleep_with_cancel(3):
-                            return {"status": "cancelled", "index": idx, "seed": seed}
+                            return tries.end({"status": "cancelled", "index": idx, "seed": seed})
                         continue
-                    return {"status": "failed", "index": idx, "seed": seed,
-                            "error": "No image in response", "elapsed": time.time() - start}
+                    return tries.end({"status": "failed", "index": idx, "seed": seed,
+                                      "error": "No image in response", "elapsed": time.time() - start})
                 b64 = getattr(data_list[0], "b64_json", None)
                 if not b64:
-                    return {"status": "failed", "index": idx, "seed": seed,
-                            "error": "Seedream returned no b64_json", "elapsed": time.time() - start}
+                    return tries.end({"status": "failed", "index": idx, "seed": seed,
+                                      "error": "Seedream returned no b64_json", "elapsed": time.time() - start})
                 pil = _to_display_image(Image.open(io.BytesIO(base64.b64decode(b64))))
                 return {"status": "success", "index": idx, "seed": seed,
                         "image": pil, "elapsed": time.time() - start, "api_used": "seedream",
-                        "usage": _extract_usage("seedream", result, pil)}
+                        "usage": tries.image("seedream", result, pil)}
             except Exception as e:
                 err = str(e)
                 if err == "Cancelled":
-                    return {"status": "cancelled", "index": idx, "seed": seed}
+                    return tries.end({"status": "cancelled", "index": idx, "seed": seed})
+                tries.saw(e)
                 detail = f"{type(e).__name__}: {err}"
                 self.log(f"{label} failed: {detail[:400]}")
                 if _is_auth_error(detail) and attempt < max_retries - 1 and \
@@ -2602,13 +2682,13 @@ class AppState:
                 if self.is_retryable_error(err) and attempt < max_retries - 1:
                     wt = delay + random.uniform(2, 8)
                     if not self.sleep_with_cancel(wt):
-                        return {"status": "cancelled", "index": idx, "seed": seed}
+                        return tries.end({"status": "cancelled", "index": idx, "seed": seed})
                     delay = min(delay * 2, 120)
                     continue
-                return {"status": "failed", "index": idx, "seed": seed,
-                        "error": detail[:300], "elapsed": time.time() - start}
-        return {"status": "failed", "index": idx, "seed": seed,
-                "error": "Max retries exceeded", "elapsed": time.time() - start}
+                return tries.end({"status": "failed", "index": idx, "seed": seed,
+                                  "error": detail[:300], "elapsed": time.time() - start})
+        return tries.end({"status": "failed", "index": idx, "seed": seed,
+                          "error": "Max retries exceeded", "elapsed": time.time() - start})
 
     def generate_one_image(self, job, prompt, ref_payloads, model, img_cfg, modalities):
         if model in OPENAI_MODEL_IDS:
@@ -2646,25 +2726,16 @@ class AppState:
         # 이 한 장을 만드느라 청구된 시도 전부의 합. 이미지가 안 나온 응답도 입력·생각
         # 토큰은 청구된다 - 예전엔 마지막에 성공한 한 번만 적어서, 재시도와 Studio<->Vertex
         # 전환에 든 돈이 집계에서 통째로 빠졌다.
-        acc = {"used": None}
+        tries = _ImageAttempts()
+        _bill, _end = tries.add, tries.end
 
-        def _bill(api, resp, pil=None):
-            u = _extract_usage(api, resp, pil)
-            if acc["used"] is None:
-                acc["used"] = u
-            else:
-                for k in _USAGE_TOKEN_KEYS:
-                    acc["used"][k] += u[k]
-                acc["used"]["images"], acc["used"]["out_px"] = u["images"], u["out_px"]
-            acc["api"] = api
-            return acc["used"]
-
-        def _end(r):
-            # 실패·취소로 끝나도 이미 청구된 시도가 있으면 그 사용량을 달고 나간다(0 장).
-            if acc["used"] is not None and r.get("status") != "success":
-                r["usage"] = dict(acc["used"], images=0, out_px=0)
-                r.setdefault("api_used", acc.get("api", ""))
-            return r
+        def _image_of(api, resp):
+            # 그림을 못 읽어도 이 응답은 이미 청구됐다.
+            try:
+                return self.extract_image_from_response(resp)
+            except Exception:
+                _bill(api, resp)
+                raise
 
         for attempt in range(max_retries):
             if self.cancel_flag:
@@ -2673,7 +2744,7 @@ class AppState:
             try:
                 resp, api_used = self.call_api(model, contents, config, preferred_provider=preferred)
                 elapsed = time.time() - start
-                pil = self.extract_image_from_response(resp)
+                pil = _image_of(api_used, resp)
                 if pil is not None:
                     return {"status": "success", "index": idx, "seed": seed,
                             "image": pil, "elapsed": elapsed, "api_used": api_used,
@@ -2693,9 +2764,10 @@ class AppState:
                     self.log(f"[{idx+1}] No image -> {fl} fallback")
                     try:
                         resp2, fu = self.call_api(model, contents, config, preferred_provider=fp)
-                    except Exception:
+                    except Exception as e2:
+                        tries.saw(e2)
                         continue
-                    pil2 = self.extract_image_from_response(resp2)
+                    pil2 = _image_of(fu, resp2)
                     if pil2:
                         return {"status": "success", "index": idx, "seed": seed,
                                 "image": pil2, "elapsed": time.time()-start, "api_used": fu,
@@ -2720,6 +2792,7 @@ class AppState:
 
             except Exception as e:
                 err = str(e)
+                tries.saw(e)
                 if err == "Cancelled":
                     return _end({"status": "cancelled", "index": idx, "seed": seed})
                 elapsed = time.time() - start
@@ -2826,16 +2899,21 @@ class AppState:
         with self.batch_lock:
             self.batches[batch_id] = {
                 "count": int(count), "done": 0, "failed": 0, "cancelled": 0,
+                "billed": 0, "billed_failed": 0, "billing_unknown": 0,
                 "images": [], "errors": [], "agent": bool(agent),
                 "started_at": time.time(), "finished_at": None,
             }
             if len(self.batches) > 50:
-                oldest = sorted(self.batches, key=lambda k: self.batches[k]["started_at"])
+                # Finished ones only. One still waiting in the queue can be asked about at
+                # any moment, and its entry is what stops a second send under its id.
+                oldest = sorted((k for k, b in self.batches.items() if b["finished_at"]),
+                                key=lambda k: self.batches[k]["started_at"])
                 for k in oldest[:len(self.batches) - 50]:
                     self.batches.pop(k, None)
 
-    def _batch_note(self, batch_id, kind, filepath=None, error=None):
-        """kind: done | failed | cancelled."""
+    def _batch_note(self, batch_id, kind, filepath=None, error=None, charge=None):
+        """kind: done | failed | cancelled. charge: what a failed or cancelled image
+        cost, see _result_charge. A finished image is paid for by definition."""
         if not batch_id:
             return
         with self.batch_lock:
@@ -2843,6 +2921,13 @@ class AppState:
             if b is None:
                 return
             b[kind] += 1
+            if kind == "done" or charge == "yes":
+                b["billed"] += 1
+            if kind != "done":
+                if charge == "yes":
+                    b["billed_failed"] += 1
+                elif charge == "unknown":
+                    b["billing_unknown"] += 1
             if filepath:
                 b["images"].append(filepath)
             if error:
@@ -2862,7 +2947,9 @@ class AppState:
                     if reason == "stopped":
                         b["cancelled"] += left
                     else:
+                        # Lost with the worker: some may have been on their way out.
                         b["failed"] += left
+                        b["billing_unknown"] += left
                         b["errors"] = (b["errors"] + [reason])[-5:]
                 b["finished_at"] = time.time()
 
@@ -2967,7 +3054,8 @@ class AppState:
                         result = fut.result()
                     except Exception as e:
                         result = {"status": "failed", "index": job["index"],
-                                  "seed": job["seed"], "error": str(e)[:120], "elapsed": 0}
+                                  "seed": job["seed"], "error": str(e)[:120], "elapsed": 0,
+                                  "maybe_billed": True}
 
                     self._finish_pending_job()
                     idx = result["index"]
@@ -3082,7 +3170,8 @@ class AppState:
                             self._spool_usage_row(job, result, None, result.get("elapsed", 0),
                                                   result.get("api_used") or "", model)
                         self.fail_count += 1
-                        self._batch_note(job.get("batch_id"), "failed", error=result.get("error", ""))
+                        self._batch_note(job.get("batch_id"), "failed", error=result.get("error", ""),
+                                         charge=_result_charge(result))
                         self.push_event({
                             "type": "image_failed",
                             "batch_id": job.get("batch_id", ""),
@@ -3098,7 +3187,7 @@ class AppState:
                         if result.get("usage"):
                             self._spool_usage_row(job, result, None, result.get("elapsed", 0),
                                                   result.get("api_used") or "", model)
-                        self._batch_note(job.get("batch_id"), "cancelled")
+                        self._batch_note(job.get("batch_id"), "cancelled", charge=_result_charge(result))
                         self.log(f"[{idx+1}] Cancelled")
 
                 # Refill loop
@@ -4958,12 +5047,21 @@ def start_generate():
       written into the tab's prompt, settings or reference slots, and the tab on
       screen does not change. Only the billing pick, the output folder and the
       gallery come from the tab — billing is always the person's choice."""
-    d = request.get_json(silent=True) or {}
+    # The window sends no body at all. A body that cannot be read is somebody else's
+    # request, whatever its Content-Type: guessing "the window" would really generate,
+    # on the tab on screen, with what the person left in it.
+    d = request.get_json(silent=True, force=True) if request.get_data().strip() else {}
+    if not isinstance(d, dict):
+        return jsonify({"ok": False, "error": "bad_json"})
     if "pid" in d:
         p = _project_strict(d.get("pid"))
         if p is None:
             return _no_such_tab()
         return _start_generate_agent(p, d)
+    # These two only exist on the agent path. Without a pid they would fall through
+    # to the window's Generate: a check would really generate, on the tab on screen.
+    if _flag_on(d.get("check_only")) or d.get("batch_id"):
+        return jsonify({"ok": False, "error": "pid_required", "field": "pid"})
     return _start_generate_window()
 
 
@@ -4980,26 +5078,27 @@ def _client_gate(model):
     return None
 
 
-def _billing_gate(p):
+def _billing_gate(p, write=True):
     """None when tab `p` may spend, else the JSON refusal (needs_billing).
 
     비용 귀속이 확인되지 않은 탭은 생성하지 않는다. 이 검사가 없으면 어디에 달아야
     할지 모르는 이미지가 쌓이고, 나중에 소급할 방법이 없다. 에이전트도 같은 문을
-    지난다 — 팀·프로젝트는 사람만 고른다."""
+    지난다 — 팀·프로젝트는 사람만 고른다. write=False: 값 검사 — 같은 답을 하되 탭은 그대로 둔다."""
     if not (p.billing_confirmed and p.billing_team_id and p.billing_project_id):
         return jsonify({"ok": False, "error": "팀과 프로젝트를 먼저 선택해 주세요",
                         "needs_billing": True, "pid": p.pid, "tab": p.display_name()})
     # 고른 뒤에 관리자가 그 건을 내렸을 수 있다. 이미 돌고 있는 배치는 건드리지
     # 않되(제출 시점에만 검사한다), 다음 생성부터는 다시 고르게 한다.
     _ok, _gone, _canon = _billing_still_valid(p.billing_team_id, p.billing_project_id)
-    if _ok and _canon != p.billing_project_id:
+    if write and _ok and _canon != p.billing_project_id:
         # 이 탭은 이관 전 id 를 들고 있었다. 새 id 로 바꿔 둬야 이번 배치의 사용량과
         # 다음 저장이 새 id 로 간다 (워커도 별칭을 거르지만 여기서 먼저 맞춘다).
         p.log("billing: project id updated after sheet rename %s" % ascii(_canon))
         p.billing_project_id = _canon
         p.project_dirty = True
     if not _ok:
-        p.billing_confirmed = False
+        if write:
+            p.billing_confirmed = False
         return jsonify({"ok": False, "needs_billing": True, "pid": p.pid, "tab": p.display_name(),
                         "error": "선택한 %s이(가) 목록에서 내려갔습니다. 다시 선택해 주세요" % _gone})
     return None
@@ -5203,14 +5302,15 @@ def _agent_settings_problem(model, aspect, resolution, quality):
     return None
 
 
-def _agent_refs(p, model, paths):
+def _agent_refs(p, model, paths, encode=True):
     """Load the agent's reference files WITHOUT attaching them to the tab.
 
     Same rules a drop into the tab meets (add_ref_image_ex): the model's limit,
     unreadable files, the same picture twice — compared by decoded pixels exactly
     like _find_identical_ref, so a re-encoded copy is caught on both paths.
     Refused with the reason, never silently trimmed.
-    Returns (snapshots, payloads, None) or (None, None, error)."""
+    Returns (snapshots, payloads, None) or (None, None, error). encode=False skips
+    the PNG encoding, the slow part, for a check that will not send anything."""
     if not isinstance(paths, list):
         return None, None, {"error": "ref_paths must be a list"}
     limit = p.get_ref_limit(model)
@@ -5243,7 +5343,7 @@ def _agent_refs(p, model, paths):
                 pil.close()
                 return _fail({"error": "ref_duplicate", "index": i + 1, "same_as": j + 1})
         snaps.append(pil)
-    return snaps, [p.ref_image_to_bytes(im) for im in snaps], None
+    return snaps, ([p.ref_image_to_bytes(im) for im in snaps] if encode else None), None
 
 
 def _agent_default_resolution(model):
@@ -5257,7 +5357,84 @@ def _agent_default_resolution(model):
     return next((t for t in ("4K", "2K", "1K") if t in tiers), "1K")
 
 
+_BATCH_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
+# Caller-made ids whose request is still being read (references can take half a minute):
+# id -> {"pid", "count"}. Not in a tab's `batches`: a worker ending would close them there.
+_batch_claims = {}
+_batch_claims_lock = threading.Lock()
+
+
+def _flag_on(value):
+    """A yes/no a JSON caller may send as false / 0 / "false" / "0" / "no" / "off".
+    Anything else counts as on — here that is the side that spends nothing."""
+    return not (value in (None, "", False, 0) or str(value).strip().lower() in ("false", "0", "no", "off"))
+
+
+def _batch_id_used(bid):
+    """Which open tab this id already went into -> (pid, count), else None. Every tab, not
+    just the one named: pids are handed out afresh each run, so after a restart the same
+    pid can be another tab — it would generate again, on that tab's team and project.
+    The tally is memory only and keeps 50; the gallery still remembers after a restart."""
+    with shared.projects_lock:
+        tabs = list(shared.projects.values())
+    for t in tabs:
+        with t.batch_lock:
+            b = t.batches.get(bid)
+            if b is not None:
+                return t.pid, b["count"]
+    for t in tabs:
+        with t.gallery_lock:
+            made = [it.get("generation_settings") or {} for it in t.gallery_items.values()]
+        made = [gs for gs in made if gs.get("batch_id") == bid]
+        if made:
+            return t.pid, _safe_int(made[0].get("count"), len(made))
+    return None
+
+
 def _start_generate_agent(p, d):
+    """One request from an agent. check_only runs every check and generates nothing.
+
+    batch_id, made by the caller, is what makes a lost connection safe: the caller
+    knows the id before it sends, can ask /api/batch about it afterwards, and can
+    send the same request again — one id never generates twice. The id is claimed
+    before the slow part, so /api/batch already says "preparing" while the references
+    are being read. A refused request lets go of it."""
+    check_only = _flag_on(d.get("check_only"))
+    bid = d.get("batch_id")
+    if bid in (None, ""):
+        return _agent_batch(p, d, uuid.uuid4().hex[:12], check_only)
+    bid = str(bid) if not isinstance(bid, (bool, float)) else ""
+    if not _BATCH_ID_RE.fullmatch(bid):
+        return jsonify({"ok": False, "error": "bad_batch_id", "field": "batch_id",
+                        "allowed": "8-64 characters: letters, digits, - and _"})
+    if check_only:
+        return _agent_batch(p, d, bid, True)
+
+    def _already(pid, count, preparing):
+        # pid is where it is, which need not be the tab this request named.
+        return jsonify({"ok": True, "duplicate": True, "preparing": preparing, "batch_id": bid,
+                        "pid": pid, "count": count})
+
+    s = d.get("settings")
+    count = _safe_int(s.get("count"), 1, 1, 10) if isinstance(s, dict) else 1
+    with _batch_claims_lock:
+        held = _batch_claims.get(bid)
+        if held is None:
+            _batch_claims[bid] = {"pid": p.pid, "count": count}
+    if held is not None:
+        return _already(held["pid"], held["count"], True)
+    # Looked up after the claim: whoever held it opened its batch before letting go.
+    try:
+        used = _batch_id_used(bid)
+        if used:
+            return _already(used[0], used[1], False)
+        return _agent_batch(p, d, bid, False)
+    finally:
+        with _batch_claims_lock:
+            _batch_claims.pop(bid, None)
+
+
+def _agent_batch(p, d, batch_id, check_only):
     prompt = str(d.get("prompt") or "").strip()
     if not prompt:
         return jsonify({"ok": False, "error": "Empty prompt"})
@@ -5278,7 +5455,7 @@ def _start_generate_agent(p, d):
     model = _live_model_name(str(s.get("model")))
     if model not in _ALL_MODEL_IDS:
         return jsonify({"ok": False, "error": "unknown_model", "model": model})
-    refused = _client_gate(model) or _billing_gate(p)
+    refused = _client_gate(model) or _billing_gate(p, write=not check_only)
     if refused is not None:
         return refused
     # 비율을 안 보내면 auto. 단 GPT 는 레퍼런스가 없으면 auto 가 크기를 OpenAI 에 맡겨 해상도가 통째로
@@ -5360,11 +5537,12 @@ def _start_generate_agent(p, d):
     providers = _providers_for(p, model)
     if not providers:
         return jsonify({"ok": False, "error": "No provider available"})
-    os.makedirs(p.output_dir, exist_ok=True)
+    if not check_only:
+        os.makedirs(p.output_dir, exist_ok=True)
     ref_paths = d.get("ref_paths") or []
     if output_format == "svg" and ref_paths:
         return jsonify({"ok": False, "model": model, "field": "ref_paths", "error": "svg_no_refs"})
-    snaps, payloads, err = _agent_refs(p, model, ref_paths)
+    snaps, payloads, err = _agent_refs(p, model, ref_paths, encode=not check_only)
     if err:
         return jsonify(dict({"ok": False}, **err))
     img_cfg = _gen_img_cfg(model, aspect, resolution, quality, custom_w, custom_h,
@@ -5375,6 +5553,22 @@ def _start_generate_agent(p, d):
             im.close()
         except Exception:
             pass
+    # 이 요청에서 쓰지 않은 칸을 알려 준다. output_dir·fixed_prompt 처럼 탭 설정에 있는 이름은 보내는
+    # 쪽이 오타인지 알 수 없어, 시킨 폴더가 아닌 곳에 저장돼도 아무도 모른다.
+    ignored = sorted(set(s) - _AGENT_SETTINGS - (_AGENT_GIF_SETTINGS if output_format == "gif" else set()))
+    # 프로바이더에 실제로 나갈 값. Custom 은 앱이 크기를 맞는 값으로 고치므로 고쳤는지도 말해 준다.
+    sends = {"sends": dict(img_cfg)}
+    if aspect == "custom":
+        sends["custom_changed"] = "%dx%d" % (custom_w, custom_h) != img_cfg.get("size")
+    if check_only:
+        # 값은 맞지만 지금 보내면 잠깐 거절될 상태도 알린다. 거절은 값이 틀렸을 때만 — 이 둘은 곧 풀린다.
+        with p.pending_jobs_lock:
+            outstanding = len(p.pending_jobs) + p.active_job_count
+            stopping = bool(p.cancel_flag)
+        return jsonify(dict(sends, ok=True, check_only=True, pid=p.pid, model=model, count=count,
+                            aspect=aspect, resolution=resolution, quality=quality, ignored=ignored,
+                            outstanding=outstanding, stopping=stopping,
+                            queue_full=outstanding + count > p.max_queued_images))
     r = _enqueue_batch(
         p, model=model, providers=providers, prompt=prompt, count=count,
         aspect=aspect, resolution=resolution, quality=quality,
@@ -5382,13 +5576,14 @@ def _start_generate_agent(p, d):
         ref_paths=[str(x) for x in ref_paths], pinned_ref_paths=[],
         # "Load setup" on an agent image brings its prompt back as one section.
         fixed_prompt="", prompt_sections=[prompt],
-        batch_id=uuid.uuid4().hex[:12], agent=True)
-    # 이 요청에서 쓰지 않은 칸을 알려 준다. output_dir·fixed_prompt 처럼 탭 설정에 있는 이름은 보내는
-    # 쪽이 오타인지 알 수 없어, 시킨 폴더가 아닌 곳에 저장돼도 아무도 모른다.
-    ignored = sorted(set(s) - _AGENT_SETTINGS - (_AGENT_GIF_SETTINGS if output_format == "gif" else set()))
-    if ignored and r.get_json().get("ok"):
-        return jsonify(dict(r.get_json(), ignored=ignored))
-    return r
+        batch_id=batch_id, agent=True)
+    answer = r.get_json()
+    if not answer.get("ok"):
+        return r
+    answer.update(sends)
+    if ignored:
+        answer["ignored"] = ignored
+    return jsonify(answer)
 
 
 _AGENT_GIF_SETTINGS = {"gif_size", "gif_frames", "gif_frame_ms"}
@@ -5524,21 +5719,43 @@ def api_batch():
     For the agent. The window's events are pop-once and belong to the window,
     and the gallery shows only images that came out — so "asked for 4, see 3"
     could not tell a failure from an image still rendering. finished=true means
-    nothing more will arrive for this batch."""
+    nothing more will arrive for this batch.
+
+    preparing=true: the request is in and its references are being read.
+    no_such_batch: not on this tab — never arrived, refused, gone with a restart, or
+    long finished. Sending the same batch_id again is safe: what it made is looked
+    up in the gallery of every open tab, so it does not generate twice.
+
+    Money, per image: billed = paid for, finished or not. billed_failed = the failed
+    or cancelled ones among them (a provider also charges for a broken file and for
+    a Gemini answer with no image). billing_unknown = failed or cancelled with no
+    answer received, so nobody here can say. Sending a failed batch again costs
+    nothing extra only when the last two are both 0."""
     p = _project_strict(request.args.get("pid", ""))
     if p is None:
         return _no_such_tab()
     bid = request.args.get("batch_id", "")
+    # Claim first: a request opens its batch before letting go, so reading in this
+    # order cannot miss both.
+    with _batch_claims_lock:
+        held = _batch_claims.get(bid)
+    if held is not None and held["pid"] != p.pid:
+        held = None
     with p.batch_lock:
         b = p.batches.get(bid)
         b = dict(b, images=list(b["images"]), errors=list(b["errors"])) if b else None
-    if b is None:
+    if b is None and held is None:
         return jsonify({"ok": False, "error": "no_such_batch"}), 404
+    if b is None:
+        b = {"count": held["count"], "done": 0, "failed": 0, "cancelled": 0, "billed": 0, "billed_failed": 0,
+             "billing_unknown": 0, "finished_at": None, "images": [], "errors": []}
     pending = max(0, b["count"] - b["done"] - b["failed"] - b["cancelled"])
     return jsonify({
         "ok": True, "pid": p.pid, "batch_id": bid, "count": b["count"],
         "done": b["done"], "failed": b["failed"], "cancelled": b["cancelled"],
         "pending": pending, "finished": bool(b["finished_at"]),
+        "preparing": "started_at" not in b,
+        "billed": b["billed"], "billed_failed": b["billed_failed"], "billing_unknown": b["billing_unknown"],
         "images": b["images"], "errors": b["errors"],
     })
 
@@ -5701,6 +5918,14 @@ def api_projects():
         order = list(shared.project_order)
         items = [_project_summary(shared.projects[pid]) for pid in order if pid in shared.projects]
         active = shared.active_pid
+        open_now = {os.path.normcase(x["path"]) for x in items if x["path"]}
+        # Last session's tabs whose folder is out of reach (drive not connected). Not
+        # tabs yet: they have no pid. Told apart so a caller looking for one by name
+        # does not make a new one, and end up with two when the drive comes back.
+        waiting = [{"name": t.get("title") or os.path.splitext(os.path.basename(t.get("path") or ""))[0],
+                    "path": t.get("path") or "", "missing_since": t.get("missing_since") or ""}
+                   for t in shared.session_unreachable
+                   if os.path.normcase(t.get("path") or "") not in open_now]
     # agent_pid: this build lets a caller address a tab by pid (generate with
     # one-shot values, strict reads, new tab without switching). The studio
     # connector checks it to tell this build from older ones still out there.
@@ -5712,7 +5937,10 @@ def api_projects():
                     "agent_pid": True,
                     # agent_model_defaults: 에이전트 요청의 빠진 값은 탭이 아니라 모델 기본이다(§2.2).
                     # 옛 앱과 섞여 있는 동안 커넥터가 어느 규칙인지 알 수 있게 한다.
-                    "features": ["agent_pid", "agent_model_defaults"]})
+                    # caller_batch_id·check_only 는 꼭 보고 보낼 것 — 옛 앱은 이 칸을 모르고 그대로 생성한다.
+                    "features": ["agent_pid", "agent_model_defaults", "caller_batch_id", "batch_billing",
+                                 "check_only", "waiting_tabs"],
+                    "waiting_tabs": waiting})
 
 
 @app.route("/api/projects/new", methods=["POST"])
@@ -7242,6 +7470,12 @@ def _scrub_once(keys):
 
 
 def _start_enrollment():
+    # 테스트가 거는 격리 폴더에는 출입증이 없어, 그대로 두면 init_app 한 번마다 실제 게이트웨이로 승인 요청이
+    # 나가 관리자 페이지에 쌓인다(2026-11-05 커넥터 시험에서 10건). 사용량 업로드와 같은 안전장치.
+    if _nbgw.enroll_blocked():
+        state.log("enrollment: not requested (isolated data dir)")
+        _set_gw("error", "", "격리 데이터 폴더라 승인 요청을 보내지 않습니다 (보내려면 NANOBANANA_ENROLL=1)")
+        return
     with _keys_lock:
         t = _keys_rt.get("enroll_thread")
         if t is not None and t.is_alive():

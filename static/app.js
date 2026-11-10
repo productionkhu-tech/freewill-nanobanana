@@ -1203,6 +1203,19 @@ const MODEL_SPECS = {
     refLimit: 14,
     refHint: "3rd-gen models support up to 14 reference images.",
   },
+  // 5.5 (early access, 2026-11): 5.0 Pro's sizes and limits, plus a transparent background on
+  // text-to-image and with references. Its one-pager mentions 4K; the API refuses it.
+  "seedream-5-5-261028": {
+    aspects: ["auto","1:1","4:3","3:4","16:9","9:16","3:2","2:3","21:9","custom"],
+    resolutions: ["1K","1.5K","2K"],
+    counts: ["1","2","3","4","5","6","7","8","9","10"],
+    showQuality: false,
+    showBackground: true,
+    defaultAspect: "16:9", defaultResolution: "2K",
+    hint: "BytePlus Seedream 5.5 - more realistic, steadier edits. 1K/1.5K/2K, png. Can return a transparent background.",
+    refLimit: 10,
+    refHint: "Up to 10 reference images. Mention them as 'image 1', 'image 2' in the prompt.",
+  },
   // 5.0 Pro / Flash (BytePlus doc 2026-10): 1K / 1.5K / 2K. 1.5K is billed like
   // 1K (Pro's $0.045 tier, Flash's flat $0.018) and looks better.
   "seedream-5-0-pro-260628": {
@@ -1331,10 +1344,11 @@ const _MODEL_MENU_ORDER = [
   "gemini-nano-banana-2.1", "gemini-3.1-flash-lite-image",
   "gpt-image-2.6-sunburst", "gpt-image-2.6-flare",
   "gpt-image-2.5-sunburst", "gpt-image-2.5-flare", "gpt-image-2",
-  "seedream-5-0-pro-260628", "seedream-5-0-flash-260915", "seedream-4-5-251128",
+  "seedream-5-5-261028", "seedream-5-0-pro-260628", "seedream-5-0-flash-260915", "seedream-4-5-251128",
 ];
 const MODEL_ORDER = [..._MODEL_MENU_ORDER, ...Object.keys(MODEL_SPECS).filter(m => !_MODEL_MENU_ORDER.includes(m))];
 const MODEL_LABELS = {
+  "seedream-5-5-261028": "seedream-5-5",
   "seedream-5-0-pro-260628": "seedream-5-0-pro",
   "seedream-5-0-flash-260915": "seedream-5-0-flash",
   "seedream-4-5-251128": "seedream-4-5",
@@ -1351,7 +1365,7 @@ const MODEL_COMPANIES = [
   { prefix: "gpt-image-", name: "OpenAI" },
   { prefix: "seedream-", name: "BytePlus Seedream" },
 ];
-const SOTA_MODELS = ["gemini-3-pro-image", "gpt-image-2.6-sunburst", "seedream-5-0-pro-260628"];
+const SOTA_MODELS = ["gemini-3-pro-image", "gpt-image-2.6-sunburst", "seedream-5-5-261028"];
 function modelCompany(m) {
   return MODEL_COMPANIES.find(c => String(m || "").startsWith(c.prefix)) || null;
 }
@@ -1525,6 +1539,7 @@ const _MODEL_SHORT = {
   "gpt-image-2.5-sunburst": "GPT Image 2.5 Sunburst",
   "gpt-image-2.6-flare": "GPT Image 2.6 Flare",
   "gpt-image-2.6-sunburst": "GPT Image 2.6 Sunburst",
+  "seedream-5-5-261028": "Seedream 5.5",
   "seedream-5-0-pro-260628": "Seedream 5 Pro",
   "seedream-5-0-flash-260915": "Seedream 5 Flash",
   "seedream-4-5-251128": "Seedream 4.5",
@@ -1740,7 +1755,7 @@ function applyModelSpec(model, preserved) {
     if (cxw) cxw.style.display = "none";
     _holdHidden("complexitySelect", preserved?.complexity);
   }
-  // Transparency is for 2.5 and 2.6 only. Hiding the row is not enough — a
+  // Transparency is for GPT 2.5 / 2.6 and Seedream 5.5 (showBackground). Hiding the row is not enough — a
   // model without it must not keep a checked box alive in the background, or
   // switching away would silently leave the request asking for a cut-out.
   const bgRow = document.getElementById("bgTransparentRow");
@@ -2071,6 +2086,7 @@ function _fmtPx(n){ return (n/1e6).toFixed(2) + "M px"; }
 // match app.py _SEEDREAM_CUSTOM so the live preview and "최대 화질" button agree
 // with the server's re-correction.
 const _SEEDREAM_CUSTOM_JS = {
+  "seedream-5-5-261028":       [921600, 4624220],
   "seedream-5-0-pro-260628":   [921600, 4624220],
   "seedream-5-0-flash-260915": [921600, 4624220],
   "seedream-4-5-251128":       [3686400, 16777216],

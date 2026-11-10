@@ -58,6 +58,7 @@
         <option value="gemini-3-pro-image" selected>gemini-3-pro-image</option>
         <option value="gemini-3.1-flash-image">gemini-3.1-flash-image</option>
         <option value="gemini-3.1-flash-lite-image">gemini-3.1-flash-lite-image</option>
+        <option value="seedream-5-5-261028">seedream-5-5</option>
         <option value="seedream-5-0-pro-260628">seedream-5-0-pro</option>
         <option value="seedream-5-0-flash-260915">seedream-5-0-flash</option>
         <option value="seedream-4-5-251128">seedream-4-5</option>
@@ -177,9 +178,9 @@
       </div>
       <p class="hint" id="formatHint" style="display:none"></p>
 
-      <!-- GPT Image 2.5 / 2.6 only: ask the model for a cut-out (alpha PNG) -->
+      <!-- GPT Image 2.5 / 2.6 and Seedream 5.5: ask the model for a cut-out (alpha PNG) -->
       <div id="bgTransparentRow" style="display:none">
-        <label class="bg-check" title="GPT Image 2.5 / 2.6 only — returns a cut-out as an alpha PNG">
+        <label class="bg-check" title="GPT Image 2.5 / 2.6 · Seedream 5.5 — returns a cut-out as an alpha PNG">
           <input type="checkbox" id="bgTransparentChk" onchange="onBgTransparentChange(this.checked)"> Transparent background
         </label>
         <p class="hint" id="bgTransparentHint" style="display:none">

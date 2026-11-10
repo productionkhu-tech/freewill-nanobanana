@@ -3,7 +3,7 @@
 멀티 프로바이더 AI 이미지 생성 데스크톱 앱 (Flask + pywebview + PyInstaller).
 이 문서 하나로 **구조 · 원리 · 규칙 · 배포 · 관리**를 파악할 수 있게 씁니다. 낡은 내용을 발견하면 즉시 고칠 것.
 
-> 최종 갱신: 2026-11-06 (v2026-11-0601 기준 — 호출자 batch_id·실패의 과금 표시·check_only·연결 대기 탭 §2.2, 200 뒤 실패도 사용량 기록 §6.1.1, 격리 시험 승인 요청 차단 규칙 17)
+> 최종 갱신: 2026-11-10 (v2026-11-1001 기준 — 시드림 5.5·투명 배경·임시 단가 §6.1, 재시도 판단을 예외 우선으로 §7, 재시작 뒤 batch_id 주의 §2.2)
 
 ---
 
@@ -145,7 +145,7 @@ NanoBanana.exe 실행
 - 크기 계산은 창·에이전트 모두 `_gen_img_cfg` 하나. 갤러리 "Load setup" 은 에이전트 프롬프트를 섹션 하나로 돌려준다
 - 창 쪽 표시: `batch_started` 이벤트(탭 줄 점이 첫 장이 아니라 시작부터 켜짐. 에이전트 묶음이면 "에이전트가 'X' 탭에서
   N장 생성을 시작했습니다" 토스트), `projects_changed`(탭 줄 다시 그림), 팀·프로젝트 미설정 탭의 "!" 표시
-- **호출자가 만드는 `batch_id`** (2026-11-06~, 영문·숫자·`-`·`_` 8~64자, **앱 전체에서 하나**): 연결이 끊겨도 돈이 두 번 안 나가게 하는 칸. 받자마자 `_batch_claims` 로 잡는다(레퍼런스 인코딩 전, 4K 12장이면 30초 가까이 걸린다) — 그동안 `/api/batch` 는 `preparing:true`. 이미 쓴 id 면 생성 없이 `{ok, duplicate:true, preparing, batch_id, pid, count}`. 열린 탭 전부의 집계·갤러리에서 찾는다(재시작하면 pid 가 새로 매겨져 같은 pid 가 다른 탭일 수 있다 — 그 탭 과금으로 또 만들면 안 된다). 답의 `pid` 가 있는 곳. 거절된 요청은 잡은 id 를 놓는다 → `no_such_batch` 면 같은 id 로 다시 보내도 안전. 잡아 둔 id 를 탭의 `batches` 에 넣지 말 것 — 앞 워커가 끝날 때 닫아 버린다. **안 끝난 묶음은 50개 정리에서 밀어내지 않는다**(`count` 1 묶음 51개가 큐에 있으면 첫 id 를 잃고 두 번 생성됐다). **레퍼런스 인코딩을 큐 뒤로 옮기지는 않았다**(돈 나가는 경로를 건드리는 데 비해 이 칸으로 문제가 이미 풀린다)
+- **호출자가 만드는 `batch_id`** (2026-11-06~, 영문·숫자·`-`·`_` 8~64자, **앱 전체에서 하나**): 연결이 끊겨도 돈이 두 번 안 나가게 하는 칸. 받자마자 `_batch_claims` 로 잡는다(레퍼런스 인코딩 전, 4K 12장이면 30초 가까이 걸린다) — 그동안 `/api/batch` 는 `preparing:true`. 이미 쓴 id 면 생성 없이 `{ok, duplicate:true, preparing, batch_id, pid, count}`. 열린 탭 전부의 집계·갤러리에서 찾는다(재시작하면 pid 가 새로 매겨져 같은 pid 가 다른 탭일 수 있다 — 그 탭 과금으로 또 만들면 안 된다). 답의 `pid` 가 있는 곳. 거절된 요청은 잡은 id 를 놓는다 → 앱이 그대로면 `no_such_batch` 일 때 같은 id 로 다시 보내도 안전. **재시작 뒤엔 아니다**: 앱은 재시작 전 묶음을 기억하지 못해 그림이 없으면 새로 만든다. 대기 중이던 장은 사라졌지만 돌던 장은 값이 나갔을 수 있다 → 커넥터가 `CSRF_TOKEN` 이 바뀐 것으로 재시작을 알아채고 사람에게 묻는다(pid 는 재시작 뒤 다른 탭일 수 있어 못 쓴다). **이 토큰을 실행마다 새로 만드는 방식을 바꾸면 커넥터 세션에 먼저 알릴 것.** 잡아 둔 id 를 탭의 `batches` 에 넣지 말 것 — 앞 워커가 끝날 때 닫아 버린다. **안 끝난 묶음은 50개 정리에서 밀어내지 않는다**(`count` 1 묶음 51개가 큐에 있으면 첫 id 를 잃고 두 번 생성됐다). **레퍼런스 인코딩을 큐 뒤로 옮기지는 않았다**(돈 나가는 경로를 건드리는 데 비해 이 칸으로 문제가 이미 풀린다)
 - **`/api/batch` 의 돈** (2026-11-06~, 장 단위): `billed` 값이 나간 장, `billed_failed` 그중 실패·취소, `billing_unknown` 실패·취소인데 모르는 장(시간 초과·끊김, 사용량 없는 200, 워커 사고, SDK 가 안에서 다시 시도한 끝의 오류 — 앞 시도가 안 보인다). **실패한 묶음을 다시 보내도 돈이 더 안 나가는 건 뒤의 둘이 모두 0 일 때뿐이다.** PNG 라고 공짜가 아니다 — 제미나이는 이미지 없이 끝나도 청구된다(§6.1.1). 판단은 `_ImageAttempts`·`_result_charge`·`_may_have_billed`. OpenAI SDK 의 자체 재시도(`max_retries` 기본 2)는 그대로 두고 `x-stainless-retry-count` 로 알아본다 — 끄면 재시도 간격이 앱 쪽 10초대로 바뀐다
 - **`check_only`** (2026-11-06~): 실제 생성과 같은 검사(거절 답도 똑같다)를 하고 `{ok, check_only:true, pid, model, count, aspect, resolution, quality, sends, custom_changed?, ignored, outstanding, queue_full, stopping}` 만 돌려준다. 생성·큐·묶음·탭·이벤트·과금 선택 전부 그대로(`_billing_gate(write=False)`), 폴더도 안 만들고 PNG 인코딩도 안 한다. `false·0·"false"·"0"·"no"·"off"` 외엔 전부 켬(돈이 안 나가는 쪽으로 읽는다). 큐가 찼거나 멈추는 중이면 값은 맞으니 거절하지 않고 `queue_full`·`stopping` 으로 알린다 — 그 상태로 보내면 잠깐 거절된다
 - **본문을 못 읽으면 `bad_json`** (2026-11-06~). 창은 본문 없이 보낸다. 예전엔 깨진 JSON·`text/plain` 이 빈 요청으로 읽혀 창의 Generate 로 떨어졌다 — 화면 탭에서 진짜 생성된다. Content-Type 은 안 본다(`force=True`)
@@ -367,7 +367,7 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 | Google Vertex | gemini-3-pro-image 등 | `VERTEX_SA` (서비스계정 JSON → 앱엔 1시간 토큰만) | `GOOGLE_APPLICATION_CREDENTIALS` + `NANOBANANA_PROJECT_ID` |
 | Google AI Studio | 동일 모델군 | `STUDIO_KEY` | `NANOBANANA_STUDIO_KEY` |
 | OpenAI | gpt-image-2 · gpt-image-2.5-sunburst / -flare · gpt-image-2.6-sunburst / -flare | `OPENAI_KEY` | `OPENAI_API_KEY` |
-| BytePlus | seedream-5-0-pro / 5-0-flash / 4-5 | `ARK_KEY` | `ARK_API_KEY` |
+| BytePlus | seedream-5-5 / 5-0-pro / 5-0-flash / 4-5 | `ARK_KEY` | `ARK_API_KEY` |
 
 - **키 교체(로테이션)**: 콘솔에서 새 키 발급 → `printf '%s' "$NEW" | env -u CLOUDFLARE_API_TOKEN npx wrangler secret put STUDIO_KEY`
   (값이 화면·히스토리에 남지 않게 stdin 으로. 클라우드플레어 대시보드 "변수 및 비밀" 에서 바꿔도 같다) →
@@ -408,7 +408,7 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   (`svg_no_refs`, 창에서도 거절 — 몰래 빼고 보내면 레퍼런스를 무시한 그림에 값을 치른다). 배경은 안 시켜도 투명으로 온다. 1024² 저·고화질 약 $0.15, max $0.37, 3840×2160 $0.23.
   화면: 갤러리는 GIF 첫 프레임·SVG 는 파일 자체 + 형식 배지, 뷰어는 `ImageDecoder` 로 재생(없는 브라우저는 첫 프레임). SVG 응답엔 `Content-Security-Policy: sandbox`
   (`<img>` 로는 스크립트가 안 돌지만 주소로 직접 열면 돈다). 레퍼런스·복사: GIF 는 첫 프레임, SVG 는 안내 후 거절
-- **모델 메뉴의 별표** (v2026-11-0502~): 회사별 그룹 + 회사마다 최고 모델 하나 `SOTA_MODELS`(app.js, 지금 `gemini-3-pro-image`·`gpt-image-2.6-sunburst`·`seedream-5-0-pro-260628`).
+- **모델 메뉴의 별표** (v2026-11-0502~): 회사별 그룹 + 회사마다 최고 모델 하나 `SOTA_MODELS`(app.js, 지금 `gemini-3-pro-image`·`gpt-image-2.6-sunburst`·`seedream-5-5-261028` — 시드림은 2026-11-10 에 5.0 Pro 에서 옮김).
   표시는 `★` + 강조색 하나(`--accent`), 화면에 "SOTA" 글자는 쓰지 않는다 — 회사별 색과 글자는 사용자가 빼라고 했다, 회사는 그룹 이름이 말한다. 판단으로 고른 값이다 — 구글은 문서가 "premium choice" 라 한 Pro 로,
   2.1 은 "workhorse". 메뉴 순서는 `_MODEL_MENU_ORDER`(OpenAI·시드림은 최신·상위부터). **새 모델을 넣을 때 이 두 목록을 같이 볼 것** — `MODEL_SPECS[].refLimit`(커넥터가 보내기 전에 읽는다)도 `get_ref_limit` 과 같게 넣을 것
 - **모델 설정의 "모델별 시작 화질" 스위치** (2026-11-05~): 켜짐(기본) = 모델을 바꾸면 그 모델의 시작 화질(`default_res`, 없으면 최고)·Quality 시작값. 꺼짐(`model_prefs.keep_panel=true`) = Ratio·Count 처럼 패널 값 유지 —
@@ -434,6 +434,19 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   실측(2026-10-22): Flash 1K 15초·1.5K 16:9 → 2048×1152 15초, Pro 1.5K 1:1 → 1536×1536 38초.
   BytePlus 는 모델마다 콘솔에서 "활성화"가 필요할 수 있다 — 새 모델은 일부러 틀린 size 로 한 번 보내 보면
   400(크기 오류)=쓸 수 있음 / 404=없음·권한 없음을 **과금 없이** 가를 수 있다
+- **Seedream 5.5** (앱 반영 2026-11-10, 얼리 액세스 문서 2026-11-07 기준): 앱 id `seedream-5-5-261028`, **보내는 id `dola-seedream-5-5-261028`**, 메뉴 `seedream-5-5`(★).
+  크기·비율·레퍼런스 10장은 5.0 Pro 와 같다(`_SEEDREAM_5_SIZES`, 직접 크기 921,600~4,624,220px). **4K 는 안 된다** — 소개 문서(11/10)는 "직접 크기 최대 8.29MP, 3840×2160" 이라 하지만 API 는
+  `"4K"`·3840×2160·2880×1620·2160² 를 "image area must be at most 4624220 pixels" 로 거절한다(2026-11-10 두 번, 생성 없이 확인: 깨진 레퍼런스를 넣으면 크기 검사가 먼저 돌아 과금 없이 가를 수 있다. `background`·`optimize_prompt_options` 는 크기보다 먼저 검사된다).
+  열리면 `_SEEDREAM_CUSTOM`·`_SEEDREAM_CUSTOM_JS`·크기표를 같이 올릴 것 — 같은 탐침(`2880x1620`·`3840x2160`)으로 먼저 확인.
+  프롬프트 최적화는 `standard` 만(`fast` 는 400). **투명 배경**: `background` auto(기본)|transparent|opaque, 프롬프트만·레퍼런스 모두 된다(5.0 Pro 는 알파 PNG 1장 편집만이라 안 씀).
+  앱은 GPT 의 "투명 배경" 칸(`openai_bg_transparent`, 이름은 그대로)을 같이 쓴다 — 켜면 `transparent`, 끄면 `auto` 를 **명시**해서 보낸다(모델이 프롬프트로 정한다).
+  다른 시드림 모델엔 `background` 를 절대 안 보낸다(`SEEDREAM_ALPHA_MODEL_IDS`, 칸이 듣는 모델 전체는 `BG_TRANSPARENT_MODEL_IDS`). 응답의 `data[].background` 를 `background_returned` 로 남겨,
+  모델이 돌려준 값이 있으면 그게 갤러리 체크무늬를 정한다(`auto` 가 투명으로 와도, 켰는데 불투명으로 와도). 실측(1K, 2026-11-10): 끔 → opaque, 켬 → 투명 픽셀 57%, 레퍼런스에서 오려 내기 → 87%.
+  **가격 미정(One-pager 11/10 도 "Pricing TBD")** — 단가표에 **임시값**을 넣어 뒀다(2026-11-10, D1 `prices` 의 `seedream-5-5-261028` 행): 5.0 Pro 와 같은 `mode='image'`·$0.045 / 2.61M px 초과 $0.09 /
+  레퍼런스 2장째부터 $0.003, `provider='byteplus'`, **`verified=0`**(관리자 페이지에 "확인 필요"·"단가 미설정 N장" 으로 계속 보인다). 비용이 적게 잡히지 않게 위쪽으로 둔 추정 — 제3자 재판매가는 장당 $0.02 선.
+  발표되면 그 행을 "이 행 수정" 으로 고칠 것(`effective_from` 2000-01-01 그대로라 지난 사용량도 새 값으로 다시 계산된다). **`mode='token'` 으로 바꾸지 말 것** —
+  5.5 응답엔 `output_tokens`(1K 에 4096)도 오고 `_extract_usage` 가 `out_tokens` 로 옮기므로, token 으로 두면 그 토큰에 값이 매겨진다. 워커가 자동으로 만든 행은 provider 가 앱 값(`seedream`)이라 `byteplus` 로 고쳤다.
+  **앱에 안 넣은 것**: 레이어 분해(`layer_decomposition`, 이미지 1장 → 최대 100장 투명 레이어 + 글자 인식 `text_recognition`. 요청 1번에 파일 수십 장이라 작업·저장 구조를 따로 설계해야 하고, 분당 한도가 `max_images` 만큼 미리 차감된다), `safety_identifier`(선택)
 - **Nano Banana 2.1** = `gemini-nano-banana-2.1` (v2026-10-0701~). **ID 규칙이 바뀌었다** — 이름에 "gemini-3"도
   "3.1"도 없다. 그래서 모델 이름 글자로 기능을 가르면 조용히 틀어진다(예전 `"gemini-3" in model` 검사 때문에
   2K/4K 가 안 실릴 뻔했다). 해상도는 `_GEMINI_IMAGE_SIZES`, 확장 비율(1:4·8:1 등)은 `_GEMINI_EXT_ASPECT_MODELS`
@@ -496,6 +509,7 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 | PNG 투명 배경이 검정 | `convert("RGB")` | `_to_display_image` / `_to_rgb_flatten` |
 | Stop 눌러도 UI 멈춤 | `with ThreadPoolExecutor`의 wait=True | `shutdown(wait=False, cancel_futures=True)` |
 | 병렬 생성 시 파일 덮어쓰기 | file_counter race | `file_counter_lock` + `reserve_filepath()` (탭이 같은 출력 폴더를 써도 안전) |
+| 될 리 없는 400 을 수십 초 간격으로 5번 다시 보냄 · 깨진 파일 응답을 다시 요청해 또 청구됨 | 재시도 판단이 "500"·"429" 를 글자 단위로 찾아, 시드림 요청 번호(`Request id: 0217…5004…`)나 메모리 주소(`0x…5003…`)에 걸렸다 | v2026-11-1001: 예외가 먼저 정한다(`_retryable_by_exception` — HTTP 상태 408·429·5xx 만 다시, httpx·`ConnectionError` 끊김은 다시). 제미나이는 `call_api` 가 제공자별 예외로 정해 `retryable` 로 넘긴다(합친 글자는 기록용). 예외가 말이 없을 때만 글자, 상태 코드는 독립된 숫자일 때만(`_RETRY_STATUS_RE`). 같이 고친 것: google-genai 는 httpx 끊김을 감싸지 않아("Server disconnected…", 한국어 WinError 10054) 제미나이가 재시도도 Vertex 전환도 안 했다 |
 | 같은 모델인데 장마다 시간이 다름 | 프로바이더별 공유 리미터(제미나이 8 RPM) 대기 시간이 카드의 초에 포함됨 | 정상. 로그의 `rate-limit wait Ns` 로 확인 |
 | `finish_reason: NO_IMAGE` 반복 | 모델(특히 Lite)이 이미지를 안 내놓음 | 재시도 때 시드 재발급 + 다른 프로바이더 폴백. 잦으면 Flash/Pro로 |
 | 켤 때 빈 탭만 보이거나, 탭은 맞는데 내용이 비어 있다가 다른 탭을 다녀와야 보임 · 다음 실행 때 탭이 사라짐 (느린 PC만) | 세션 복원이 화면보다 늦게 끝남(키 준비가 먼저 돌고, 느린 디스크·PC). 화면은 3초·8초에만 다시 맞췄고, 그 사이 탭 동작(열기·새 탭)이 `session.json` 을 덮어써 복원이 읽을 목록이 지워졌다 | v2026-11-0201 수정: `init_app` 이 맨 먼저 목록을 읽고, 복원이 끝날 때까지 `_save_session` 은 미뤘다가 끝에 한 번 저장 + `projects_changed`(`_session_lock` 하나로 스냅샷+쓰기). 복원 중 사람이 열거나 누른 탭(`_note_user_tab`)은 남기고 화면도 그대로. 경로 확인은 병렬·최대 4초, 탭 하나가 깨져도 나머지는 복원. 프런트는 `_shownPid` ≠ 활성 탭이면 `refreshProjects` 가 다시 그림(스스로 탭을 바꾸는 중엔 `_localTabOps` 로 미룸). 로그 `Opened N project(s) at startup (X.Xs)` |
@@ -509,7 +523,7 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 | 저장한 프로젝트인데 켜자 팀·프로젝트를 다시 물음 | 그 팀·프로젝트가 목록에서 빠짐(시트 종료·관리자 보관) 또는 파일에 값 하나가 빔 | 정상. 창의 안내대로 다시 고름 (§2.3) |
 | 에이전트 요청이 `needs_billing` | 그 탭 팀·프로젝트 미설정 또는 목록에서 빠짐 | 사람이 탭의 "!" 또는 우클릭 "팀·프로젝트…" (탭을 안 옮기고 고름) |
 | 에이전트 요청이 `bad_aspect` 등 | 그 모델이 모르는 값을 보냄 | 응답의 `allowed` 중에서 다시 (§2.2) |
-| `/api/batch` 가 `no_such_batch` | 안 들어갔거나 거절됨, 앱 재시작(집계는 메모리), 또는 그 탭의 최근 50개 밖 | 갤러리 `?batch_id=` 로 찾기. 호출자 id 면 같은 id 로 다시 보내도 두 번 안 만든다 |
+| `/api/batch` 가 `no_such_batch` | 안 들어갔거나 거절됨, 앱 재시작(집계는 메모리), 또는 그 탭의 최근 50개 밖 | 갤러리 `?batch_id=` 로 찾기. 앱이 그대로면 같은 호출자 id 로 다시 보내도 두 번 안 만든다. 재시작 뒤 그림이 없으면 새로 만들고, 돌던 장은 값이 나갔을 수 있다 — 사람에게 물을 것 (§2.2) |
 
 ---
 

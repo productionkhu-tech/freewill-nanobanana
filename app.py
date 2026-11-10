@@ -322,9 +322,16 @@ def _gemini_image_size_ok(model, size):
 # the gpt-image-2 path like GPT is isolated from Gemini.
 # ==========================================
 SEEDREAM_BASE_URL = "https://ark.ap-southeast.bytepluses.com/api/v3"
-SEEDREAM_MODEL_IDS = ("seedream-5-0-pro-260628", "seedream-5-0-flash-260915", "seedream-4-5-251128")
+SEEDREAM_MODEL_IDS = ("seedream-5-5-261028", "seedream-5-0-pro-260628", "seedream-5-0-flash-260915",
+                      "seedream-4-5-251128")
+# Seedream 5.5 (early access doc 2026-11-07): `background` auto|transparent|opaque on text-to-image and
+# image-to-image alike. 5.0 pro only takes it for one alpha PNG in, so it is left out there.
+SEEDREAM_ALPHA_MODEL_IDS = ("seedream-5-5-261028",)
+# Every model the "Transparent background" box applies to (the setting keeps its old name).
+BG_TRANSPARENT_MODEL_IDS = GPT_LADDER_MODEL_IDS + SEEDREAM_ALPHA_MODEL_IDS
 # output_format: 5.0 pro/flash accept png/jpeg; 4-5 is jpeg-only (param unsupported -> omit)
 _SEEDREAM_OUTPUT_FORMAT = {
+    "seedream-5-5-261028": "png",
     "seedream-5-0-pro-260628": "png",
     "seedream-5-0-flash-260915": "png",
     "seedream-4-5-251128": None,
@@ -341,8 +348,11 @@ _SEEDREAM_5_SIZES = {
     "2K": {"1:1": "2048x2048", "4:3": "2368x1776", "3:4": "1776x2368", "16:9": "2816x1584",
            "9:16": "1584x2816", "3:2": "2496x1664", "2:3": "1664x2496", "21:9": "3136x1344"},
 }
-# aspect+resolution -> "WxH" (BytePlus official mapping)
+# aspect+resolution -> "WxH" (BytePlus official mapping). 5.5 lists the same levels and ratios as
+# 5.0 pro. Its one-pager says 4K, the API does not: "4K" and anything over 4,624,220 px are
+# refused (2026-11-10, checked without generating).
 _SEEDREAM_SIZES = {
+    "seedream-5-5-261028": _SEEDREAM_5_SIZES,
     "seedream-5-0-pro-260628": _SEEDREAM_5_SIZES,
     "seedream-5-0-flash-260915": _SEEDREAM_5_SIZES,
     "seedream-4-5-251128": {
@@ -358,6 +368,7 @@ _SEEDREAM_SIZES = {
 # custom sizes that BytePlus would actually have accepted (e.g. 4800x960 =
 # 4,608,000 px, valid, was being cut to 4576x912). Do NOT drop the 1.1025.
 _SEEDREAM_CUSTOM = {
+    "seedream-5-5-261028": (921_600, 4_624_220),         # measured: 2160x2160 and 3840x2160 refused
     "seedream-5-0-pro-260628": (921_600, 4_624_220),
     "seedream-5-0-flash-260915": (921_600, 4_624_220),   # same documented bounds as pro
     "seedream-4-5-251128": (3_686_400, 16_777_216),
@@ -443,6 +454,9 @@ def _seedream_endpoint(model):
         # Not in _ARK_ENDPOINT_DEFAULTS on purpose: no installer ever wrote an env
         # variable for it, so the key cleanup has nothing to recognise.
         return "dola-seedream-5-0-flash-260915"
+    if model == "seedream-5-5-261028":
+        # The only id BytePlus documents for 5.5. Same reason as flash for no env override.
+        return "dola-seedream-5-5-261028"
     return model
 
 
@@ -545,6 +559,30 @@ def _extract_usage(provider, result_obj, pil=None, file_px=None):
 
 
 _USAGE_TOKEN_KEYS = ("in_text_tokens", "in_image_tokens", "out_tokens", "out_text_tokens")
+# A retryable HTTP status, standing as a number of its own (see is_retryable_error).
+_RETRY_STATUS_RE = re.compile(r"(?<![0-9a-z])(?:429|500|502|503|504)(?![0-9a-z])")
+
+
+def _retryable_by_exception(exc):
+    """What the exception itself says about trying again: True / False, or None when it
+    says nothing and the text has to decide. An HTTP status wins over any number that
+    happens to be in the message ("prompt must be at most 500 characters" is a 400)."""
+    if exc is None:
+        return None
+    if hasattr(exc, "retryable"):              # call_api decided it per provider
+        return bool(exc.retryable)
+    code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if isinstance(code, int) and not isinstance(code, bool) and 400 <= code < 600:
+        return code in (408, 429) or code >= 500
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    try:
+        import httpx
+        if isinstance(exc, httpx.TransportError):
+            return True
+    except Exception:
+        pass
+    return None
 
 
 def _may_have_billed(e):
@@ -720,6 +758,7 @@ _ALL_MODEL_IDS = (
     "gemini-3.1-flash-image",
     "gemini-nano-banana-2.1",
     "gemini-3.1-flash-lite-image",
+    "seedream-5-5-261028",
     "seedream-5-0-pro-260628",
     "seedream-5-0-flash-260915",
     "seedream-4-5-251128",
@@ -1315,11 +1354,23 @@ class AppState:
         self.vertex_session_disabled = True
         self.log(f"Vertex disabled for this session ({reason})" if reason else "Vertex disabled for this session")
 
-    def is_retryable_error(self, err):
+    def is_retryable_error(self, err, exc=None):
+        # The exception knows better than its text: an HTTP status says it outright, and a
+        # dropped connection from httpx (which google-genai raises unwrapped, e.g. "Server
+        # disconnected without sending a response.") has no marker words at all.
+        verdict = _retryable_by_exception(exc)
+        if verdict is not None:
+            return verdict
         err_lower = err.lower()
+        # Status codes only as a number of their own. As plain substrings they matched
+        # request ids ("Request id: 0217...5004b7...") and object addresses ("at
+        # 0x00000215003A..."): a BytePlus 400 was sent again up to five times, and a
+        # paid-for file that would not decode was paid for again.
+        if _RETRY_STATUS_RE.search(err_lower):
+            return True
         markers = (
-            "429", "resource_exhausted", "timeout", "timed out",
-            "deadline exceeded", "500", "502", "503", "504",
+            "resource_exhausted", "timeout", "timed out",
+            "deadline exceeded",
             "internal server error", "server error", "service unavailable",
             "temporarily unavailable", "bad gateway", "gateway timeout",
             "connection reset", "connection aborted", "connection refused",
@@ -1327,18 +1378,19 @@ class AppState:
         )
         return any(m in err_lower for m in markers)
 
-    def should_fallback(self, provider, err_text):
+    def should_fallback(self, provider, err_text, exc=None):
         err_lower = err_text.lower()
         if provider == "studio":
             # A rejected Studio key is exactly when the Vertex path should take over.
-            return self.is_retryable_error(err_text) or _is_auth_error(err_text)
+            return self.is_retryable_error(err_text, exc) or _is_auth_error(err_text)
         if provider == "vertex":
-            return "invalid_grant" in err_lower or self.is_retryable_error(err_text)
+            return "invalid_grant" in err_lower or self.is_retryable_error(err_text, exc)
         return False
 
     def call_api(self, model, contents, config, preferred_provider=None):
         errors = []
         no_answer = False       # a provider got the request and we never heard back
+        retry_any = False       # one of them failed in a way worth trying again
         providers = self.build_provider_order(preferred_provider)
         for i, provider in enumerate(providers):
             client = self.get_provider_client(provider)
@@ -1371,9 +1423,10 @@ class AppState:
                 self.log(f"{label} failed ({time.time()-t:.1f}s): {err_text[:80]}")
                 errors.append(f"{provider}: {err_text[:120]}")
                 no_answer = no_answer or _may_have_billed(e)
+                retry_any = retry_any or self.is_retryable_error(err_text, e)
                 if provider == "vertex" and "invalid_grant" in err_text.lower():
                     self.disable_vertex_for_session("invalid_grant")
-                if i < len(providers) - 1 and self.should_fallback(provider, err_text):
+                if i < len(providers) - 1 and self.should_fallback(provider, err_text, e):
                     next_p = providers[i + 1]
                     self.log(f"-> {self.get_provider_label(next_p)} fallback")
                     continue
@@ -1382,6 +1435,9 @@ class AppState:
         failure = RuntimeError(f"All providers failed: {'; '.join(errors)}" if errors
                                else _no_client_error("Gemini"))
         failure.no_answer = no_answer
+        # Decided here, where each provider's own exception is still in hand; the joined
+        # text above is for the log and the card.
+        failure.retryable = retry_any
         raise failure
 
     def extract_image_from_response(self, resp):
@@ -2583,7 +2639,7 @@ class AppState:
                 if _is_auth_error(detail) and attempt < max_retries - 1 and \
                         _keys_changed_since(keys_before, label):
                     continue
-                if self.is_retryable_error(err) and attempt < max_retries - 1:
+                if self.is_retryable_error(err, e) and attempt < max_retries - 1:
                     wt = delay + random.uniform(2, 8)
                     self.log(f"[{idx+1}] Retryable error. Wait {wt:.0f}s (retry {attempt+1}/{max_retries})")
                     if not self.sleep_with_cancel(wt):
@@ -2621,11 +2677,14 @@ class AppState:
         # 4-5 supports batch; force a single image. pro rejects this param -> omit.
         if model == "seedream-4-5-251128":
             extra["sequential_image_generation"] = "disabled"
-        # 5.0 pro / flash: prompt optimisation stays "standard" (higher quality) -
-        # said out loud instead of leaning on the API default. Flash has no other
-        # mode; pro's "fast" trades quality for speed and is not used.
-        if model in ("seedream-5-0-pro-260628", "seedream-5-0-flash-260915"):
+        # 5.5 / 5.0 pro / flash: prompt optimisation stays "standard" (higher quality) -
+        # said out loud instead of leaning on the API default. Flash and 5.5 have no
+        # other mode (5.5 refuses "fast"); pro's "fast" trades quality and is not used.
+        if model in ("seedream-5-5-261028", "seedream-5-0-pro-260628", "seedream-5-0-flash-260915"):
             extra["optimize_prompt_options"] = {"mode": "standard"}
+        # 5.5: auto | transparent. Only _gen_img_cfg puts it in, so other models never send it.
+        if img_cfg.get("background"):
+            extra["background"] = img_cfg["background"]
         kwargs = dict(model=_seedream_endpoint(model), prompt=prompt_s, size=size,
                       response_format="b64_json", extra_body=extra)
         if outfmt:  # pro -> "png"; 4-5 -> None (jpeg default, param unsupported)
@@ -2668,7 +2727,9 @@ class AppState:
                 pil = _to_display_image(Image.open(io.BytesIO(base64.b64decode(b64))))
                 return {"status": "success", "index": idx, "seed": seed,
                         "image": pil, "elapsed": time.time() - start, "api_used": "seedream",
-                        "usage": tries.image("seedream", result, pil)}
+                        "usage": tries.image("seedream", result, pil),
+                        # 5.5 says what it actually gave: "auto" may come back transparent.
+                        "background": getattr(data_list[0], "background", None)}
             except Exception as e:
                 err = str(e)
                 if err == "Cancelled":
@@ -2679,7 +2740,7 @@ class AppState:
                 if _is_auth_error(detail) and attempt < max_retries - 1 and \
                         _keys_changed_since(keys_before, label):
                     continue
-                if self.is_retryable_error(err) and attempt < max_retries - 1:
+                if self.is_retryable_error(err, e) and attempt < max_retries - 1:
                     wt = delay + random.uniform(2, 8)
                     if not self.sleep_with_cancel(wt):
                         return tries.end({"status": "cancelled", "index": idx, "seed": seed})
@@ -2799,7 +2860,7 @@ class AppState:
                 if _is_auth_error(err) and attempt < max_retries - 1 and \
                         _keys_changed_since(keys_before, "Gemini"):
                     continue
-                if self.is_retryable_error(err) and attempt < max_retries - 1:
+                if self.is_retryable_error(err, e) and attempt < max_retries - 1:
                     wt = delay + random.uniform(2, 8)
                     self.log(f"[{idx+1}] Retryable error. Wait {wt:.0f}s (retry {attempt+1}/{max_retries})")
                     if not self.sleep_with_cancel(wt):
@@ -3121,6 +3182,10 @@ class AppState:
                             "agent": bool(job.get("agent")),
                             "output_format": job.get("output_format") or "png",
                         }
+                        # What the model says it gave (Seedream 5.5): an "auto" request
+                        # can come back cut out, and the grid should show that.
+                        if result.get("background"):
+                            gen_settings["background_returned"] = str(result["background"])
                         # A GIF ignores the tab's ratio and 1K/2K/4K: Load gets those
                         # back as they were, while the card shows what the file really is.
                         card_aspect, card_res = aspect, resolution
@@ -4335,7 +4400,10 @@ def get_gallery():
             # listing deliberately doesn't ship the whole settings blob, and the
             # grid needs this one bit to put a checkerboard behind a cut-out.
             # An SVG comes back with an empty background unless asked otherwise.
-            "transparent": bool(item.get("generation_settings", {}).get("openai_bg_transparent")) or _is_svg_path(fp),
+            # When the model said what it returned (Seedream 5.5), that wins over what was
+            # asked: an "auto" can come back cut out, a cut-out request can come back opaque.
+            "transparent": ((gs.get("background_returned") == "transparent") if gs.get("background_returned")
+                            else (bool(gs.get("openai_bg_transparent")) or _is_svg_path(fp))),
             "format": os.path.splitext(fp)[1].lstrip(".").lower(),
             "generated_at": item.get("generated_at", ""),
             "favorite": fp in state.favorites,
@@ -5180,6 +5248,11 @@ def _gen_img_cfg(model, aspect, resolution, quality, custom_w, custom_h, bg_tran
         _of = _SEEDREAM_OUTPUT_FORMAT.get(model)
         if _of:
             img_cfg["output_format"] = _of
+        if model in SEEDREAM_ALPHA_MODEL_IDS:
+            # Box on -> transparent. Off -> auto, the API's own default said out loud: the model
+            # decides from the prompt ("no background" can come back cut out). Always png, so
+            # transparent never meets the jpeg it refuses.
+            img_cfg["background"] = "transparent" if bg_transparent else "auto"
         return img_cfg
     # H2: Gemini "auto" = OMIT aspect_ratio so the model auto-matches the
     # input image ratio. Passing the literal "auto" string crashes
@@ -5396,9 +5469,10 @@ def _start_generate_agent(p, d):
 
     batch_id, made by the caller, is what makes a lost connection safe: the caller
     knows the id before it sends, can ask /api/batch about it afterwards, and can
-    send the same request again — one id never generates twice. The id is claimed
-    before the slow part, so /api/batch already says "preparing" while the references
-    are being read. A refused request lets go of it."""
+    send the same request again — while the app still remembers an id it never
+    generates twice (restarts: see api_batch). The id is claimed before the slow part,
+    so /api/batch already says "preparing" while the references are being read. A
+    refused request lets go of it."""
     check_only = _flag_on(d.get("check_only"))
     bid = d.get("batch_id")
     if bid in (None, ""):
@@ -5485,7 +5559,7 @@ def _agent_batch(p, d, batch_id, check_only):
     else:
         bg_transparent = not (bg_sent is False or bg_sent == 0
                               or str(bg_sent).strip().lower() in ("false", "0", "no", "off"))
-        if bg_transparent and model not in GPT_LADDER_MODEL_IDS:
+        if bg_transparent and model not in BG_TRANSPARENT_MODEL_IDS:
             return jsonify({"ok": False, "model": model, "field": "openai_bg_transparent",
                             "error": "bad_openai_bg_transparent", "allowed": []})
     # Sent for a model that does not take it (or an unknown level) -> refused like
@@ -5723,8 +5797,11 @@ def api_batch():
 
     preparing=true: the request is in and its references are being read.
     no_such_batch: not on this tab — never arrived, refused, gone with a restart, or
-    long finished. Sending the same batch_id again is safe: what it made is looked
-    up in the gallery of every open tab, so it does not generate twice.
+    long finished. With the app still running, sending the same batch_id again is safe:
+    it is looked up on every open tab. Not after a restart: the tally is gone, so a
+    batch with no image in the gallery runs again, and an image that was on its way
+    out when the app went down may already be paid for. Ask a person then. (Same for
+    a failed batch with no image once 50 newer ones have pushed it out of the tally.)
 
     Money, per image: billed = paid for, finished or not. billed_failed = the failed
     or cancelled ones among them (a provider also charges for a broken file and for

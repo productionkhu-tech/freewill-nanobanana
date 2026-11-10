@@ -443,10 +443,12 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   다른 시드림 모델엔 `background` 를 절대 안 보낸다(`SEEDREAM_ALPHA_MODEL_IDS`, 칸이 듣는 모델 전체는 `BG_TRANSPARENT_MODEL_IDS`). 응답의 `data[].background` 를 `background_returned` 로 남겨,
   모델이 돌려준 값이 있으면 그게 갤러리 체크무늬를 정한다(`auto` 가 투명으로 와도, 켰는데 불투명으로 와도). 실측(1K, 2026-11-10): 끔 → opaque, 켬 → 투명 픽셀 57%, 레퍼런스에서 오려 내기 → 87%.
   **단가는 BytePlus 콘솔 "모델 활성화" 화면에만 있다**(2026-11-10. 문서 가격표·One-pager 는 아직 TBD): 출력 장당 **$0.020~0.035**, 입력 이미지 장당 **$0.008**(레이어 분해 출력도 $0.020~0.035).
-  D1 `prices` 의 `seedream-5-5-261028` 행: `mode='image'`·$0.020 / 2.61M px 초과 $0.035·레퍼런스 장당 $0.008·무료 0장·`verified=1`. **추정 두 가지**: 구간 경계를 5.0 Pro 와 같은 2.61M px 로 봤고(1K·1.5K / 2K),
-  레퍼런스 첫 장 무료 여부는 화면에 없어 전부 과금으로 넣었다(5.0 Pro 는 첫 장 무료) — 콘솔 금액의 툴팁이나 청구서로 확인되면 "이 행 수정" 으로 고칠 것(`effective_from` 2000-01-01 이라 지난 사용량도 다시 계산된다).
+  D1 `prices` 의 `seedream-5-5-261028` 행: `mode='image'`·$0.020 / 2.61M px 초과 $0.035·레퍼런스 장당 $0.008·**첫 장 무료**(`in_free_count` 1)·`verified=1`.
+  **청구로 확인된 것**(11/10): 1K 는 청구서의 low-res 줄로 장당 $0.020(ta-test 3장), 레퍼런스 1장이 $0 으로 청구 → 첫 장 무료(1건뿐이라 미확정).
+  **아직 모르는 것**: $0.035 가 붙는 경계 px — 2.61M 은 5.0 Pro 를 따른 가정이다. 콘솔 금액의 툴팁이나 1.5K·2K 청구 줄로 확인되면 `per_image_hi`·`px_threshold` 를 "이 행 수정" 으로 고칠 것(`effective_from` 2000-01-01 이라 지난 사용량도 다시 계산된다).
   **`mode='token'` 으로 바꾸지 말 것** — 5.5 응답엔 `output_tokens`(1K 에 4096)도 오고 `_extract_usage` 가 `out_tokens` 로 옮기므로, token 으로 두면 그 토큰에 값이 매겨진다. 워커가 자동으로 만든 행은 provider 가 앱 값(`seedream`)이라 `byteplus` 로 고쳤다.
-  **앱에 안 넣은 것**: 레이어 분해(`layer_decomposition`, 이미지 1장 → 최대 100장 투명 레이어 + 글자 인식 `text_recognition`. 요청 1번에 파일 수십 장이라 작업·저장 구조를 따로 설계해야 하고, 분당 한도가 `max_images` 만큼 미리 차감된다), `safety_identifier`(선택)
+  **앱에 안 넣은 것**: 레이어 분해(`layer_decomposition`, 이미지 1장 → 최대 100장 투명 레이어 + 글자 인식 `text_recognition`. 요청 1번에 파일 수십 장이라 작업·저장 구조를 따로 설계해야 하고, 분당 한도가 `max_images` 만큼 미리 차감된다.
+  **과금은 레이어 한 장마다**(장당 $0.020~0.035, 요청 1번에 최대 100장) — 넣게 되면 사용량의 `images` 에 돌려받은 레이어 수를 넣을 것. 1 로 두면 99장이 공짜로 집계된다), `safety_identifier`(선택)
 - **Nano Banana 2.1** = `gemini-nano-banana-2.1` (v2026-10-0701~). **ID 규칙이 바뀌었다** — 이름에 "gemini-3"도
   "3.1"도 없다. 그래서 모델 이름 글자로 기능을 가르면 조용히 틀어진다(예전 `"gemini-3" in model` 검사 때문에
   2K/4K 가 안 실릴 뻔했다). 해상도는 `_GEMINI_IMAGE_SIZES`, 확장 비율(1:4·8:1 등)은 `_GEMINI_EXT_ASPECT_MODELS`

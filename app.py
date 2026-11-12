@@ -316,6 +316,21 @@ def _gemini_image_size_ok(model, size):
     return True if allowed is None else (size in allowed)
 
 
+def _gemini_size_token(resolution):
+    """The app's own name for a Gemini tier. The 512 tier is "512px" in the menus, saved
+    projects and the agent's `allowed` lists; "512" (the API's name) and the wrong "0.5K"
+    shipped in v1201/02 are read as the same tier when a request is built. The agent check
+    does not take "512" (see _agent_settings_problem)."""
+    return "512px" if resolution in ("0.5K", "512") else resolution
+
+
+def _gemini_wire_size(size):
+    """What goes into image_config.image_size. The documented value for the 512 tier is "512".
+    The API also takes 512px as an alias - its own error lists "1K, 2K, 4K, 512, 512P, 512PX"
+    (2026-11-12, checked without generating) - but the documented one is what is sent."""
+    return "512" if size == "512px" else size
+
+
 # ==========================================
 # Seedream (BytePlus ModelArk) — OpenAI-SDK-compatible image provider
 # Same `openai` client library, different base_url + ARK_API_KEY. Isolated from
@@ -5266,16 +5281,15 @@ def _gen_img_cfg(model, aspect, resolution, quality, custom_w, custom_h, bg_tran
     # 해상도를 받는 모델인가. 예전엔 "gemini-3" 글자 검사뿐이라, 이름 규칙이 바뀐
     # gemini-nano-banana-2.1 은 2K/4K 를 골라도 image_size 가 안 실려 늘 기본 해상도로 나왔다.
     if "gemini-3" in model or _normalize_model_name(model) in _GEMINI_IMAGE_SIZES:
-        # The Gemini API token is "512px", not "0.5K". v1201/02 shipped the
-        # wrong token; translate it here so even a project saved with "0.5K"
-        # (loaded straight into state) can't send the 400-causing value.
-        _size = "512px" if resolution == "0.5K" else resolution
+        # The app calls the 512 tier "512px" (a project saved with the wrong "0.5K" from
+        # v1201/02 reads as the same tier); the API is sent its documented "512".
+        _size = _gemini_size_token(resolution)
         # H10: only forward a tier this model actually supports. The lite
         # model matches the "gemini-3" test above but is 1K-only, so a 2K/4K
         # value carried over from another model would 400. Omitting the key
         # lets the model use its own default instead of failing the job.
         if _gemini_image_size_ok(model, _size):
-            img_cfg["image_size"] = _size
+            img_cfg["image_size"] = _gemini_wire_size(_size)
     return img_cfg
 
 
@@ -5364,6 +5378,9 @@ def _agent_settings_problem(model, aspect, resolution, quality):
         ok = sorted(a for a in _GEMINI_ASPECTS_31 if _gemini_aspect_ok(model, a))
         return {"error": "bad_aspect", "allowed": ["auto"] + ok}
     if "gemini-3" in model or _normalize_model_name(model) in _GEMINI_IMAGE_SIZES:
+        # Not _gemini_size_token: an agent's "512" would be stored as the batch's resolution, and
+        # the window has no "512" in its menu - Load on that card could land on 4K. The connector
+        # sends the menu's "512px"; "512" stays refused with the allowed list.
         size = "512px" if resolution == "0.5K" else resolution
         if not _gemini_image_size_ok(model, size):
             return {"error": "bad_resolution",

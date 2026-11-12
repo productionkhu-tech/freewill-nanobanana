@@ -1512,7 +1512,8 @@ function _holdHidden(selId, value) {
   sel.value = value;
 }
 
-// The Gemini API token is "512px" (NOT "0.5K" — verified: 0.5K returns 400).
+// The app's name for Gemini's 512 tier is "512px" (NOT "0.5K" — 0.5K returns 400). The
+// server sends the API's documented "512" (app.py _gemini_wire_size).
 // v2026-06-12 01/02 shipped the wrong "0.5K" token; migrate it back here.
 const _RES_MIGRATIONS = { "0.5K": "512px" };
 function migrateResolution(r) { return _RES_MIGRATIONS[r] || r; }

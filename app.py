@@ -1072,6 +1072,9 @@ class AppState:
         self.max_parallel_requests = 100
         self.pending_jobs = []
         self.pending_jobs_lock = threading.Lock()
+        # Set (under pending_jobs_lock) when the tab leaves the bar; _enqueue_batch turns a
+        # request away then. See _retire_tab.
+        self.closed = False
         # Per-batch tally (done / failed / cancelled) for callers that cannot
         # watch the window's pop-once events — the agent asks /api/batch.
         # Newest 50 kept; see _batch_open/_batch_note.
@@ -5452,6 +5455,18 @@ _BATCH_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")
 # id -> {"pid", "count"}. Not in a tab's `batches`: a worker ending would close them there.
 _batch_claims = {}
 _batch_claims_lock = threading.Lock()
+# Every agent batch opened in this run: id -> {"pid", "count"}. Never trimmed — a few dozen
+# bytes each. The tally keeps 50 per tab and the gallery forgets what a person deleted or
+# what never came out, so without this an old id sent again after both were gone was
+# taken as new and generated (and paid for) twice. A refused or check_only request never
+# opens a batch, so its id stays free. Memory only: a restart still forgets (api_batch).
+_batch_seen = {}
+_batch_seen_lock = threading.Lock()
+
+
+def _batch_remember(batch_id, pid, count):
+    with _batch_seen_lock:
+        _batch_seen.setdefault(batch_id, {"pid": pid, "count": int(count)})
 
 
 def _flag_on(value):
@@ -5461,10 +5476,12 @@ def _flag_on(value):
 
 
 def _batch_id_used(bid):
-    """Which open tab this id already went into -> (pid, count), else None. Every tab, not
+    """Which tab this id already went into -> (pid, count), else None. Every tab, not
     just the one named: pids are handed out afresh each run, so after a restart the same
     pid can be another tab — it would generate again, on that tab's team and project.
-    The tally is memory only and keeps 50; the gallery still remembers after a restart."""
+    The tally is memory only and keeps 50; the gallery still remembers after a restart;
+    _batch_seen remembers everything opened in this run, even on a tab closed since
+    (its pid is then gone — still better than paying twice)."""
     with shared.projects_lock:
         tabs = list(shared.projects.values())
     for t in tabs:
@@ -5478,6 +5495,10 @@ def _batch_id_used(bid):
         made = [gs for gs in made if gs.get("batch_id") == bid]
         if made:
             return t.pid, _safe_int(made[0].get("count"), len(made))
+    with _batch_seen_lock:
+        seen = _batch_seen.get(bid)
+    if seen is not None:
+        return seen["pid"], seen["count"]
     return None
 
 
@@ -5656,6 +5677,9 @@ def _agent_batch(p, d, batch_id, check_only):
         with p.pending_jobs_lock:
             outstanding = len(p.pending_jobs) + p.active_job_count
             stopping = bool(p.cancel_flag)
+            closed = p.closed
+        if closed:                      # closed while the references were read: as a real send would answer
+            return _no_such_tab()
         return jsonify(dict(sends, ok=True, check_only=True, pid=p.pid, model=model, count=count,
                             aspect=aspect, resolution=resolution, quality=quality, ignored=ignored,
                             outstanding=outstanding, stopping=stopping,
@@ -5697,6 +5721,13 @@ def _enqueue_batch(p, *, model, providers, prompt, count, aspect, resolution, qu
     # no worker" stall). Everything that reads or writes the shared
     # generator state now happens under pending_jobs_lock.
     with p.pending_jobs_lock:
+        if p.closed:
+            # Closed while this request was still reading its references (an agent's 4K
+            # set takes up to half a minute): it would run, and be paid for, on a tab
+            # nobody can see or stop. Nothing has started, so a caller's id stays free.
+            gone = jsonify({"ok": False, "error": "no_such_tab"})
+            gone.status_code = 404
+            return gone
         # If a Stop is in flight, the previous worker is either still
         # draining active futures or already in its teardown finally. Piling
         # new jobs onto pending_jobs right now would race: the worker's
@@ -5771,6 +5802,8 @@ def _enqueue_batch(p, *, model, providers, prompt, count, aspect, resolution, qu
         # Opened before the jobs become visible to the worker, so a fast first
         # result can never arrive for a batch the tally does not know yet.
         p._batch_open(batch_id, count, agent)
+        if agent:
+            _batch_remember(batch_id, p.pid, count)   # before the claim lets go
         p.pending_jobs.extend(new_jobs)
         p.queue_count += count
         outstanding_after = len(p.pending_jobs) + p.active_job_count
@@ -5814,11 +5847,11 @@ def api_batch():
 
     preparing=true: the request is in and its references are being read.
     no_such_batch: not on this tab — never arrived, refused, gone with a restart, or
-    long finished. With the app still running, sending the same batch_id again is safe:
-    it is looked up on every open tab. Not after a restart: the tally is gone, so a
+    long finished (50 newer ones pushed it out). With the app still running, sending the
+    same batch_id again is safe: every id opened in this run is remembered (_batch_seen),
+    whatever became of its tab or images. Not after a restart: the tally is gone, so a
     batch with no image in the gallery runs again, and an image that was on its way
-    out when the app went down may already be paid for. Ask a person then. (Same for
-    a failed batch with no image once 50 newer ones have pushed it out of the tally.)
+    out when the app went down may already be paid for. Ask a person then.
 
     Money, per image: billed = paid for, finished or not. billed_failed = the failed
     or cancelled ones among them (a provider also charges for a broken file and for
@@ -6032,8 +6065,10 @@ def api_projects():
                     # agent_model_defaults: 에이전트 요청의 빠진 값은 탭이 아니라 모델 기본이다(§2.2).
                     # 옛 앱과 섞여 있는 동안 커넥터가 어느 규칙인지 알 수 있게 한다.
                     # caller_batch_id·check_only 는 꼭 보고 보낼 것 — 옛 앱은 이 칸을 모르고 그대로 생성한다.
+                    # batch_id_run: 이 실행에서 받은 묶음 id 는 집계에서 빠지거나 그림이 지워지거나 탭이 닫혀도
+                    # 다시 보내면 duplicate 다(v2026-11-1301~). 이게 없는 앱은 50개가 지난 그림 없는 묶음을 새로 만든다.
                     "features": ["agent_pid", "agent_model_defaults", "caller_batch_id", "batch_billing",
-                                 "check_only", "waiting_tabs"],
+                                 "check_only", "waiting_tabs", "batch_id_run"],
                     "waiting_tabs": waiting})
 
 
@@ -6077,6 +6112,19 @@ def api_projects_switch():
     return jsonify({"ok": True, "active": pid})
 
 
+def _retire_tab(p):
+    """About to take p off the bar: False if it is generating (keep it), else mark it
+    closed. Under its queue lock, the one _enqueue_batch checks `closed` under, so a
+    request already past its checks for this tab either got in first (then this says
+    generating) or is turned away. Lock order: projects_lock, then pending_jobs_lock —
+    nothing holding a queue lock takes projects_lock."""
+    with p.pending_jobs_lock:
+        if p.is_generating:
+            return False
+        p.closed = True
+        return True
+
+
 @app.route("/api/projects/close", methods=["POST"])
 def api_projects_close():
     """Close a tab. Refuses while that project is still generating — killing a
@@ -6088,7 +6136,7 @@ def api_projects_close():
         proj = shared.projects.get(pid)
         if not proj:
             return jsonify({"ok": False, "error": "No such project"})
-        if proj.is_generating:
+        if not _retire_tab(proj):
             return jsonify({"ok": False, "error": "생성 중인 프로젝트입니다. 먼저 Stop을 눌러주세요.",
                             "generating": True})
         # Release the PIL handles this tab was holding.
@@ -6126,6 +6174,8 @@ def _drop_failed_tab(proj, was_active):
     screen. It used to fall to the LAST tab — invisible while the page never
     re-read the active tab, a jump to another project now that it does."""
     with shared.projects_lock:
+        with proj.pending_jobs_lock:
+            proj.closed = True
         shared.projects.pop(proj.pid, None)
         if proj.pid in shared.project_order:
             shared.project_order.remove(proj.pid)
@@ -7267,7 +7317,7 @@ def _restore_session(tabs=None):
                     continue
                 if (p.gallery_items or p.ref_path_list
                         or getattr(p, "_pending_refs", None)
-                        or p.compose_prompt().strip() or p.is_generating):
+                        or p.compose_prompt().strip() or not _retire_tab(p)):
                     continue
                 shared.projects.pop(pid, None)
                 shared.project_order.remove(pid)
@@ -7307,6 +7357,8 @@ def _restore_session(tabs=None):
 def _drop_tab(proj):
     """Take a tab restore made back off the bar (its file would not load)."""
     with shared.projects_lock:
+        with proj.pending_jobs_lock:
+            proj.closed = True
         shared.projects.pop(proj.pid, None)
         if proj.pid in shared.project_order:
             shared.project_order.remove(proj.pid)

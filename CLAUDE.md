@@ -3,7 +3,7 @@
 멀티 프로바이더 AI 이미지 생성 데스크톱 앱 (Flask + pywebview + PyInstaller).
 이 문서 하나로 **구조 · 원리 · 규칙 · 배포 · 관리**를 파악할 수 있게 씁니다. 낡은 내용을 발견하면 즉시 고칠 것.
 
-> 최종 갱신: 2026-11-12 (v2026-11-1201 기준 — Gemini 512 해상도를 문서 값 "512" 로 보냄 §6.1. 1001: 시드림 5.5·투명 배경 §6.1, 재시도 판단을 예외 우선으로 §7)
+> 최종 갱신: 2026-11-13 (v2026-11-1301 기준 — 묶음 id 를 실행 내내 기억해 두 번 생성 막음 · 레퍼런스 읽는 사이 닫힌 탭엔 생성 안 함 §2.2·규칙 25. 1201: Gemini 512 를 문서 값 "512" 로 §6.1. 1001: 시드림 5.5·투명 배경 §6.1, 재시도 판단을 예외 우선으로 §7)
 
 ---
 
@@ -126,7 +126,7 @@ NanoBanana.exe 실행
 ```
 | 요청 | 하는 일 |
 |---|---|
-| `GET /api/projects` | `agent_pid: true`·`features:["agent_pid","agent_model_defaults","caller_batch_id","batch_billing","check_only","waiting_tabs"]`(기능 확인), 탭마다 `pid·name·generating·billing_confirmed`, `waiting_tabs:[{name,path,missing_since}]`(드라이브가 안 붙어 못 연 지난 탭 — pid 없음, 같은 이름으로 새로 만들면 둘이 된다) |
+| `GET /api/projects` | `agent_pid: true`·`features:["agent_pid","agent_model_defaults","caller_batch_id","batch_billing","check_only","waiting_tabs","batch_id_run"]`(기능 확인), 탭마다 `pid·name·generating·billing_confirmed`, `waiting_tabs:[{name,path,missing_since}]`(드라이브가 안 붙어 못 연 지난 탭 — pid 없음, 같은 이름으로 새로 만들면 둘이 된다) |
 | `POST /api/generate` `{pid, prompt, settings:{model,aspect,resolution,quality,complexity,count,custom_w,custom_h,openai_bg_transparent,output_format,gif_size,gif_frames,gif_frame_ms}, ref_paths:[..], batch_id?, check_only?}` | 그 탭에 생성 → `{ok, batch_id, pid, count, queued, outstanding, sends, custom_changed?}`(`sends` = 프로바이더에 실제로 나갈 값). pid 가 없으면 예전 그대로(화면 탭의 입력칸 = 창의 Generate), 단 `batch_id`·`check_only` 를 pid 없이 보내면 `pid_required` |
 | `GET /api/batch?pid=&batch_id=` | 그 묶음의 `count·done·failed·cancelled·pending·finished·preparing·billed·billed_failed·billing_unknown·images·errors`. `finished` 면 더 올 것 없음 |
 | `GET /api/gallery?pid=&strict=1&batch_id=` | 그 묶음의 이미지 (항목마다 `batch_id`) |
@@ -145,7 +145,7 @@ NanoBanana.exe 실행
 - 크기 계산은 창·에이전트 모두 `_gen_img_cfg` 하나. 갤러리 "Load setup" 은 에이전트 프롬프트를 섹션 하나로 돌려준다
 - 창 쪽 표시: `batch_started` 이벤트(탭 줄 점이 첫 장이 아니라 시작부터 켜짐. 에이전트 묶음이면 "에이전트가 'X' 탭에서
   N장 생성을 시작했습니다" 토스트), `projects_changed`(탭 줄 다시 그림), 팀·프로젝트 미설정 탭의 "!" 표시
-- **호출자가 만드는 `batch_id`** (2026-11-06~, 영문·숫자·`-`·`_` 8~64자, **앱 전체에서 하나**): 연결이 끊겨도 돈이 두 번 안 나가게 하는 칸. 받자마자 `_batch_claims` 로 잡는다(레퍼런스 인코딩 전, 4K 12장이면 30초 가까이 걸린다) — 그동안 `/api/batch` 는 `preparing:true`. 이미 쓴 id 면 생성 없이 `{ok, duplicate:true, preparing, batch_id, pid, count}`. 열린 탭 전부의 집계·갤러리에서 찾는다(재시작하면 pid 가 새로 매겨져 같은 pid 가 다른 탭일 수 있다 — 그 탭 과금으로 또 만들면 안 된다). 답의 `pid` 가 있는 곳. 거절된 요청은 잡은 id 를 놓는다 → 앱이 그대로면 `no_such_batch` 일 때 같은 id 로 다시 보내도 안전. **재시작 뒤엔 아니다**: 앱은 재시작 전 묶음을 기억하지 못해 그림이 없으면 새로 만든다. 대기 중이던 장은 사라졌지만 돌던 장은 값이 나갔을 수 있다 → 커넥터가 `CSRF_TOKEN` 이 바뀐 것으로 재시작을 알아채고 사람에게 묻는다(pid 는 재시작 뒤 다른 탭일 수 있어 못 쓴다). **이 토큰을 실행마다 새로 만드는 방식을 바꾸면 커넥터 세션에 먼저 알릴 것.** 잡아 둔 id 를 탭의 `batches` 에 넣지 말 것 — 앞 워커가 끝날 때 닫아 버린다. **안 끝난 묶음은 50개 정리에서 밀어내지 않는다**(`count` 1 묶음 51개가 큐에 있으면 첫 id 를 잃고 두 번 생성됐다). **레퍼런스 인코딩을 큐 뒤로 옮기지는 않았다**(돈 나가는 경로를 건드리는 데 비해 이 칸으로 문제가 이미 풀린다)
+- **호출자가 만드는 `batch_id`** (2026-11-06~, 영문·숫자·`-`·`_` 8~64자, **앱 전체에서 하나**): 연결이 끊겨도 돈이 두 번 안 나가게 하는 칸. 받자마자 `_batch_claims` 로 잡는다(레퍼런스 인코딩 전, 4K 12장이면 30초 가까이 걸린다) — 그동안 `/api/batch` 는 `preparing:true`. 이미 쓴 id 면 생성 없이 `{ok, duplicate:true, preparing, batch_id, pid, count}`. 열린 탭 전부의 집계·갤러리에서 찾는다(재시작하면 pid 가 새로 매겨져 같은 pid 가 다른 탭일 수 있다 — 그 탭 과금으로 또 만들면 안 된다). 답의 `pid` 가 있는 곳. **그리고 이 실행에서 연 에이전트 묶음 id 를 전부 따로 기억한다**(`_batch_seen`, 지우지 않는다 — 한 줄에 수십 바이트, v2026-11-1301~ `features` 의 `batch_id_run`): 집계 50개에서 밀려나고 그림이 지워졌거나 다 실패했어도, 탭이 닫혔어도 duplicate. 그 전엔 이 경우 새 요청으로 받아 두 번 생성·과금했다(11/13 시뮬레이션에서 재현). 닫힌 탭이면 답의 `pid` 로 `/api/batch` 가 `no_such_tab` 이다. 거절된 요청·`check_only` 는 묶음을 안 열어 id 를 쓰지 않는다 → 앱이 그대로면 `no_such_batch` 일 때 같은 id 로 다시 보내도 안전(만들어졌으면 duplicate, 아니면 생성). **재시작 뒤엔 아니다**: 앱은 재시작 전 묶음을 기억하지 못해 그림이 없으면 새로 만든다. 대기 중이던 장은 사라졌지만 돌던 장은 값이 나갔을 수 있다 → 커넥터가 `CSRF_TOKEN` 이 바뀐 것으로 재시작을 알아채고 사람에게 묻는다(pid 는 재시작 뒤 다른 탭일 수 있어 못 쓴다). **이 토큰을 실행마다 새로 만드는 방식을 바꾸면 커넥터 세션에 먼저 알릴 것.** 잡아 둔 id 를 탭의 `batches` 에 넣지 말 것 — 앞 워커가 끝날 때 닫아 버린다. **안 끝난 묶음은 50개 정리에서 밀어내지 않는다**(`count` 1 묶음 51개가 큐에 있으면 첫 id 를 잃고 두 번 생성됐다). **레퍼런스 인코딩을 큐 뒤로 옮기지는 않았다**(돈 나가는 경로를 건드리는 데 비해 이 칸으로 문제가 이미 풀린다)
 - **`/api/batch` 의 돈** (2026-11-06~, 장 단위): `billed` 값이 나간 장, `billed_failed` 그중 실패·취소, `billing_unknown` 실패·취소인데 모르는 장(시간 초과·끊김, 사용량 없는 200, 워커 사고, SDK 가 안에서 다시 시도한 끝의 오류 — 앞 시도가 안 보인다). **실패한 묶음을 다시 보내도 돈이 더 안 나가는 건 뒤의 둘이 모두 0 일 때뿐이다.** PNG 라고 공짜가 아니다 — 제미나이는 이미지 없이 끝나도 청구된다(§6.1.1). 판단은 `_ImageAttempts`·`_result_charge`·`_may_have_billed`. OpenAI SDK 의 자체 재시도(`max_retries` 기본 2)는 그대로 두고 `x-stainless-retry-count` 로 알아본다 — 끄면 재시도 간격이 앱 쪽 10초대로 바뀐다
 - **`check_only`** (2026-11-06~): 실제 생성과 같은 검사(거절 답도 똑같다)를 하고 `{ok, check_only:true, pid, model, count, aspect, resolution, quality, sends, custom_changed?, ignored, outstanding, queue_full, stopping}` 만 돌려준다. 생성·큐·묶음·탭·이벤트·과금 선택 전부 그대로(`_billing_gate(write=False)`), 폴더도 안 만들고 PNG 인코딩도 안 한다. `false·0·"false"·"0"·"no"·"off"` 외엔 전부 켬(돈이 안 나가는 쪽으로 읽는다). 큐가 찼거나 멈추는 중이면 값은 맞으니 거절하지 않고 `queue_full`·`stopping` 으로 알린다 — 그 상태로 보내면 잠깐 거절된다
 - **본문을 못 읽으면 `bad_json`** (2026-11-06~). 창은 본문 없이 보낸다. 예전엔 깨진 JSON·`text/plain` 이 빈 요청으로 읽혀 창의 Generate 로 떨어졌다 — 화면 탭에서 진짜 생성된다. Content-Type 은 안 본다(`force=True`)
@@ -289,6 +289,10 @@ gen_worker:
 24. **pid 가 온 요청을 화면 탭으로 폴백하지 말 것, 에이전트 경로에서 탭 입력칸(state)에 쓰지 말 것.** 폴백하면 사람이
     보고 있는 탭에 생성·저장이 새어 들어간다(닫힌 탭의 늦은 저장이 화면 탭 프롬프트를 덮던 경로도 같은 원인).
     pid 가 오면 읽기(`_tab_for_read`)·쓰기 모두 `_project_strict` → 없으면 404. 예외는 뷰어용 `/api/gallery`(strict 없이) 하나
+25. **탭을 `shared.projects` 에서 뺄 땐 `_retire_tab`(생성 중이면 거절) 또는 그 탭의 `pending_jobs_lock` 안에서 `closed = True`.**
+    에이전트 요청은 탭을 확인한 뒤 레퍼런스를 읽느라 수 초~30초 걸리고, 그 사이 닫힌 탭에 생성이 들어가면 보이지도
+    멈출 수도 없는(Stop → `no_such_tab`) 탭에서 값이 나간다(v2026-11-1201 까지, 4/4 재현). `_enqueue_batch` 가 같은 잠금 안에서
+    `closed` 를 보고 `no_such_tab`(404)으로 돌려보낸다 — 이때 호출자 id 는 안 쓴 것. 잠금 순서는 projects_lock → pending_jobs_lock 하나뿐
 
 ---
 
@@ -528,7 +532,7 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 | 저장한 프로젝트인데 켜자 팀·프로젝트를 다시 물음 | 그 팀·프로젝트가 목록에서 빠짐(시트 종료·관리자 보관) 또는 파일에 값 하나가 빔 | 정상. 창의 안내대로 다시 고름 (§2.3) |
 | 에이전트 요청이 `needs_billing` | 그 탭 팀·프로젝트 미설정 또는 목록에서 빠짐 | 사람이 탭의 "!" 또는 우클릭 "팀·프로젝트…" (탭을 안 옮기고 고름) |
 | 에이전트 요청이 `bad_aspect` 등 | 그 모델이 모르는 값을 보냄 | 응답의 `allowed` 중에서 다시 (§2.2) |
-| `/api/batch` 가 `no_such_batch` | 안 들어갔거나 거절됨, 앱 재시작(집계는 메모리), 또는 그 탭의 최근 50개 밖 | 갤러리 `?batch_id=` 로 찾기. 앱이 그대로면 같은 호출자 id 로 다시 보내도 두 번 안 만든다. 재시작 뒤 그림이 없으면 새로 만들고, 돌던 장은 값이 나갔을 수 있다 — 사람에게 물을 것 (§2.2) |
+| `/api/batch` 가 `no_such_batch` | 안 들어갔거나 거절됨, 앱 재시작(집계는 메모리), 또는 그 탭의 최근 50개 밖 | 갤러리 `?batch_id=` 로 찾기. 앱이 그대로면 같은 호출자 id 로 다시 보내도 두 번 안 만든다(1301~ 그림이 지워졌거나 탭이 닫혀도 — `batch_id_run`. 그 전 앱은 50개 밖 + 그림 없음이면 새로 만들었다). 재시작 뒤 그림이 없으면 새로 만들고, 돌던 장은 값이 나갔을 수 있다 — 사람에게 물을 것 (§2.2) |
 
 ---
 

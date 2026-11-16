@@ -5716,6 +5716,7 @@ def _enqueue_batch(p, *, model, providers, prompt, count, aspect, resolution, qu
                    custom_w, custom_h, img_cfg, ref_payloads, ref_paths, pinned_ref_paths,
                    fixed_prompt, prompt_sections, batch_id, agent):
     naming = p.get_naming_settings()
+    same = _mini_same_key(model, prompt, aspect, resolution, quality, custom_w, custom_h, img_cfg, ref_payloads)
     # --- Atomic critical section -----------------------------------------
     # Pre-v2101 the read of is_generating, the reset of counters, and the
     # set of is_generating=True all lived outside any lock. Two rapid
@@ -5807,7 +5808,7 @@ def _enqueue_batch(p, *, model, providers, prompt, count, aspect, resolution, qu
 
         # Opened before the jobs become visible to the worker, so a fast first
         # result can never arrive for a batch the tally does not know yet.
-        p._batch_open(batch_id, count, agent, mini=_mini_batch_meta(model, prompt, resolution, quality, img_cfg))
+        p._batch_open(batch_id, count, agent, mini=_mini_batch_meta(model, prompt, resolution, quality, img_cfg, same))
         if agent:
             _batch_remember(batch_id, p.pid, count)   # before the claim lets go
         p.pending_jobs.extend(new_jobs)
@@ -7069,17 +7070,36 @@ def _mini_model_name(m):
     return re.sub(r"^GPT Image (\d+\.\d+)", r"GPT \1", n)
 
 
-def _mini_batch_meta(model, prompt, resolution, quality, img_cfg):
-    """한 묶음이 미니창 줄에 쓰는 값 — 대기열에 넣는 순간의 값(창 · 에이전트 같은 길)."""
+def _mini_batch_meta(model, prompt, resolution, quality, img_cfg, same=""):
+    """한 묶음이 미니창 줄에 쓰는 값 — 대기열에 넣는 순간의 값(창 · 에이전트 같은 길).
+    same: 같은 일을 또 보냈는지 알아보는 열쇠(_mini_same_key)."""
     try:
         fmt = str((img_cfg or {}).get("output_format") or "").lower()
         q = ""
         if quality and openai_qualities(model):             # 품질은 GPT 에만 뜻이 있다
             q = str(openai_clamp_quality(model, quality))
         return {"model": str(model or ""), "res": str(resolution or ""), "quality": q,
-                "fmt": fmt.upper() if fmt in ("gif", "svg") else "", "prompt": str(prompt or "")[:300]}
+                "fmt": fmt.upper() if fmt in ("gif", "svg") else "", "prompt": str(prompt or "")[:300],
+                "same": str(same or "")}
     except Exception:
         return {"model": str(model or "")}
+
+
+def _mini_same_key(model, prompt, aspect, resolution, quality, custom_w, custom_h, img_cfg, ref_payloads):
+    """같은 프롬프트 · 같은 설정으로 여러 번 보낸 묶음을 미니창에서 한 줄 ×N 으로 합치는 열쇠(사용자 11/17).
+    모델 · 프롬프트 전체 · 비율 · 해상도 · 화질 · 그 밖에 보낼 값(img_cfg: 형식 · 투명 · GIF · 복잡도) ·
+    레퍼런스 그림 자체(경로가 아니라 보낼 바이트)가 같아야 같다. 장수와 시드는 뺀다. 락 밖에서 부를 것
+    (4K 레퍼런스 12장이면 수십 MB 를 읽는다). 못 만들면 '' — 그 묶음은 혼자 한 줄."""
+    try:
+        import hashlib
+        h = hashlib.sha1(json.dumps([str(model), str(prompt), str(aspect), str(resolution), str(quality),
+                                     str(custom_w), str(custom_h), img_cfg or {}],
+                                    sort_keys=True, default=str).encode("utf-8"))
+        for r in ref_payloads or []:
+            h.update(b"|" + (hashlib.sha1(bytes(r)).digest() if isinstance(r, (bytes, bytearray)) else b"-"))
+        return h.hexdigest()[:20]
+    except Exception:
+        return ""
 
 
 def _mini_code_name(p):
@@ -7096,9 +7116,61 @@ def _mini_code_name(p):
     return str(pid_)
 
 
+def _mini_row_end(g, now):
+    """한 줄이 보이는 끝 — 줄을 큰 묶음 하나처럼: 도는 게 있으면 지금, 다 끝났으면 마지막으로 끝난 때부터
+    실패가 있으면 10분, 없으면 90초(한 묶음의 규칙과 같다)."""
+    if any(not m["fin"] for m in g):
+        return now
+    return max(m["fin"] for m in g) + (MINI_FAIL_KEEP if any(m["b"]["failed"] for m in g) else MINI_DONE_KEEP)
+
+
+def _mini_linked(ms, now):
+    """한 줄로 합칠 묶음들(같은 탭 · 같은 일 · 같은 쪽). 시작 순서대로, 줄이 아직 보이는 동안 온 묶음은 그
+    줄에 붙고, 줄이 이미 빠진 뒤에 온 묶음은 새 줄을 연다 — 그래서 먼저 끝난 묶음도 나머지와 같이 빠지고
+    (사용자 11/17 '끝나면 같이 빠짐'), 끝난 지 오래된 옛 묶음이 새 줄에 섞여 숫자가 부풀지 않는다.
+    앞 줄은 다음 줄이 시작되기 전에 이미 빠졌으므로 보이는 줄은 많아야 하나 — 그 줄의 묶음(없으면 [])."""
+    rows = []
+    for m in sorted(ms, key=lambda x: x["started"]):
+        if rows and m["started"] <= _mini_row_end(rows[-1], now):
+            rows[-1].append(m)
+        else:
+            rows.append([m])
+    return rows[-1] if rows and _mini_row_end(rows[-1], now) >= now else []
+
+
+def _mini_row(p, name, code, g, now):
+    """같은 일 묶음들(g)을 한 줄로: 장수 · 진행은 합치고, 하나라도 돌면 도는 중, 다 끝나면 실패가 있으면 실패."""
+    g = sorted(g, key=lambda m: m["started"])
+    tot = {k: sum(m["b"][k] for m in g) for k in ("count", "done", "failed", "cancelled")}
+    open_ = [m for m in g if not m["fin"]]
+    if open_:
+        st_ = ("queued" if all(m["state"] == "queued" for m in open_) and not (tot["done"] or tot["failed"])
+               else "running")
+    else:
+        st_ = "failed" if tot["failed"] else "cancelled" if tot["cancelled"] else "done"
+    thumb = last = ""
+    for m in reversed(g):                       # the newest picture / error of the row
+        imgs = m["b"].get("images") or []
+        if imgs and not thumb:
+            thumb = imgs[-1]
+        if m["last"] and not last:
+            last = m["last"]
+    meta = g[-1]["meta"]
+    ends = [m["fin"] for m in g if m["fin"]]
+    return {"id": g[0]["id"], "ids": [m["id"] for m in g], "n": len(g), "pid": p.pid, "tab": name, "code": code,
+            "model": _mini_model_name(meta.get("model", "")), "model_id": meta.get("model", ""),
+            "res": meta.get("res", ""), "quality": meta.get("quality", ""), "fmt": meta.get("fmt", ""),
+            "thumb": thumb, "prompt": meta.get("prompt", ""), "agent": bool(g[0]["b"].get("agent")),
+            "count": tot["count"], "done": tot["done"], "failed": tot["failed"], "cancelled": tot["cancelled"],
+            "left": sum(m["rest"] for m in g), "finished": not open_, "state": st_, "sticky": st_ == "failed",
+            "elapsed": (max(ends) if not open_ else now) - g[0]["started"],
+            "started": g[0]["started"], "latest": g[-1]["started"], "last_error": last[:60]}
+
+
 def mini_summary():
-    """미니창이 그리는 것: 묶음 하나가 줄 하나(창 · 에이전트 모두, 에이전트 줄엔 MCP 칩). 순서는 도는 중 ·
-    대기 · 실패 · 끝남, 같은 무리 안에선 최신 먼저. 끝난 줄 90초, 실패 10분, 눌러 본 줄은 바로 빠진다."""
+    """미니창이 그리는 것: 묶음 하나가 줄 하나(창 · 에이전트 모두, 에이전트 줄엔 MCP 칩) — 단, 같은 탭에 같은
+    프롬프트 · 같은 설정으로 여러 번 보낸 묶음은 한 줄 ×N(창과 에이전트는 따로). 순서는 도는 중 · 대기 · 실패 ·
+    끝남, 같은 무리 안에선 최신 먼저. 끝난 줄 90초, 실패 10분, 눌러 본 줄은 바로 빠진다."""
     now = time.time()
     batches, alerts = [], []
     running = queued = 0
@@ -7125,6 +7197,7 @@ def mini_summary():
                 waiting[jb.get("batch_id")] = waiting.get(jb.get("batch_id"), 0) + 1
         with p.batch_lock:
             items = [(k, dict(v), list(v.get("errors") or []), dict(v.get("mini") or {})) for k, v in p.batches.items()]
+        same = {}
         for bid, b, errs, meta in items:
             fin = b.get("finished_at")
             rest = max(0, b["count"] - b["done"] - b["failed"] - b["cancelled"])
@@ -7132,10 +7205,9 @@ def mini_summary():
                 st_ = "failed" if b["failed"] else "cancelled" if b["cancelled"] else "done"
             else:
                 st_ = "queued" if rest and waiting.get(bid, 0) >= rest and not (b["done"] or b["failed"]) else "running"
-            sticky = st_ == "failed"
             with _mini_lock:
                 gone = bid in _mini_dismissed
-            if fin and (gone or now - fin > (MINI_FAIL_KEEP if sticky else MINI_DONE_KEEP)):
+            if fin and gone:
                 continue
             if st_ == "running":
                 oldest = b["started_at"] if oldest is None else min(oldest, b["started_at"])
@@ -7143,17 +7215,16 @@ def mini_summary():
             last = last.get("error", "") if isinstance(last, dict) else str(last)
             if re.search(r"(?:Error code|status|HTTP)[: ]+400(?![0-9])", last):   # 요청 번호 속 숫자가 아니라 상태 번호
                 last = "요청 거절(400)"
-            imgs = b.get("images") or []
-            batches.append({"id": bid, "pid": p.pid, "tab": name, "code": code,
-                            "model": _mini_model_name(meta.get("model", "")), "model_id": meta.get("model", ""),
-                            "res": meta.get("res", ""), "quality": meta.get("quality", ""), "fmt": meta.get("fmt", ""),
-                            "thumb": imgs[-1] if imgs else "", "prompt": meta.get("prompt", ""),
-                            "agent": bool(b.get("agent")), "count": b["count"], "done": b["done"],
-                            "failed": b["failed"], "cancelled": b["cancelled"], "left": rest, "finished": bool(fin),
-                            "state": st_, "sticky": sticky, "elapsed": (fin or now) - b["started_at"],
-                            "started": b["started_at"], "last_error": last[:60]})
+            m = {"id": bid, "b": b, "fin": fin, "rest": rest, "state": st_, "last": last, "meta": meta,
+                 "started": b["started_at"]}
+            # 창과 에이전트는 따로, 열쇠가 없는 묶음(못 만듦 · 옛 기록)은 혼자
+            same.setdefault((bool(b.get("agent")), meta.get("same") or "one:" + bid), []).append(m)
+        for g in same.values():
+            g = _mini_linked(g, now)
+            if g:
+                batches.append(_mini_row(p, name, code, g, now))
     group = {"running": 0, "queued": 1, "failed": 2, "done": 3, "cancelled": 3}
-    batches.sort(key=lambda x: (group[x["state"]], -x["started"]))
+    batches.sort(key=lambda x: (group[x["state"]], -x["latest"]))
     if not _mini_version:
         _mini_version.append(_read_version())          # read once, not on every poll
     return {"version": _mini_version[0], "running": running, "queued": queued,
@@ -7162,17 +7233,20 @@ def mini_summary():
 
 
 def mini_dismiss(bid=None, finished=False, pid_seen=None):
-    """사람이 줄을 눌러 봤다(끝난 줄은 바로 빠진다) / 막힘 알림을 눌러 봤다."""
+    """사람이 줄을 눌러 봤다(끝난 줄은 바로 빠진다) / 막힘 알림을 눌러 봤다.
+    bid: 묶음 id 하나 또는 목록 — ×N 줄은 그 줄의 묶음 전부(ids)를 한꺼번에."""
     with _mini_lock:
         if bid:
-            _mini_dismissed.add(str(bid))
+            for x in (bid if isinstance(bid, (list, tuple)) else [bid]):
+                if x:
+                    _mini_dismissed.add(str(x))
         if pid_seen and pid_seen in _mini_blocked:
             _mini_blocked[pid_seen]["seen"] = True
     if finished:
         for b in mini_summary()["batches"]:
             if b["finished"]:
                 with _mini_lock:
-                    _mini_dismissed.add(b["id"])
+                    _mini_dismissed.update(b.get("ids") or [b["id"]])
 
 
 @app.after_request

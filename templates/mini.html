@@ -83,6 +83,11 @@ body { box-shadow: inset 0 0 0 1px var(--ring); }
 .rt b { font-weight: 600; color: var(--sub); font-variant-numeric: tabular-nums; }
 .rt span { color: var(--faint); font-family: ui-monospace, Consolas, monospace; }
 .rt b.good { color: var(--good); } .rt b.red { color: var(--red); } .rt b.faint { color: var(--faint); }
+/* the same job sent N times is one row (user 11/17): its count, beside the status */
+.rtop { display: flex; align-items: center; gap: 4px; }
+.xn { font-style: normal; font-size: 9.5px; font-weight: 700; border-radius: 4px; padding: 0 4px; line-height: 14px;
+  background: var(--chip); color: var(--sub); font-variant-numeric: tabular-nums; }
+.xn:empty { display: none; }
 .note { padding: 7px 11px; font-size: 11px; color: var(--faint); border-bottom: 1px solid var(--line); }
 .more { padding: 5px 11px; font-size: 10.5px; color: var(--faint); border-bottom: 1px solid var(--line); cursor: pointer; }
 .more:hover { color: var(--sub); }
@@ -146,14 +151,15 @@ function rowFor(b) {
     el = document.createElement("div");
     el.className = "row";
     el.innerHTML = '<div class="ic"></div><div class="mid"><div class="p cut"></div><div class="m"></div>'
-      + '<div class="bar"><i class="d"></i><i class="x"></i></div></div><div class="rt"><b></b><span></span></div>';
+      + '<div class="bar"><i class="d"></i><i class="x"></i></div></div>'
+      + '<div class="rt"><div class="rtop"><em class="xn"></em><b></b></div><span></span></div>';
     rowEls.set(b.id, el);
   }
   el.onclick = () => {
     // rule 4: the main window opens on this tab; a finished row counts as seen and leaves at once
     if (!api()) return;
     api().open_main(b.pid);
-    if (b.finished) { api().dismiss(b.id); el.remove(); rowEls.delete(b.id); }
+    if (b.finished) { api().dismiss(b.ids || b.id); el.remove(); rowEls.delete(b.id); }   // a x N row: all its batches
   };
   const icKey = b.state + (b.state === "done" ? b.thumb : "");
   if (el.dataset.ic !== icKey) {
@@ -165,7 +171,8 @@ function rowFor(b) {
   const prompt = b.prompt || "(프롬프트 없음)";
   el.querySelector(".p").textContent = prompt;
   const proj = b.tab + " · " + (b.code ? "코드 " + b.code : "코드 없음");
-  el.title = prompt + "\n" + proj + (b.last_error ? "\n" + b.last_error : "") + "\n— 눌러서 본창의 그 탭으로"
+  el.title = prompt + "\n" + proj + (b.n > 1 ? "\n같은 작업 " + b.n + "번 · 합쳐서 " + b.count + "장" : "")
+    + (b.last_error ? "\n" + b.last_error : "") + "\n— 눌러서 본창의 그 탭으로"
     + (b.finished ? " (확인하면 목록에서 빠져요)" : "");
   el.querySelector(".m").innerHTML = b.state === "failed"
     ? '<span class="err cut">' + esc(b.last_error || "생성 실패") + "</span>"
@@ -177,6 +184,7 @@ function rowFor(b) {
   bar.style.display = b.finished ? "none" : "";
   bar.querySelector(".d").style.width = (100 * b.done / b.count) + "%";
   bar.querySelector(".x").style.width = (100 * b.failed / b.count) + "%";
+  el.querySelector(".xn").textContent = b.n > 1 ? "×" + b.n : "";
   const top = el.querySelector(".rt b"), bot = el.querySelector(".rt span");
   top.className = { done: "good", failed: "red", cancelled: "faint" }[b.state] || "";
   top.textContent = { running: b.done + "/" + b.count + "장", queued: "대기", done: "완료",

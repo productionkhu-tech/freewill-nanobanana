@@ -638,7 +638,8 @@ def _auto():
     blocked request) - unless the person closed the strip while work was running, until that work is done.
     Shown by itself: closes by itself once the list is empty. Shown by the person: stays."""
     summ = A.mini_summary()
-    active = {b["id"] for b in summ["batches"] if not b["finished"]}
+    # every batch, not every row: a new batch of the same job joins an existing x N row and is still new work
+    active = {i for b in summ["batches"] if not b["finished"] for i in (b.get("ids") or [b["id"]])}
     n_alerts = sum(a["n"] for a in summ["alerts"])
     fresh = bool(active - PREV["active"]) or n_alerts > PREV["alerts"]
     PREV["active"], PREV["alerts"] = active, n_alerts

@@ -117,8 +117,8 @@ body.pill .app { display: none; }          /* the pill is the small one: the bad
     <span class="grow"></span>
     <button class="btn on" id="pin" title="" aria-label="구석에 붙이기"><svg viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 3h6l-1 6 3 3v2H7v-2l3-3z"/></svg></button>
     <button class="btn" id="size" title="크기" aria-label="크기"><svg viewBox="0 0 24 24" id="sizeIco"></svg></button>
-    <button class="btn" id="main" title="본창 열기" aria-label="본창 열기"><svg viewBox="0 0 24 24"><path d="M15 3h6v6M10 14 21 3M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg></button>
-    <button class="btn" id="close" title="닫기" aria-label="닫기"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+    <button class="btn" id="main" title="본창 열기 (미니창은 들어가요)" aria-label="본창 열기"><svg viewBox="0 0 24 24"><path d="M15 3h6v6M10 14 21 3M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg></button>
+    <button class="btn" id="close" title="닫기 — 본창으로 돌아가요" aria-label="닫기"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
     <div class="stat" id="statline"><i class="dot" id="dot"></i><span class="cut" id="status">연결 중…</span><span class="time" id="time"></span></div>
   </div>
   <div class="bodyx" id="bodyx">
@@ -339,7 +339,8 @@ document.addEventListener("contextmenu", async e => {
     + [["pill", "알약"], ["card", "카드"], ["full", "펼침"]].map(([v, l]) => '<button data-a="size:' + v + '">' + dot(size === v) + "크기: " + l + "</button>").join("")
     + "<hr>" + [1, 0.85, 0.7, 0.55].map(o => '<button data-a="op:' + o + '">' + dot(Math.abs(prefs.opacity - o) < 0.01) + "투명도 " + Math.round(o * 100) + "%</button>").join("")
     + '<hr><button data-a="auto">' + (prefs.auto ? "☑ " : "☐ ") + "본창을 내렸을 때 새 작업이 생기면 띄우기</button>"
-    + '<button data-a="close">미니 창 닫기</button>';
+    + '<button data-a="close">미니 창 닫기 (본창으로)</button><hr>'
+    + '<button data-a="quit">앱 종료</button>';
   document.body.appendChild(m);
   const x = Math.min(e.clientX, innerWidth - m.offsetWidth - 4), y = Math.min(e.clientY, innerHeight - m.offsetHeight - 4);
   m.style.left = Math.max(4, x) + "px"; m.style.top = Math.max(4, y) + "px";
@@ -352,6 +353,7 @@ document.addEventListener("contextmenu", async e => {
     if (a === "auto") { prefs.auto = !prefs.auto; api().set_auto(prefs.auto); }
     if (a === "main") api().open_main();
     if (a === "close") api().close_mini();
+    if (a === "quit") api().quit_app();
   };
 });
 document.addEventListener("click", e => { if (!e.target.closest(".menu")) closeMenu(); });

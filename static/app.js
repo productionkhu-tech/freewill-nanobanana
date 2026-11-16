@@ -121,7 +121,7 @@ function _paintMiniToggle(visible) {
   const b = document.getElementById("miniToggleBtn");
   if (!b) return;
   b.classList.toggle("active", !!visible);
-  b.title = visible ? "미니 창 끄기" : "미니 창 켜기 (작업 상태를 화면 구석에)";
+  b.title = visible ? "본창으로 돌아오기" : "미니창으로 보기 — 본창은 숨고 작업 상태만 화면 구석에 (미니창의 ↗ 나 × 로 돌아와요)";
 }
 async function _syncMiniToggle() {
   const b = document.getElementById("miniToggleBtn");
@@ -140,7 +140,7 @@ async function toggleMiniWindow() {
   const d = await api("/api/mini/toggle", { method: "POST", body: {} });
   if (d.ok) {
     _paintMiniToggle(d.visible);
-    showToast(d.visible ? "미니 창을 켰습니다" : "미니 창을 껐습니다", "success");
+    if (!d.visible) showToast("본창으로 돌아왔습니다", "success");   // on: this window is gone, nobody sees a toast
   } else {
     showToast(d.error || "미니 창을 바꾸지 못했습니다", "error");
   }

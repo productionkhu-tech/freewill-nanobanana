@@ -27,6 +27,10 @@ EDGE = 22                        # our card sits 22 in from the work area's edge
 A = None                         # the app module (app.py), set by start()
 mini = None                      # the strip's pywebview window
 OPEN_MAIN = {"fn": None}         # how a click on the strip brings the main window back (start() wires it)
+# One of the two at a time (user 11/17 "미니창을 띄우면 당연히 본창은 없어져야", like Task Manager's compact view):
+# the main window's button hides the main window (taskbar too) and shows the strip; the strip's open / row / x
+# brings the main window back and puts the strip away. Never no window at all - NanoBanana has no tray icon.
+MAIN = {"w": None, "hidden": False}
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
@@ -664,7 +668,48 @@ def main_minimized():
 
 
 def main_shown():
+    """The main window is up again (restored from the taskbar, maximised): one of the two - the strip goes."""
     MAIN_STATE["visible"] = True
+    MAIN["hidden"] = False
+    if MINI_STATE["visible"] and not CLOSING["v"]:
+        try:
+            _hide_mini()
+        except Exception as e:
+            print("mini hide on main:", e, flush=True)
+
+
+def set_main(w):
+    """The main window (the test harness makes its own late)."""
+    MAIN["w"] = w
+
+
+def back_to_main(pid=None, billing=False):
+    """The strip's open / row / notice / x: the main window first (on that tab), then the strip goes - in that
+    order, so there is never a moment with no window."""
+    fn = OPEN_MAIN["fn"]
+    if fn:
+        try:
+            fn(pid, billing=bool(billing))
+        except Exception as e:
+            print("mini open_main:", e, flush=True)
+    MAIN["hidden"] = False
+    MAIN_STATE["visible"] = True
+    if MINI_STATE["visible"]:
+        _hide_mini()
+
+
+def to_mini():
+    """The main window's button: the strip first, then the main window goes (taskbar too)."""
+    DISMISS["v"] = False
+    _show_mini(auto=False)
+    w = MAIN["w"]
+    if w is not None and MINI_STATE["visible"]:
+        try:
+            w.hide()
+            MAIN["hidden"] = True
+            MAIN_STATE["visible"] = False
+        except Exception as e:
+            print("mini hide main:", e, flush=True)
 
 
 def _apply_opacity(v):
@@ -728,12 +773,14 @@ user32.TrackPopupMenu.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, 
                                   ctypes.c_void_p, ctypes.c_void_p]
 user32.DestroyMenu.argtypes = [ctypes.c_void_p]
 user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+
 user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
 MENU = [  # (id, action, label) - None is a separator
     (1, "main", "본창 열기"), None,
     (11, "size:pill", "크기: 알약"), (12, "size:card", "크기: 카드"), (13, "size:full", "크기: 펼침"), None,
     (21, "op:1", "투명도 100%"), (22, "op:0.85", "투명도 85%"), (23, "op:0.7", "투명도 70%"), (24, "op:0.55", "투명도 55%"), None,
-    (31, "auto", "본창을 내렸을 때 새 작업이 생기면 띄우기"), (32, "close", "미니 창 닫기"),
+    (31, "auto", "본창을 내렸을 때 새 작업이 생기면 띄우기"), (32, "close", "미니 창 닫기 (본창으로)"), None,
+    (41, "quit", "앱 종료"),
 ]
 MENU_DARK = {"done": False}
 
@@ -842,12 +889,7 @@ class Api:
     def open_main(self, pid=None, billing=False):
         if pid:
             A.mini_dismiss(pid_seen=pid)
-        fn = OPEN_MAIN["fn"]
-        if fn:
-            try:
-                fn(pid, billing=bool(billing))
-            except Exception as e:
-                print("mini open_main:", e, flush=True)
+        back_to_main(pid, billing)
 
     def dismiss(self, bid):
         A.mini_dismiss(bid=bid)
@@ -869,12 +911,26 @@ class Api:
             self.open_main()
         elif a == "close":
             self.close_mini()
+        elif a == "quit":
+            self.quit_app()
         return a
 
     def close_mini(self):
-        # closed by the person - stays closed until what is running now is done
-        DISMISS["v"] = _has_active(A.mini_summary())
-        _hide_mini()
+        # the strip's x: back to the main window (one of the two at a time; there is no tray to fall back to)
+        back_to_main()
+
+    def quit_app(self):
+        """The strip's menu 'quit': the main window comes back and closes the usual way (it asks to save)."""
+        back_to_main()
+        w = MAIN["w"]
+        if w is not None:
+            def later():
+                time.sleep(0.4)
+                try:
+                    user32.PostMessageW(_hwnd(w), 0x0010, 0, 0)      # WM_CLOSE -> the app's own close flow
+                except Exception as e:
+                    print("mini quit:", e, flush=True)
+            threading.Thread(target=later, daemon=True).start()
 
     def set_opacity(self, v):
         PREFS["opacity"] = min(1.0, max(0.3, float(v)))
@@ -891,13 +947,12 @@ def prefs_view():
 
 
 def toggle():
-    """The main window's button: off = like the strip's x, on = shown by the person (stays when empty)."""
+    """The main window's button (and a second launch of the app): one of the two - strip on and the main window
+    away, or the main window back and the strip away."""
     if MINI_STATE["visible"]:
-        DISMISS["v"] = _has_active(A.mini_summary())
-        _hide_mini()
+        back_to_main()
     else:
-        DISMISS["v"] = False
-        _show_mini(auto=False)
+        to_mini()
     return MINI_STATE["visible"]
 
 
@@ -912,7 +967,10 @@ def _focus_main(main_window, pid=None, billing=False):
             print("mini goto:", e, flush=True)
     try:
         h = _hwnd(main_window)
-        if user32.IsIconic(h):
+        if MAIN["hidden"]:
+            main_window.show()                                   # hidden by the strip's button (not minimised)
+            MAIN["hidden"] = False
+        elif user32.IsIconic(h):
             user32.ShowWindow(h, 9)                              # SW_RESTORE
         user32.SetForegroundWindow(h)
         if user32.GetForegroundWindow() != h:
@@ -937,6 +995,7 @@ def start(app_module, url, main_window=None, open_main=None, api=None):
     _prefs_load()
     CORNER["v"] = PREFS["corner"]
     LOCKED["v"] = PREFS["pinned"]
+    MAIN["w"] = main_window
     if open_main is not None:
         OPEN_MAIN["fn"] = open_main
     elif main_window is not None:

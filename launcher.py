@@ -263,6 +263,29 @@ def is_port_in_use(port):
 # If another NanoBanana is already running, focus its window and exit silently.
 _instance_mutex_handle = None
 
+def _ask_running_app_back_to_main():
+    """The running instance shows only its mini window: ask it, over its own HTTP API, to bring the main window
+    back (the same route as the main window's button). Print strings stay ASCII (rule 11)."""
+    try:
+        import json as _json
+        import re as _re
+        import urllib.request as _u
+        st = _json.loads(_u.urlopen(APP_URL + "/api/mini/visible", timeout=3).read())
+        if not st.get("visible"):
+            return False
+        html = _u.urlopen(APP_URL + "/", timeout=3).read().decode("utf-8", "replace")
+        m = _re.search(r'name="nb-csrf" content="([^"]+)"', html)
+        if not m:
+            return False
+        req = _u.Request(APP_URL + "/api/mini/toggle", method="POST", data=b"{}",
+                         headers={"Content-Type": "application/json", "X-NB-Token": m.group(1)})
+        _u.urlopen(req, timeout=5).read()
+        return True
+    except Exception as e:
+        print(f"  ask running app for its main window: {e}")
+        return False
+
+
 def _focus_existing_nanobanana_window():
     """Bring any already-running NanoBanana window to the front.
 
@@ -321,7 +344,11 @@ def _focus_existing_nanobanana_window():
         user32.EnumWindows(EnumWindowsProc(_cb), 0)
         hwnd = found_hwnd[0]
         if not hwnd:
-            return False
+            # No main window on screen: the running app may be showing only its
+            # mini window (the main window is hidden, taskbar too). Ask it to
+            # bring the main window back - launching the app again means "show me
+            # the app", and NanoBanana has no tray icon to do that from.
+            return _ask_running_app_back_to_main()
 
         SW_RESTORE = 9
         SW_SHOW = 5

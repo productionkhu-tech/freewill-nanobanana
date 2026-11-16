@@ -59,6 +59,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   // so asking just duplicated what is already on the tab bar — and answering
   // it left a spare empty tab behind. The picker still exists behind Load.
   initAlwaysOnTopButton();
+  initMiniToggle();
   wireProjectNameInputs();
   try {
     const d = await api("/api/delete-confirm-state");
@@ -111,6 +112,38 @@ async function initAlwaysOnTopButton() {
     const btn = document.getElementById("alwaysOnTopBtn");
     if (btn) btn.classList.toggle("active", !!d.enabled);
   } catch (_) { /* ignore */ }
+}
+
+// Mini window (v2026-11-1601): the button beside the pin shows / hides the small
+// status strip (mini_window.py). Only the Windows app has one: elsewhere the button
+// stays hidden. Polled so it follows the strip's own x and its auto-show.
+function _paintMiniToggle(visible) {
+  const b = document.getElementById("miniToggleBtn");
+  if (!b) return;
+  b.classList.toggle("active", !!visible);
+  b.title = visible ? "미니 창 끄기" : "미니 창 켜기 (작업 상태를 화면 구석에)";
+}
+async function _syncMiniToggle() {
+  const b = document.getElementById("miniToggleBtn");
+  if (!b) return;
+  try {
+    const d = await api("/api/mini/visible");
+    b.style.display = d.available ? "" : "none";
+    _paintMiniToggle(d.visible);
+  } catch (_) { /* ignore */ }
+}
+function initMiniToggle() {
+  _syncMiniToggle();
+  setInterval(_syncMiniToggle, 1500);
+}
+async function toggleMiniWindow() {
+  const d = await api("/api/mini/toggle", { method: "POST", body: {} });
+  if (d.ok) {
+    _paintMiniToggle(d.visible);
+    showToast(d.visible ? "미니 창을 켰습니다" : "미니 창을 껐습니다", "success");
+  } else {
+    showToast(d.error || "미니 창을 바꾸지 못했습니다", "error");
+  }
 }
 
 async function toggleAlwaysOnTop() {
@@ -4611,6 +4644,19 @@ async function pollEvents() {
     // A tab was made without switching to it (an agent, at the person's
     // request) — only the strip needs to know.
     if (ev.type === "projects_changed") { anyOther = true; continue; }
+    // A row or a notice was clicked in the mini window: go to that tab the way a
+    // click on the tab strip does (this tab's unsaved inputs first). The server
+    // must not switch behind the page's back — the page would show A while its
+    // Generate made B (review, 2026-11-16). A blocked request opens its picker.
+    if (ev.type === "mini_goto") {
+      const target = ev.target;
+      (async () => {
+        if (target && !projectTabs.length) await refreshProjects();
+        if (target && target !== activePid && projectTabs.some(t => t.pid === target)) await switchProject(target);
+        if (ev.billing && target) openBillingModal(target);
+      })();
+      continue;
+    }
     // A batch started somewhere. The strip shows its dot from this moment, not
     // from the first finished image; an agent's batch also says so on screen —
     // nobody should find images they did not know were being made.

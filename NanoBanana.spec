@@ -30,6 +30,8 @@ a = Analysis(
         'google.auth.crypt', 'google.auth.crypt.es256', 'google.auth.crypt.rsa',
         'google.oauth2', 'google.oauth2.service_account',
         'clr_loader', 'pythonnet',
+        # imported inside launcher.main() (v2026-11-1601) - named here so it is never left out
+        'mini_window',
         'tkinter', 'tkinter.filedialog',
     ],
     hookspath=[],

@@ -93,16 +93,24 @@ os.environ.setdefault(
     "--enable-gpu-rasterization --enable-zero-copy",
 )
 
-# DPI awareness so Windows scaling is respected
+# DPI awareness so Windows scaling is respected - before pywebview, whose own
+# SetProcessDPIAware() (system-aware: a 150% bitmap stretched onto a 100% monitor,
+# blurry) then fails harmlessly. Per-monitor v2 first (each monitor at its own
+# scale; the mini window's placement was tested in this mode, 2026-11-16), then
+# the per-monitor v1 this always used.
 if sys.platform == "win32":
     try:
         import ctypes
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        if not ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
         try:
-            ctypes.windll.user32.SetProcessDPIAware()
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
-            pass
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
 
 PORT = 5656
 APP_URL = f"http://127.0.0.1:{PORT}"
@@ -301,7 +309,9 @@ def _focus_existing_nanobanana_window():
                     return True
                 buf = ctypes.create_unicode_buffer(length + 1)
                 user32.GetWindowTextW(hwnd, buf, length + 1)
-                if buf.value.startswith("NanoBanana"):
+                # Not the mini window: it is topmost, so it comes first in the
+                # enumeration and would be "focused" instead of the app.
+                if buf.value.startswith("NanoBanana") and buf.value != "NanoBanana mini":
                     found_hwnd[0] = hwnd
                     return False  # stop enumeration
             except Exception:
@@ -1004,6 +1014,19 @@ def main():
     )
     _window = webview.create_window(**window_kwargs)
     _window.events.closing += on_closing
+
+    # The mini window (v2026-11-1601): created hidden; the button beside the pin
+    # shows it, and it shows by itself when this window is minimised and new work
+    # comes in. It must close with this window - pywebview only ends the app
+    # when every window is gone.
+    if sys.platform == "win32":
+        try:
+            import app as _app_module
+            import mini_window
+            mini_window.start(_app_module, f"{APP_URL}/mini", main_window=_window)
+            _window.events.closed += (lambda *a: mini_window.close())
+        except Exception as e:
+            print(f"  mini window: {e}")
 
     # Force the pywebview window + taskbar icon on Windows.
     # `webview.start(icon=...)` is unreliable on WebView2; use Win32 instead.

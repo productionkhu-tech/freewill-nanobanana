@@ -1,0 +1,398 @@
+{% raw %}<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>NanoBanana mini</title>
+<link rel="icon" href="data:,">  <!-- no /favicon.ico request: the server logs a non-API 404 as a 500 -->
+
+<style>
+/* The mini window (v2026-11-1601, mini_window.py draws the window, app.mini_summary() feeds it).
+   앱개발\Freewill_미니창_공통규칙.md: Seedance's frame (src/mini/MiniApp.tsx) with NanoBanana's badge.
+   Colours are Seedance's T.dark table - NanoBanana's main window has only the dark theme (rule 10).
+   Nothing may push the card wider: text cells shrink with an ellipsis, chips / buttons / status never do. */
+:root {
+  --bg: #1c1c1e; --ink: #f5f5f7; --sub: #a1a1aa; --faint: #7c7c85; --line: #2c2c31; --chip: #2c2c31;
+  --ind: #818cf8; --indSoft: #26304d; --good: #4ade80; --amber: #fcd34d; --amberSoft: #3b2f12;
+  --red: #f87171; --redSoft: #3a1d1d; --ring: rgba(255,255,255,0.1);
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { background: var(--bg); color: var(--ink); font-family: 'Malgun Gothic', 'Segoe UI', system-ui, sans-serif;
+  font-size: 12px; line-height: 1.4; overflow: hidden; user-select: none; -webkit-user-select: none; width: 100%; height: 100%; }
+body { box-shadow: inset 0 0 0 1px var(--ring); }
+/* The window is one size per step (카드 = room for 2 rows, 펼침 = 6), whatever is in it: rows come and go
+   inside it, and an alert takes its room from the list. (User 11/13: "알림창이 좀 점잖아야 함".) */
+#root { display: flex; flex-direction: column; min-width: 0; height: 100vh; }
+.head, .foot { flex: none; }
+.cut { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+
+.head { display: flex; flex-wrap: wrap; align-items: center; column-gap: 8px; row-gap: 4px; padding: 9px 8px 8px 11px; cursor: grab; }
+.badge { width: 18px; height: 18px; border-radius: 5px; background: linear-gradient(135deg, #f5d27a, #d4a24c); color: #1c1c1e;
+  font-size: 10px; font-weight: 700; display: grid; place-items: center; flex: none; }
+.app { font-size: 12.5px; font-weight: 600; flex: none; }
+.grow { flex: 1; }
+.btn { width: 22px; height: 22px; flex: none; border-radius: 6px; display: grid; place-items: center; color: var(--faint);
+  background: transparent; border: 0; cursor: pointer; padding: 0; }
+.btn:hover { background: var(--chip); color: var(--ink); }
+.btn.on { color: var(--ind); background: var(--indSoft); }
+.btn svg { width: 13px; height: 13px; stroke: currentColor; fill: none; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.dot { width: 7px; height: 7px; border-radius: 7px; display: inline-block; flex: none; background: var(--good); }
+.stat { flex-basis: 100%; display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; line-height: 17px; height: 17px; min-width: 0; }
+.stat .dot { transform: none; }
+.time { margin-left: auto; flex: none; font-size: 10.5px; font-weight: 500; color: var(--faint); font-family: ui-monospace, Consolas, monospace; line-height: 17px; }
+.pstat { display: none; font-size: 11.5px; color: var(--sub); white-space: nowrap; flex: 1 1 auto; min-width: 0;
+  align-items: center; gap: 5px; }
+.pstat .dot { flex: none; }
+#pstatus { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+#ptime { flex: none; color: var(--faint); font-family: ui-monospace, Consolas, monospace; font-size: 10.5px; }
+.amber { color: var(--amber); } .red { color: var(--red); }
+
+.bodyx { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+.alerts { display: flex; flex-direction: column; gap: 6px; margin: 0 10px 8px; }
+.alerts:empty { display: none; }
+.alertbox { font-size: 11px; border-radius: 7px; padding: 5px 8px; background: var(--amberSoft); color: var(--amber); font-weight: 600;
+  word-break: keep-all;
+  cursor: pointer; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.list { border-top: 1px solid var(--line); min-height: 0; flex: 1 1 auto; overflow-y: auto; overflow-x: hidden;
+  scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+.list::-webkit-scrollbar { width: 5px; }
+.list::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+.row { display: grid; grid-template-columns: 38px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 7px 10px;
+  border-bottom: 1px solid var(--line); cursor: pointer; }
+.row:hover { background: rgba(255,255,255,0.03); }
+.row.failed { background: var(--redSoft); }
+.ic { width: 38px; height: 24px; border-radius: 4px; background: var(--chip); display: grid; place-items: center; overflow: hidden; position: relative; }
+.ic img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.ic svg { width: 14px; height: 14px; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.spin { width: 12px; height: 12px; border-radius: 12px; border: 2px solid var(--indSoft); border-top-color: var(--ind); animation: spin .9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+.qdot { width: 6px; height: 6px; border-radius: 6px; background: var(--faint); }
+.mid { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.p { font-size: 11.5px; }
+.row.failed .p { color: var(--red); }
+.m { display: flex; gap: 5px; align-items: center; font-size: 10px; color: var(--faint); white-space: nowrap; min-width: 0; }
+.chip { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 9.5px; font-weight: 600; border-radius: 4px; padding: 0 5px; line-height: 15px; background: var(--chip); color: var(--sub); white-space: nowrap; }
+.chip.mcp { background: var(--indSoft); color: var(--ind); flex: none; }
+.code.none { color: var(--amber); }
+.m .code { flex: 0 100 auto; }     /* the tab and code give way first; the model chip keeps its words longest */
+.err { color: var(--red); }
+.bar { height: 3px; border-radius: 2px; background: var(--chip); overflow: hidden; display: flex; margin-top: 3px; }
+.bar i { display: block; height: 100%; transition: width .5s ease; }
+.bar .d { background: var(--ind); } .bar .x { background: var(--red); }
+.rt { font-size: 10.5px; text-align: right; white-space: nowrap; display: flex; flex-direction: column; align-items: flex-end; gap: 1px; }
+.rt b { font-weight: 600; color: var(--sub); font-variant-numeric: tabular-nums; }
+.rt span { color: var(--faint); font-family: ui-monospace, Consolas, monospace; }
+.rt b.good { color: var(--good); } .rt b.red { color: var(--red); } .rt b.faint { color: var(--faint); }
+.note { padding: 7px 11px; font-size: 11px; color: var(--faint); border-bottom: 1px solid var(--line); }
+.more { padding: 5px 11px; font-size: 10.5px; color: var(--faint); border-bottom: 1px solid var(--line); cursor: pointer; }
+.more:hover { color: var(--sub); }
+.foot { display: flex; justify-content: space-between; gap: 8px; padding: 6px 11px 8px; font-size: 10.5px; color: var(--faint); min-width: 0; }
+.foot b { color: var(--sub); font-weight: 600; }
+#session { cursor: pointer; }
+.off { color: var(--red); }
+
+/* 알약: one line, as wide as its words (rule 2) */
+/* every size is 300 wide - the pill too (user 11/16: "가로 길이 일정", Seedance's card is 300) */
+body.pill #root { height: auto; }
+body.pill .head { flex-wrap: nowrap; padding: 6px 8px; }
+body.pill .stat, body.pill .bodyx, body.pill .grow, body.pill #pin { display: none !important; }
+body.pill .pstat { display: flex; }
+body.pill .app { display: none; }          /* the pill is the small one: the badge says which app it is */
+
+.menu { position: fixed; z-index: 5; background: #26262a; border: 1px solid var(--line); border-radius: 8px; padding: 4px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.5); min-width: 210px; max-width: calc(100vw - 8px); }
+.menu button { display: block; width: 100%; text-align: left; border: 0; background: transparent; color: var(--ink); font: inherit;
+  font-size: 11.5px; padding: 5px 9px; border-radius: 5px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.menu button:hover { background: var(--chip); }
+.menu hr { border: 0; border-top: 1px solid var(--line); margin: 4px 2px; }
+.menu .dim { color: var(--faint); }
+</style>
+</head>
+<body>
+<div id="root">
+  <div class="head pywebview-drag-region" id="head" title="끌어서 옮기기 · 우클릭 메뉴">
+    <span class="badge">N</span>
+    <span class="app">NanoBanana</span>
+    <span class="pstat" id="pstat"><i class="dot" id="pdot"></i><span id="pstatus"></span><span id="ptime"></span></span>
+    <span class="grow"></span>
+    <button class="btn on" id="pin" title="" aria-label="구석에 붙이기"><svg viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 3h6l-1 6 3 3v2H7v-2l3-3z"/></svg></button>
+    <button class="btn" id="size" title="크기" aria-label="크기"><svg viewBox="0 0 24 24" id="sizeIco"></svg></button>
+    <button class="btn" id="main" title="본창 열기" aria-label="본창 열기"><svg viewBox="0 0 24 24"><path d="M15 3h6v6M10 14 21 3M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg></button>
+    <button class="btn" id="close" title="닫기" aria-label="닫기"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+    <div class="stat" id="statline"><i class="dot" id="dot"></i><span class="cut" id="status">연결 중…</span><span class="time" id="time"></span></div>
+  </div>
+  <div class="bodyx" id="bodyx">
+    <div class="alerts" id="alerts"></div>
+    <div class="list" id="rows"></div>
+    <div class="foot"><span class="cut" id="session"></span><span id="ver"></span></div>
+  </div>
+</div>
+<script>
+const api = () => (window.pywebview && window.pywebview.api) || null;
+const $ = id => document.getElementById(id);
+function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function mmss(s) { s = Math.max(0, Math.floor(s)); return String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0"); }
+const ICON = {
+  done: '<svg viewBox="0 0 24 24" style="stroke:var(--good);stroke-width:3"><path d="M20 6 9 17l-5-5"/></svg>',
+  failed: '<svg viewBox="0 0 24 24" style="stroke:var(--red);stroke-width:2.6"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5.5M12 16.5v.01"/></svg>',
+  cancelled: '<svg viewBox="0 0 24 24" style="stroke:var(--faint);stroke-width:2.4"><circle cx="12" cy="12" r="9"/><path d="M8 12h8"/></svg>',
+  running: '<div class="spin"></div>', queued: '<div class="qdot"></div>',
+};
+
+const rowEls = new Map();   // batch id -> element, reused so bars move instead of redrawing
+function rowFor(b) {
+  let el = rowEls.get(b.id);
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "row";
+    el.innerHTML = '<div class="ic"></div><div class="mid"><div class="p cut"></div><div class="m"></div>'
+      + '<div class="bar"><i class="d"></i><i class="x"></i></div></div><div class="rt"><b></b><span></span></div>';
+    rowEls.set(b.id, el);
+  }
+  el.onclick = () => {
+    // rule 4: the main window opens on this tab; a finished row counts as seen and leaves at once
+    if (!api()) return;
+    api().open_main(b.pid);
+    if (b.finished) { api().dismiss(b.id); el.remove(); rowEls.delete(b.id); }
+  };
+  const icKey = b.state + (b.state === "done" ? b.thumb : "");
+  if (el.dataset.ic !== icKey) {
+    el.dataset.ic = icKey;
+    el.querySelector(".ic").innerHTML = ICON[b.state] + (b.state === "done" && b.thumb
+      ? '<img alt="" src="/api/gallery/thumb?size=96&path=' + encodeURIComponent(b.thumb) + '" onerror="this.remove()">' : "");
+  }
+  el.classList.toggle("failed", b.state === "failed");
+  const prompt = b.prompt || "(프롬프트 없음)";
+  el.querySelector(".p").textContent = prompt;
+  const proj = b.tab + " · " + (b.code ? "코드 " + b.code : "코드 없음");
+  el.title = prompt + "\n" + proj + (b.last_error ? "\n" + b.last_error : "") + "\n— 눌러서 본창의 그 탭으로"
+    + (b.finished ? " (확인하면 목록에서 빠져요)" : "");
+  el.querySelector(".m").innerHTML = b.state === "failed"
+    ? '<span class="err cut">' + esc(b.last_error || "생성 실패") + "</span>"
+    : (b.agent ? '<span class="chip mcp">MCP</span>' : "")
+      + (function () { const t = [b.model, b.res, b.quality, b.fmt].filter(Boolean).join(" · ");
+           return t ? '<span class="chip" title="' + esc(t) + '">' + esc(t) + "</span>" : ""; })()
+      + '<span class="code cut' + (b.code ? "" : " none") + '">' + esc(proj) + "</span>";
+  const bar = el.querySelector(".bar");
+  bar.style.display = b.finished ? "none" : "";
+  bar.querySelector(".d").style.width = (100 * b.done / b.count) + "%";
+  bar.querySelector(".x").style.width = (100 * b.failed / b.count) + "%";
+  const top = el.querySelector(".rt b"), bot = el.querySelector(".rt span");
+  top.className = { done: "good", failed: "red", cancelled: "faint" }[b.state] || "";
+  top.textContent = { running: b.done + "/" + b.count + "장", queued: "대기", done: "완료",
+                      failed: "실패 " + b.failed + "장", cancelled: "취소" }[b.state];
+  bot.textContent = b.state === "queued" ? b.count + "장" : b.state === "cancelled" ? b.done + "/" + b.count + "장" : mmss(b.elapsed);
+  return el;
+}
+
+let lastH = 0, lastW = 0, downAt = null, prefs = {auto: true, opacity: 1}, rowH = 0, pillW = 0;
+function probeRow() {        // the height of one row, from a hidden sample, so the size never waits for real rows
+  const el = rowFor({id: "__probe", pid: "", state: "running", prompt: "가", tab: "가", code: "가", model: "가", res: "1K",
+                     agent: true, count: 1, done: 0, failed: 0, elapsed: 0, finished: false});
+  rowEls.delete("__probe");
+  el.style.cssText = "position:absolute;visibility:hidden;width:300px;left:0;top:0";
+  document.body.appendChild(el);
+  const h = el.getBoundingClientRect().height; el.remove();
+  return Math.ceil(h);
+}
+function wantH() {
+  if (size === "pill") return Math.ceil($("head").getBoundingClientRect().height);
+  if (!rowH) rowH = probeRow();
+  const n = size === "card" ? 2 : 6;
+  return Math.ceil($("head").getBoundingClientRect().height + 1 + n * rowH + 23
+                   + document.querySelector(".foot").getBoundingClientRect().height);   // 23: the "외 N개" line
+}
+let shrinkMs = 2500, shrinkT = null, sizeSynced = false;   // grow at once (or it is cut), shrink only after a moment
+let size = "card";                     // rule 2 - the real app keeps it in prefs.json
+try { size = localStorage.getItem("nb-mini-size") || "card"; } catch (e) {}
+// One button cycles the three sizes, 펼침 → 카드 → 알약 → 펼침 (user 11/16). Like a window's maximize/restore
+// button it shows where a click takes you: the shape of the next size.
+const NEXT = {full: "card", card: "pill", pill: "full"};
+const NAME = {full: "펼침", card: "카드", pill: "알약"};
+const SHAPE = {
+  pill: '<rect x="3.5" y="9" width="17" height="6" rx="3"/>',                 // flat capsule
+  card: '<rect x="4.5" y="6" width="15" height="12" rx="2"/>',                // a box
+  full: '<rect x="6.5" y="3" width="11" height="18" rx="2"/><path d="M9.5 8.5h5M9.5 12h5M9.5 15.5h5"/>',   // a tall list
+};
+function setSize(v) {
+  size = v;
+  try { localStorage.setItem("nb-mini-size", v); } catch (e) {}
+  const next = NEXT[v];
+  $("sizeIco").innerHTML = SHAPE[next];
+  $("size").title = "지금 " + NAME[v] + " · 누르면 " + NAME[next] + "  (펼침 → 카드 → 알약 순서)";
+  $("size").setAttribute("aria-label", "크기: " + NAME[next] + "으로");
+  document.body.classList.toggle("pill", v === "pill");
+  lastH = 0; lastW = 0; pillW = 0; tick();
+}
+function fit(now) {
+  if (downAt) return;
+  const h = wantH();
+  let w = 300;
+  // one width for every size (11/16); the pill's words end in "…" rather than widening it
+  if (!now && lastH && h < lastH - 1 && Math.abs(w - lastW) <= 1) {
+    if (!shrinkT) shrinkT = setTimeout(() => { shrinkT = null; fit(true); }, shrinkMs);
+    return;
+  }
+  clearTimeout(shrinkT); shrinkT = null;
+  if ((Math.abs(h - lastH) > 1 || Math.abs(w - lastW) > 1) && api()) { lastH = h; lastW = w; api().fit(h, w, size); }
+}
+
+async function tick() {
+  let d;
+  try { d = await (await fetch("/api/mini", {cache: "no-store"})).json(); }
+  catch (e) { $("dot").style.background = "var(--red)"; $("status").innerHTML = '<span class="off">앱과 연결 끊김</span>'; fit(); return; }
+  if (d.shrink_ms) shrinkMs = d.shrink_ms;
+  if (d.prefs) {
+    prefs = d.prefs; paintPin();
+    // the size step comes back from mini_window.json once at start (the app's WebView forgets localStorage)
+    if (!sizeSynced) { sizeSynced = true; if (d.prefs.size && d.prefs.size !== size) { setSize(d.prefs.size); return; } }
+  }
+  // rule 3: one status, in this order - something to fix, working, failures left to look at, resting
+  const blocked = d.alerts.reduce((n, a) => n + a.n, 0);
+  const working = d.running + d.queued > 0 || d.batches.some(b => !b.finished);
+  const failedN = d.batches.filter(b => b.state === "failed").reduce((n, b) => n + b.failed, 0);
+  const work = "생성 중 " + d.running + "장" + (d.queued ? " · 대기 " + d.queued + "장" : "");
+  const [text, colour] = blocked ? ["요청 막힘 " + blocked + (working ? " · 생성 중 " + d.running + "장" : ""), "var(--amber)"]
+    : working ? [work, "var(--ind)"] : ["쉬는 중", "var(--good)"];
+  $("status").textContent = text; $("pstatus").textContent = text;
+  $("status").className = "cut" + (blocked ? " amber" : "");
+  $("dot").style.background = colour; $("pdot").style.background = colour;
+  const t = d.longest > 0 ? mmss(d.longest) : "";
+  $("time").textContent = t; $("time").title = "가장 오래 돌고 있는 묶음";
+  $("ptime").textContent = t;
+  $("pstat").title = text + (t ? " · " + t : "");
+
+  // the notice first: in a card it takes its room from the list, which then shows only whole rows
+  $("alerts").innerHTML = d.alerts.map(a => '<div class="alertbox" data-pid="' + esc(a.pid) + '" title="' + esc(a.text) + '">'
+    + esc(a.text) + "</div>").join("");
+  const rows = $("rows"), seen = new Set();
+  let fitN = 2;
+  if (size === "card") {
+    if (!rowH) rowH = probeRow();
+    const room = innerHeight - $("head").getBoundingClientRect().height - $("alerts").getBoundingClientRect().height
+      - (d.alerts.length ? 8 : 0) - document.querySelector(".foot").getBoundingClientRect().height - 1;
+    const needMore = d.batches.length > 1;
+    fitN = Math.max(1, Math.min(2, Math.floor((room - (needMore ? 23 : 0)) / rowH)));
+  }
+  const shown = size === "card" ? d.batches.slice(0, fitN) : d.batches;
+  shown.forEach(b => { seen.add(b.id); rows.appendChild(rowFor(b)); });   // appendChild keeps the server's order
+  for (const [id, el] of rowEls) if (!seen.has(id)) { el.remove(); rowEls.delete(id); }
+  let more = rows.querySelector(".more");
+  const hiddenN = d.batches.length - shown.length;
+  if (hiddenN > 0) {
+    if (!more) { more = document.createElement("div"); more.className = "more"; more.onclick = () => setSize("full"); }
+    more.textContent = "외 " + hiddenN + "개 — 펼쳐서 보기";
+    rows.appendChild(more);
+  } else if (more) more.remove();
+  let note = rows.querySelector(".note");
+  if (!d.batches.length) {
+    if (!note) rows.insertAdjacentHTML("afterbegin", '<div class="note">돌고 있는 작업이 없어요</div>');
+  } else if (note) note.remove();
+  // the room the agreement leaves us (Seedance's slot beside us): the list gives way first
+
+  $("session").innerHTML = "오늘 <b>" + d.session.images + "장</b>" + (d.session.failed ? " · 실패 " + d.session.failed : "");
+  $("session").title = "눌러서 본창 보기";
+  $("ver").textContent = d.version;
+  fit();
+  if (api() && api().report) setTimeout(() => {
+    const over = [...document.querySelectorAll("#root *")].filter(n => n.getBoundingClientRect().right > innerWidth + 0.5).length;
+    api().report({total: size === "card" ? shown.length : size === "pill" ? 0 : d.batches.length,
+      cut_rows: [...rows.querySelectorAll(".row")].filter(r => r.getBoundingClientRect().bottom > rows.getBoundingClientRect().bottom + 0.5).length,
+      all: d.batches.length, size: size, status: $("status").textContent,
+      dom_rows: size === "pill" ? 0 : rows.querySelectorAll(".row").length,
+      rows_h: Math.ceil(rows.getBoundingClientRect().height), rows_scroll: rows.scrollHeight > rows.clientHeight + 1,
+      height: Math.ceil($("root").getBoundingClientRect().height), overflow_x: document.documentElement.scrollWidth > innerWidth,
+      past_right_edge: over, width: innerWidth, win_h: innerHeight, alerts: d.alerts.length, manual: false,
+      pill_btn: getComputedStyle($("size")).display !== "none" && $("size").getBoundingClientRect().right <= innerWidth + 0.5,
+      pill_btn_title: $("size").title, pin_on: $("pin").classList.contains("on"),
+      pin_shown: getComputedStyle($("pin")).display !== "none",
+      mcp_rows: rows.querySelectorAll(".chip.mcp").length,
+      chips: [...rows.querySelectorAll(".row")].map(r => { const c = r.querySelector(".chip:not(.mcp)");
+        return c ? {text: c.textContent, cut: c.scrollWidth > c.clientWidth + 1} : null; }),
+      empty_chips: rows.querySelectorAll(".chip:empty").length,
+      codes: [...rows.querySelectorAll(".code")].map(n => n.textContent)});
+  }, 400);
+}
+$("session").addEventListener("click", () => { if (api()) api().open_main(); });
+// a notice: that tab, with its team / project picker open ("눌러서 고르기")
+$("alerts").addEventListener("click", e => { const a = e.target.closest(".alertbox"); if (a && api()) api().open_main(a.dataset.pid, true); });
+
+// rule 9: the same menu, in the same order, as Seedance's
+function closeMenu() { const m = document.querySelector(".menu"); if (m) m.remove(); }
+function doAction(a) {         // what a menu pick means for the page (the native menu returns the same names)
+  if (!a) return;
+  if (a.startsWith("size:")) { setSize(a.slice(5)); return; }
+  if (a.startsWith("op:")) { prefs.opacity = +a.slice(3); return; }
+  if (a === "auto") prefs.auto = !prefs.auto;
+}
+document.addEventListener("contextmenu", async e => {
+  e.preventDefault(); closeMenu();
+  // the window's own (Windows) menu: it is drawn outside the strip, so nothing gets cut off
+  if (api() && api().show_menu) {
+    const a = await api().show_menu(size, prefs.opacity, prefs.auto);
+    if (a !== "html") { doAction(a); return; }
+  }
+  const m = document.createElement("div");
+  m.className = "menu";
+  const dot = on => (on ? "● " : "　 ");
+  m.innerHTML = '<button data-a="main">본창 열기</button><hr>'
+    + [["pill", "알약"], ["card", "카드"], ["full", "펼침"]].map(([v, l]) => '<button data-a="size:' + v + '">' + dot(size === v) + "크기: " + l + "</button>").join("")
+    + "<hr>" + [1, 0.85, 0.7, 0.55].map(o => '<button data-a="op:' + o + '">' + dot(Math.abs(prefs.opacity - o) < 0.01) + "투명도 " + Math.round(o * 100) + "%</button>").join("")
+    + '<hr><button data-a="auto">' + (prefs.auto ? "☑ " : "☐ ") + "본창을 내렸을 때 새 작업이 생기면 띄우기</button>"
+    + '<button data-a="close">미니 창 닫기</button>';
+  document.body.appendChild(m);
+  const x = Math.min(e.clientX, innerWidth - m.offsetWidth - 4), y = Math.min(e.clientY, innerHeight - m.offsetHeight - 4);
+  m.style.left = Math.max(4, x) + "px"; m.style.top = Math.max(4, y) + "px";
+  m.onclick = ev => {
+    const a = (ev.target.closest("button") || {}).dataset?.a; closeMenu();
+    if (!a) return;
+    if (a.startsWith("size:")) { setSize(a.slice(5)); return; }
+    if (!api()) return;
+    if (a.startsWith("op:")) { prefs.opacity = +a.slice(3); api().set_opacity(prefs.opacity); }
+    if (a === "auto") { prefs.auto = !prefs.auto; api().set_auto(prefs.auto); }
+    if (a === "main") api().open_main();
+    if (a === "close") api().close_mini();
+  };
+});
+document.addEventListener("click", e => { if (!e.target.closest(".menu")) closeMenu(); });
+
+$("main").onclick = () => { if (api()) api().open_main(); };
+$("size").onclick = () => setSize(NEXT[size]);
+window.__pillBtn = () => $("size").click();        // demo hook: one click on the size button
+// the pin (11/16): on = a drop goes to the nearest corner and stacks with Seedance, off = it stays where dropped
+function paintPin() {
+  const on = prefs.pinned !== false;
+  $("pin").classList.toggle("on", on);
+  $("pin").title = on ? "구석에 붙이기 켜짐 — 끌어 놓으면 가장 가까운 구석에 붙어요 (누르면 자유롭게)"
+                      : "자유 위치 — 끌어 놓은 자리에 그대로 있어요 (누르면 구석에 붙이기)";
+}
+$("pin").onclick = async () => {
+  prefs.pinned = !(prefs.pinned !== false); paintPin();
+  if (api()) await api().set_locked(prefs.pinned);
+};
+window.__pin = () => $("pin").click();
+paintPin();
+$("close").onclick = () => { if (api()) api().close_mini(); };
+// rule 4: double-click on an empty spot opens the main window (rows have their own click)
+$("root").addEventListener("dblclick", e => {
+  if (!e.target.closest(".btn, .row, .alertbox, .more, .menu") && api()) api().open_main();
+});
+window.__setSize = setSize;
+window.addEventListener("pywebviewready", () => { lastH = 0; fit(); });
+// rule 1: drag by the header; on release the strip goes to the nearest corner
+$("head").addEventListener("mousedown", e => {
+  if (e.button === 0 && !e.target.closest(".btn")) { downAt = [e.screenX, e.screenY]; if (api()) api().drag(true); }
+});
+document.addEventListener("mouseup", e => {
+  if (!downAt) return;
+  const moved = Math.hypot(e.screenX - downAt[0], e.screenY - downAt[1]) > 4;
+  downAt = null;
+  if (api()) { if (moved) api().snap(); else api().drag(false); }   // snap: pinned -> nearest corner, free -> stays
+  lastH = 0; fit();
+});
+window.addEventListener("blur", () => { if (downAt) { downAt = null; if (api()) api().drag(false); } });
+setSize(size); setInterval(tick, 1000);
+</script>
+</body>
+</html>
+{% endraw %}

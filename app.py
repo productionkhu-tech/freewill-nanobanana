@@ -2974,13 +2974,17 @@ class AppState:
     # The gallery lists only images that came out and the window's events are
     # consumed by the window, so a caller that sent 4 and sees 3 could not tell
     # "one failed" from "one still running". This answers that.
-    def _batch_open(self, batch_id, count, agent):
+    def _batch_open(self, batch_id, count, agent, mini=None):
         with self.batch_lock:
             self.batches[batch_id] = {
                 "count": int(count), "done": 0, "failed": 0, "cancelled": 0,
                 "billed": 0, "billed_failed": 0, "billing_unknown": 0,
                 "images": [], "errors": [], "agent": bool(agent),
                 "started_at": time.time(), "finished_at": None,
+                # What the mini window's row says (model, size, prompt): taken from what the
+                # batch was queued with, the same for the window's Generate and an agent.
+                # /api/batch lists its fields by name, so this stays out of its answer.
+                "mini": dict(mini or {}),
             }
             if len(self.batches) > 50:
                 # Finished ones only. One still waiting in the queue can be asked about at
@@ -2995,6 +2999,8 @@ class AppState:
         cost, see _result_charge. A finished image is paid for by definition."""
         if not batch_id:
             return
+        if kind in ("done", "failed"):
+            _mini_today_bump(kind)       # the mini window's "오늘 N장 · 실패 M"
         with self.batch_lock:
             b = self.batches.get(batch_id)
             if b is None:
@@ -5801,7 +5807,7 @@ def _enqueue_batch(p, *, model, providers, prompt, count, aspect, resolution, qu
 
         # Opened before the jobs become visible to the worker, so a fast first
         # result can never arrive for a batch the tally does not know yet.
-        p._batch_open(batch_id, count, agent)
+        p._batch_open(batch_id, count, agent, mini=_mini_batch_meta(model, prompt, resolution, quality, img_cfg))
         if agent:
             _batch_remember(batch_id, p.pid, count)   # before the claim lets go
         p.pending_jobs.extend(new_jobs)
@@ -6881,7 +6887,9 @@ def _find_nanobanana_hwnd():
                     return True
                 buf = ctypes.create_unicode_buffer(length + 1)
                 user32.GetWindowTextW(hwnd, buf, length + 1)
-                if buf.value.startswith("NanoBanana"):
+                # Not the mini window (v2026-11-1601): it is topmost, so it comes first
+                # and the pin would pin it instead of the app (review 2026-11-16).
+                if buf.value.startswith("NanoBanana") and buf.value != "NanoBanana mini":
                     found[0] = hwnd
                     return False
             except Exception:
@@ -6977,6 +6985,255 @@ def set_always_on_top():
     state.always_on_top = enabled
     state.log(f"Always-on-top: {'ON' if enabled else 'OFF'}")
     return jsonify({"ok": True, "enabled": enabled})
+
+
+# ===================== Mini window (v2026-11-1601) =====================
+# 본창을 내려 두고 에이전트(MCP)에게 일을 맡길 때, 돌고 있는 작업만 화면 구석에 띄우는 작은 창
+# (아이디어 전상필님 11/13, 설계는 2026-11-13~16 데모에서 사용자와 정함 — 기획_미니창_점검목록.md,
+# ..\Freewill_미니창_공통규칙.md). 창 자체(자리 · 크기 · 시댄스와 쌓기 · 메뉴)는 mini_window.py 가 하고
+# (launcher 가 띄움, Windows 만), 여기서는 그 창이 읽는 요약과 본창 버튼의 길만 만든다. 맥(브라우저)엔 창이 없다.
+MINI_DONE_KEEP, MINI_FAIL_KEEP = 90, 600     # 끝난 줄 90초, 실패 10분 (시댄스 mini-feed 와 같은 시계)
+# mini_window 가 채운다: app 은 launcher 를 import 하지 않는다(규칙 19).
+MINI_HOOKS = {"toggle": None, "visible": None}
+_mini_lock = threading.Lock()
+_mini_blocked = {}          # pid -> {"n", "at", "seen"}: 팀·프로젝트가 없어 거절된 에이전트 요청
+_mini_dismissed = set()     # 사람이 눌러 본 끝난 줄
+_mini_today = {"day": "", "images": 0, "failed": 0, "loaded": False}
+_mini_names = {}
+_mini_version = []
+
+
+def _mini_today_file():
+    return os.path.join(_user_data_dir(), "mini_today.json")
+
+
+def _mini_today_bump(kind, t=None):
+    """'오늘' = 이 PC 시계로 0시부터. 재시작해도 이어지게 작은 파일에, 날짜가 바뀌면 0부터. t: 시험용 시각."""
+    try:
+        with _mini_lock:
+            day = time.strftime("%Y-%m-%d", time.localtime(time.time() if t is None else t))
+            if not _mini_today["loaded"]:
+                _mini_today["loaded"] = True
+                try:
+                    with open(_mini_today_file(), "r", encoding="utf-8") as f:
+                        d = json.load(f)
+                    if isinstance(d, dict):
+                        _mini_today.update(day=str(d.get("day", "")), images=int(d.get("images", 0)),
+                                           failed=int(d.get("failed", 0)))
+                except Exception:
+                    pass
+            if _mini_today["day"] != day:
+                _mini_today.update(day=day, images=0, failed=0)
+            _mini_today["images" if kind == "done" else "failed"] += 1
+            tmp = _mini_today_file() + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({k: _mini_today[k] for k in ("day", "images", "failed")}, f)
+            os.replace(tmp, _mini_today_file())
+    except Exception:
+        pass
+
+
+def _mini_today_view(t=None):
+    with _mini_lock:
+        if not _mini_today["loaded"]:
+            _mini_today["loaded"] = True
+            try:
+                with open(_mini_today_file(), "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                _mini_today.update(day=str(d.get("day", "")), images=int(d.get("images", 0)),
+                                   failed=int(d.get("failed", 0)))
+            except Exception:
+                pass
+        if _mini_today["day"] != time.strftime("%Y-%m-%d", time.localtime(time.time() if t is None else t)):
+            return {"images": 0, "failed": 0}
+        return {"images": _mini_today["images"], "failed": _mini_today["failed"]}
+
+
+def _mini_model_name(m):
+    """갤러리가 부르는 이름 그대로(static/app.js 의 _MODEL_SHORT 를 읽는다 — 모델을 넣을 때 한 곳만 고치면
+    갤러리와 미니창이 같이 바뀐다). 표에 아직 없는 새 모델은 ID 에서 날짜 꼬리를 떼고, 줄 폭 때문에
+    "GPT Image 2.6" 만 규칙으로 "GPT 2.6" 으로 줄인다. 빈칸이나 40자 ID 는 나오지 않는다."""
+    if not m:
+        return ""
+    if not _mini_names:
+        try:
+            with open(os.path.join(app.static_folder, "app.js"), "r", encoding="utf-8") as f:
+                src = f.read()
+            block = src[src.index("const _MODEL_SHORT = {"):]
+            block = block[:block.index("};")]
+            _mini_names.update(re.findall(r'"([^"]+)"\s*:\s*"([^"]+)"', block))
+        except Exception:
+            _mini_names["_"] = ""            # read once; an unreadable table falls back to the id
+    m2 = _MODEL_RENAMES.get(m, m)
+    n = _mini_names.get(m2) or _mini_names.get(m) or re.sub(r"-\d{6}$", "", m2)
+    return re.sub(r"^GPT Image (\d+\.\d+)", r"GPT \1", n)
+
+
+def _mini_batch_meta(model, prompt, resolution, quality, img_cfg):
+    """한 묶음이 미니창 줄에 쓰는 값 — 대기열에 넣는 순간의 값(창 · 에이전트 같은 길)."""
+    try:
+        fmt = str((img_cfg or {}).get("output_format") or "").lower()
+        q = ""
+        if quality and openai_qualities(model):             # 품질은 GPT 에만 뜻이 있다
+            q = str(openai_clamp_quality(model, quality))
+        return {"model": str(model or ""), "res": str(resolution or ""), "quality": q,
+                "fmt": fmt.upper() if fmt in ("gif", "svg") else "", "prompt": str(prompt or "")[:300]}
+    except Exception:
+        return {"model": str(model or "")}
+
+
+def _mini_code_name(p):
+    """탭의 프로젝트 코드 이름(목록에 있으면 그 이름). 쓸 수 없는 탭은 ''."""
+    if not _billing_usable(p):
+        return ""
+    pid_ = p.billing_project_id
+    try:
+        for pj in ((_catalog_cache.get("data") or {}).get("projects") or []):
+            if pj.get("id") == pid_:
+                return str(pj.get("name") or pid_)
+    except Exception:
+        pass
+    return str(pid_)
+
+
+def mini_summary():
+    """미니창이 그리는 것: 묶음 하나가 줄 하나(창 · 에이전트 모두, 에이전트 줄엔 MCP 칩). 순서는 도는 중 ·
+    대기 · 실패 · 끝남, 같은 무리 안에선 최신 먼저. 끝난 줄 90초, 실패 10분, 눌러 본 줄은 바로 빠진다."""
+    now = time.time()
+    batches, alerts = [], []
+    running = queued = 0
+    oldest = None
+    with shared.projects_lock:
+        projs = [shared.projects[k] for k in shared.project_order if k in shared.projects]
+    for p in projs:
+        name = p.display_name()
+        usable = _billing_usable(p)
+        code = _mini_code_name(p) if usable else ""
+        with _mini_lock:
+            blk = _mini_blocked.get(p.pid)
+            if blk and usable:
+                _mini_blocked.pop(p.pid, None)          # 고쳐졌다: 다음 요청은 통과한다
+                blk = None
+            if blk and not blk["seen"] and now - blk["at"] <= MINI_FAIL_KEEP:
+                alerts.append({"pid": p.pid, "tab": name, "n": blk["n"],
+                               "text": "'%s' 탭 팀·프로젝트 없음 — 요청 %d건 막힘 · 눌러서 고르기" % (name, blk["n"])})
+        with p.pending_jobs_lock:
+            running += p.active_job_count
+            queued += len(p.pending_jobs)
+            waiting = {}
+            for jb in p.pending_jobs:
+                waiting[jb.get("batch_id")] = waiting.get(jb.get("batch_id"), 0) + 1
+        with p.batch_lock:
+            items = [(k, dict(v), list(v.get("errors") or []), dict(v.get("mini") or {})) for k, v in p.batches.items()]
+        for bid, b, errs, meta in items:
+            fin = b.get("finished_at")
+            rest = max(0, b["count"] - b["done"] - b["failed"] - b["cancelled"])
+            if fin:
+                st_ = "failed" if b["failed"] else "cancelled" if b["cancelled"] else "done"
+            else:
+                st_ = "queued" if rest and waiting.get(bid, 0) >= rest and not (b["done"] or b["failed"]) else "running"
+            sticky = st_ == "failed"
+            with _mini_lock:
+                gone = bid in _mini_dismissed
+            if fin and (gone or now - fin > (MINI_FAIL_KEEP if sticky else MINI_DONE_KEEP)):
+                continue
+            if st_ == "running":
+                oldest = b["started_at"] if oldest is None else min(oldest, b["started_at"])
+            last = errs[-1] if errs else ""
+            last = last.get("error", "") if isinstance(last, dict) else str(last)
+            if re.search(r"(?:Error code|status|HTTP)[: ]+400(?![0-9])", last):   # 요청 번호 속 숫자가 아니라 상태 번호
+                last = "요청 거절(400)"
+            imgs = b.get("images") or []
+            batches.append({"id": bid, "pid": p.pid, "tab": name, "code": code,
+                            "model": _mini_model_name(meta.get("model", "")), "model_id": meta.get("model", ""),
+                            "res": meta.get("res", ""), "quality": meta.get("quality", ""), "fmt": meta.get("fmt", ""),
+                            "thumb": imgs[-1] if imgs else "", "prompt": meta.get("prompt", ""),
+                            "agent": bool(b.get("agent")), "count": b["count"], "done": b["done"],
+                            "failed": b["failed"], "cancelled": b["cancelled"], "left": rest, "finished": bool(fin),
+                            "state": st_, "sticky": sticky, "elapsed": (fin or now) - b["started_at"],
+                            "started": b["started_at"], "last_error": last[:60]})
+    group = {"running": 0, "queued": 1, "failed": 2, "done": 3, "cancelled": 3}
+    batches.sort(key=lambda x: (group[x["state"]], -x["started"]))
+    if not _mini_version:
+        _mini_version.append(_read_version())          # read once, not on every poll
+    return {"version": _mini_version[0], "running": running, "queued": queued,
+            "longest": (now - oldest) if oldest else 0, "left": running + queued,
+            "batches": batches, "alerts": alerts, "session": _mini_today_view()}
+
+
+def mini_dismiss(bid=None, finished=False, pid_seen=None):
+    """사람이 줄을 눌러 봤다(끝난 줄은 바로 빠진다) / 막힘 알림을 눌러 봤다."""
+    with _mini_lock:
+        if bid:
+            _mini_dismissed.add(str(bid))
+        if pid_seen and pid_seen in _mini_blocked:
+            _mini_blocked[pid_seen]["seen"] = True
+    if finished:
+        for b in mini_summary()["batches"]:
+            if b["finished"]:
+                with _mini_lock:
+                    _mini_dismissed.add(b["id"])
+
+
+@app.after_request
+def _mini_note_blocked(resp):
+    """에이전트 요청이 팀·프로젝트가 없는 탭이라 거절되면 미니창 알림으로 센다(값 검사 check_only 는 빼고)."""
+    try:
+        if request.path == "/api/generate" and request.method == "POST":
+            d = resp.get_json(silent=True) or {}
+            if d.get("needs_billing"):
+                body = request.get_json(silent=True, force=True) or {}
+                pid_ = body.get("pid") if isinstance(body, dict) else None
+                just_checking = isinstance(body, dict) and body.get("check_only") not in (None, False, 0, "false", "0", "no", "off")
+                if pid_ and not just_checking:
+                    with _mini_lock:
+                        blk = _mini_blocked.get(pid_)
+                        if blk is None or blk["seen"]:
+                            _mini_blocked[pid_] = {"n": 1, "at": time.time(), "seen": False}
+                        else:
+                            blk["n"] += 1
+                            blk["at"] = time.time()
+    except Exception:
+        pass
+    return resp
+
+
+@app.route("/api/mini", methods=["GET"])
+def api_mini():
+    d = mini_summary()
+    fn = MINI_HOOKS.get("prefs")            # the window's own settings (pin, opacity, auto-show)
+    if fn:
+        try:
+            d["prefs"] = fn()
+        except Exception:
+            pass
+    return jsonify(d)
+
+
+@app.route("/mini")
+def mini_page():
+    return render_template("mini.html", build_id=_BUILD_ID)
+
+
+@app.route("/api/mini/visible", methods=["GET"])
+def api_mini_visible():
+    # available: 이 실행에 미니창이 있는가(Windows 앱). 맥(브라우저)엔 없다 — 본창 버튼을 숨긴다.
+    fn = MINI_HOOKS.get("visible")
+    try:
+        return jsonify({"available": fn is not None, "visible": bool(fn()) if fn else False})
+    except Exception:
+        return jsonify({"available": fn is not None, "visible": False})
+
+
+@app.route("/api/mini/toggle", methods=["POST"])
+def api_mini_toggle():
+    fn = MINI_HOOKS.get("toggle")
+    if fn is None:
+        return jsonify({"ok": False, "error": "no mini window here"})
+    try:
+        return jsonify({"ok": True, "visible": bool(fn())})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:200]})
 
 
 # --- UI-driven log line (for Prompt clipboard copy etc.) ---

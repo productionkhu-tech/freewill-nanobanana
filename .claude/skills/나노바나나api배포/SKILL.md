@@ -34,12 +34,14 @@ node --check static\app.js
 & "C:\NanoBanana_build\venv\Scripts\python.exe" -m py_compile launcher.py
 & "C:\NanoBanana_build\venv\Scripts\python.exe" -m py_compile updater.py
 & "C:\NanoBanana_build\venv\Scripts\python.exe" -m py_compile nb_gateway.py
+& "C:\NanoBanana_build\venv\Scripts\python.exe" -m py_compile mini_window.py
 # 동기화 (변경된 파일 + VERSION은 항상)
 # ⚠ nb_gateway.py 도 반드시 — 2026-10-08 까지 이 목록에 없었다. 그 파일이 9/17 이후 안 바뀐 동안만
 #   우연히 맞았고, 바뀐 채로 빌드했다면 옛 모듈이 들어가 앱이 키를 못 받았을 것이다.
-Copy-Item ".\app.py",".\launcher.py",".\updater.py",".\nb_gateway.py",".\VERSION" "C:\NanoBanana_build\src\" -Force
+# ⚠ mini_window.py · templates\mini.html (미니창, v2026-11-1601~) 도 반드시. spec 도 같이(hiddenimports 에 mini_window).
+Copy-Item ".\app.py",".\launcher.py",".\updater.py",".\nb_gateway.py",".\mini_window.py",".\VERSION",".\NanoBanana.spec" "C:\NanoBanana_build\src\" -Force
 Copy-Item ".\static\app.js",".\static\style.css" "C:\NanoBanana_build\src\static\" -Force
-Copy-Item ".\templates\index.html",".\templates\viewer.html",".\templates\prompt_popup.html" "C:\NanoBanana_build\src\templates\" -Force
+Copy-Item ".\templates\index.html",".\templates\viewer.html",".\templates\prompt_popup.html",".\templates\mini.html" "C:\NanoBanana_build\src\templates\" -Force
 # 클린 빌드 (캐시 재사용 금지 — Remove-Item은 훅 오해 방지를 위해 개별 명령으로)
 # ⚠ 사용자가 쓰는 앱(예: Desktop\앱 백업\nanobanana)이 떠 있으면 아래 줄은 건너뛴다 — 빌드는
 #   그 파일을 건드리지 않고, 끄면 진행 중인 작업이 날아간다. 꺼야 하는 단계(§5)는 사용자에게 부탁한다.

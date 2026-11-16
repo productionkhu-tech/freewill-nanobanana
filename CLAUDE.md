@@ -3,7 +3,7 @@
 멀티 프로바이더 AI 이미지 생성 데스크톱 앱 (Flask + pywebview + PyInstaller).
 이 문서 하나로 **구조 · 원리 · 규칙 · 배포 · 관리**를 파악할 수 있게 씁니다. 낡은 내용을 발견하면 즉시 고칠 것.
 
-> 최종 갱신: 2026-11-13 (v2026-11-1301 기준 — 묶음 id 를 실행 내내 기억해 두 번 생성 막음 · 레퍼런스 읽는 사이 닫힌 탭엔 생성 안 함 §2.2·규칙 25. 1201: Gemini 512 를 문서 값 "512" 로 §6.1. 1001: 시드림 5.5·투명 배경 §6.1, 재시도 판단을 예외 우선으로 §7)
+> 최종 갱신: 2026-11-16 (v2026-11-1601 기준 — 미니창(작업 상태를 화면 구석에, 시댄스 미니창과 자리 나누기) §2.4·규칙 26, DPI 모니터별 v2. 1301: 묶음 id 를 실행 내내 기억해 두 번 생성 막음 · 레퍼런스 읽는 사이 닫힌 탭엔 생성 안 함 §2.2·규칙 25. 1201: Gemini 512 를 문서 값 "512" 로 §6.1. 1001: 시드림 5.5·투명 배경 §6.1, 재시도 판단을 예외 우선으로 §7)
 
 ---
 
@@ -20,6 +20,8 @@
   `state`는 "이 요청이 다루는 프로젝트"를 가리키는 프록시라 기존 라우트는 그대로 동작
 - **에이전트 → 탭 지정 생성** (v2026-10-2001~): `/api/generate` 에 `pid` 를 주면 그 탭에 그 요청의 값으로만 생성.
   화면의 탭도, 그 탭의 입력칸도 안 바뀐다. 모르는 pid 는 404. §2.2
+- **미니창** (v2026-11-1601~, Windows): 돌고 있는 작업만 화면 구석에 띄우는 작은 창. 본창 📌 옆 버튼으로 켜고, 본창을 내렸을 때 새 작업이 오면 저절로 뜬다.
+  시댄스 미니창과 같은 구석에 오면 겹치지 않게 쌓인다(`%APPDATA%\Freewill\mini-dock`). §2.4
 - **배포**: GitHub Release에 EXE 업로드 → 사용자는 **앱을 껐다 켜기만 하면 자동 설치** (클릭 불필요)
 - **버전**: `vYYYY-MM-DDNN` — **오늘 날짜 기준**, 같은 날 재릴리스는 NN 증가, 날짜 바뀌면 01부터
 - **맥**: EXE 없이 소스 실행 (`server_mac.py` + `keys.env`), git pull로 업데이트
@@ -32,6 +34,7 @@
 나노바나나 api/                     # 프로젝트 루트 = 문서 저장 폴더
 ├── app.py                  # Flask 서버 + AppState(상태·로직 전부), ~6850줄, 라우트 82개
 ├── launcher.py             # pywebview 창 수명주기 + 단일인스턴스 + --updater 모드 + 부팅 업데이트 체크
+├── mini_window.py          # 미니창(Windows): 창 자리·크기·시댄스와 쌓기·메뉴·저절로 뜨기 (v2026-11-1601~, §2.4)
 ├── updater.py              # 버전 체크 + 자산 다운로드/검증 + EXE 자기교체 + 자동설치 시도 예산
 ├── nb_gateway.py           # 게이트웨이 클라이언트: 출입증·키 받기, DPAPI 금고, 승인 요청, 평문 정리, 사용량 spool
 ├── gateway/worker.js       # Cloudflare Worker (키 배포·승인·사용량 집계·관리자 페이지). wrangler deploy
@@ -41,6 +44,7 @@
 ├── templates/index.html    # 메인 UI
 ├── templates/viewer.html   # 프리뷰 창 (자체 완결 — 뷰어 로직 전부 이 파일)
 ├── templates/prompt_popup.html
+├── templates/mini.html     # 미니창 화면 (자체 완결, `{% raw %}` 로 감쌈)
 ├── server_mac.py           # 맥 전용 진입점 (Flask를 브라우저로 띄움)
 ├── requirements_mac.txt    NanoBanana.command    keys.env.example
 ├── dist/NanoBanana/        # 배포 산출물
@@ -64,6 +68,9 @@ C:\NanoBanana_build\
 ~/.nanobanana/gw_keys.vault              # 키 사본 (DPAPI) — 게이트웨이가 안 될 때 켜기용
 ~/.nanobanana/gateway.json               # 출입증 메타(누구/언제). 토큰 자체는 없음 (옛 버전은 평문으로 뒀다)
 ~/.nanobanana/usage_spool.jsonl          # 아직 못 올린 사용량 (30초마다 업로드)
+~/.nanobanana/mini_window.json           # 미니창 설정 (구석·핀·투명도·저절로 뜨기·마지막 모니터)
+~/.nanobanana/mini_today.json            # 미니창 "오늘 N장 · 실패 M" (날짜가 바뀌면 0부터)
+%APPDATA%/Freewill/mini-dock/            # 미니창 자리 파일 — 시댄스와 같이 쓰는 폴더 (자기 파일만 쓴다, §2.4)
 ~/Documents/NanoBanana JSON/             # 프로젝트 세션 JSON
 ~/Pictures/Screenshots/NanoBanana Clipboard/  # 클립보드·업로드 ref 캐시 (SHA1 이름)
 ~/Desktop/NanoBanana_Output/             # 기본 출력 폴더
@@ -170,6 +177,25 @@ NanoBanana.exe 실행
   순서가 바뀌면 켤 때 사라진 건을 멀쩡하다고 듣고 묻지 않는다
 - 에이전트: 저장된 탭은 재시작 뒤에도 사람의 재확인 없이 생성된다. **고르는 건 여전히 사람만**, 새 탭은 `needs_billing`
 - 탭 파일을 건네받아 열면 파일에 적힌 팀·프로젝트로 바로 잡힌다(Status 칸에 보인다)
+
+### 2.4 미니창 (v2026-11-1601~, Windows)
+아이디어 전상필님 11/13, 설계는 11/13~16 격리 데모에서 사용자와 정함. 정리: `기획_미니창_점검목록.md`, 두 앱 공통 규칙: `..\Freewill_미니창_공통규칙.md`.
+```
+launcher  → 본창 다음에 mini_window.start() — 숨긴 채 만든다. 본창이 닫히면 mini_window.close() (규칙 26)
+켜는 길   → 본창 📌 옆 버튼(/api/mini/toggle) · 본창을 내렸을 때 새 묶음/막힌 요청이 오면 저절로(설정에서 끌 수 있음)
+           저절로 뜬 창은 목록이 비면 저절로 닫힌다. 사람이 켠 창은 그대로. 돌고 있을 때 사람이 닫으면 그 일이 끝날 때까지 안 뜬다
+읽는 것   → app.mini_summary() (/api/mini): 묶음 하나 = 줄 하나(창·에이전트 모두, 에이전트 줄엔 MCP 칩), 끝난 줄 90초·실패 10분·눌러 본 줄은 바로 빠짐,
+           팀·프로젝트 없는 탭으로 온 에이전트 요청(needs_billing)은 노란 알림, "오늘 N장 · 실패 M"
+```
+- **줄의 모델·해상도·프롬프트는 대기열에 넣는 순간의 값**(`_batch_open(..., mini=)` → 묶음 기록의 `mini`). 요청 본문에서 읽으면 창의 Generate 줄이 빈다(데모에서 겪음). `/api/batch` 는 칸을 이름으로 골라 답하므로 이 칸은 안 나간다
+- **모델 이름은 갤러리 이름표(`static/app.js` 의 `_MODEL_SHORT`)를 서버가 읽어 쓴다** — 새 모델은 거기 하나만 넣으면 갤러리·미니창이 같이 바뀐다. 표에 없으면 ID 에서 날짜 꼬리를 뗀다. "GPT Image 2.x" 만 줄 폭 때문에 "GPT 2.x"
+- 크기 세 단계(알약·카드·펼침), 폭은 모두 300, 높이는 단계마다 고정(줄이 오가도 창이 안 움직인다 — 사용자 "점잖게"). 머리줄 단추 하나가 펼침→카드→알약을 돈다. 핀: 구석 고정 / 자유 위치
+- **시댄스와 자리 나누기**: 각 앱이 `mini-dock\<앱>.json` 자기 파일만 쓴다. 같은 모니터·구석이면 먼저 켜진 쪽(`since`)이 구석, 나중 쪽이 앞 카드의 **실제 자리** 22 바깥에 앉는다(카드 사이 22 = 화면 끝에서 22).
+  좌표는 '실제 픽셀 ÷ 그 모니터 배율' + `px`(실제 픽셀). 커질 때 뒤 창이 있으면 커질 자리를 먼저 적고 비킨 뒤 커진다(최대 1.3초). 읽다 실패하면 마지막으로 읽은 기록을 쓴다.
+  `NANOBANANA_DATA_DIR` 시험에선 데이터 폴더 안의 `mini-dock` 을 쓴다(진짜 폴더에 쓰면 시댄스가 진짜 창으로 본다). `NANOBANANA_MINI_DOCK_DIR` 로 바꿀 수 있다
+- 창은 작업표시줄·Alt+Tab 에 안 나온다(도구 창). 항상 위가 빠지면 되건다. 우클릭은 Windows 기본 메뉴(작은 창 안에 잘리지 않게)
+- **DPI**: launcher 가 모니터별 v2 를 먼저 켠다(안 되면 예전 v1). 창 좌표 = 화면 실제 픽셀이라는 전제를 미니창의 자리 계산이 쓴다
+- 시험(격리, 돈 안 듦): `mini_harness.py`(데모 가짜 생성기·시험용 시댄스 + 진짜 app.py·mini_window.py) 위에서 크기·부하·두 모니터·모델별 4종 — 스크래치에 있다. 실제 시댄스 시험판과의 측정은 `qa_live.py`
 
 ### 프론트 ↔ 서버
 - 상태는 `AppState` 싱글톤 하나에 전부 (설정·갤러리·ref 슬롯·큐·로그·이벤트)
@@ -293,6 +319,9 @@ gen_worker:
     에이전트 요청은 탭을 확인한 뒤 레퍼런스를 읽느라 수 초~30초 걸리고, 그 사이 닫힌 탭에 생성이 들어가면 보이지도
     멈출 수도 없는(Stop → `no_such_tab`) 탭에서 값이 나간다(v2026-11-1201 까지, 4/4 재현). `_enqueue_batch` 가 같은 잠금 안에서
     `closed` 를 보고 `no_such_tab`(404)으로 돌려보낸다 — 이때 호출자 id 는 안 쓴 것. 잠금 순서는 projects_lock → pending_jobs_lock 하나뿐
+26. **창을 새로 만들면 본창이 닫힐 때 같이 닫을 것.** pywebview 는 창이 **전부** 닫혀야 앱을 끝낸다(`BrowserView.instances` 가 빌 때).
+    숨긴 미니창 하나가 남으면 본창을 닫아도 프로세스가 화면 없이 계속 돈다. launcher 의 `_window.events.closed += mini_window.close()` 를 지우지 말 것.
+    미니창 제목("NanoBanana mini")은 두 번째 실행이 본창을 찾을 때 빼고 찾는다(항상 위라 먼저 잡힌다)
 
 ---
 
@@ -414,7 +443,7 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   (`<img>` 로는 스크립트가 안 돌지만 주소로 직접 열면 돈다). 레퍼런스·복사: GIF 는 첫 프레임, SVG 는 안내 후 거절
 - **모델 메뉴의 별표** (v2026-11-0502~): 회사별 그룹 + 회사마다 최고 모델 하나 `SOTA_MODELS`(app.js, 지금 `gemini-3-pro-image`·`gpt-image-2.6-sunburst`·`seedream-5-5-261028` — 시드림은 2026-11-10 에 5.0 Pro 에서 옮김).
   표시는 `★` + 강조색 하나(`--accent`), 화면에 "SOTA" 글자는 쓰지 않는다 — 회사별 색과 글자는 사용자가 빼라고 했다, 회사는 그룹 이름이 말한다. 판단으로 고른 값이다 — 구글은 문서가 "premium choice" 라 한 Pro 로,
-  2.1 은 "workhorse". 메뉴 순서는 `_MODEL_MENU_ORDER`(OpenAI·시드림은 최신·상위부터). **새 모델을 넣을 때 이 두 목록을 같이 볼 것** — `MODEL_SPECS[].refLimit`(커넥터가 보내기 전에 읽는다)도 `get_ref_limit` 과 같게 넣을 것
+  2.1 은 "workhorse". 메뉴 순서는 `_MODEL_MENU_ORDER`(OpenAI·시드림은 최신·상위부터). **새 모델을 넣을 때 이 두 목록을 같이 볼 것**(+ 갤러리·미니창 이름표 `_MODEL_SHORT` — 빠지면 미니창엔 ID 에서 날짜를 뗀 이름이 나온다. 앱의 모델 표끼리 대조하는 시험: 스크래치 `t_models.py` A 부분) — `MODEL_SPECS[].refLimit`(커넥터가 보내기 전에 읽는다)도 `get_ref_limit` 과 같게 넣을 것
 - **모델 설정의 "모델별 시작 화질" 스위치** (2026-11-05~): 켜짐(기본) = 모델을 바꾸면 그 모델의 시작 화질(`default_res`, 없으면 최고)·Quality 시작값. 꺼짐(`model_prefs.keep_panel=true`) = Ratio·Count 처럼 패널 값 유지 —
   해상도·Quality·Complexity 모두. 그 모델에 없는 값은 가장 가까운 값으로(`_nearestByRank`, 같은 거리면 높은 쪽: 1K 가 없으면 2K, 1.5K → 2K, 4K → 2K) 옮기고 토스트로 알린다. Quality 를 같이 묶은 건 해상도만 고정하면 모델을 바꿀 때마다 max 로 올라가 값이 새기 때문.
   사람이 고른 값은 `_panelWant` 에 따로 둔다 — 4K → 시드림 5.0(2K) → Pro 면 4K 로 돌아온다. `loadSettings`·모델 설정 저장·Reset Setup 때 비운다(재시작·탭 전환·Load 뒤엔 그 값부터). 다른 탭을 닫을 땐 안 비운다. 꺼 둔 동안에도 `default_res` 는 지우지 않는다(다시 켜면 그대로). prefs.json 이라 업데이트해도 유지. 표시 체크박스는 스위치와 무관.

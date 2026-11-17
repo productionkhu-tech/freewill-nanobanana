@@ -476,6 +476,8 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   **5.0 Pro / Flash 는 1K · 1.5K · 2K** — 1.5K 는 1K 와 같은 값(Pro 는 2.61M px 이하 $0.045 구간, 1.5K 는 전부 그 아래)인데
   화질이 낫다. 4.5 는 2K/4K 그대로. 프롬프트 최적화는 5.0 Pro/Flash 에 `optimize_prompt_options={"mode":"standard"}`
   를 **명시**해서 보낸다(기본값도 standard 지만 바뀌어도 흔들리지 않게. fast 는 Pro 만 되고 화질을 깎는다 — 안 씀).
+  **끄는 값은 없다**(2026-11-17, 과금 없는 탐침 — 너무 작은 size 로 보내면 mode 검사가 크기보다 먼저 돈다): 5.5·Flash 는 `standard` 만, Pro 는 `standard, fast` 만 받고
+  none·off·disabled·close·"" 는 400. 빼고 보내도 기본 standard. 4.5 는 크기 검사가 먼저라 이 방법으론 못 가른다(문서상 standard 만). 저장소의 `seedream 5-0 ... API` 문서는 Pro 가 fast 를 못 받는다고 하지만 실제로는 받는다
   실측(2026-10-22): Flash 1K 15초·1.5K 16:9 → 2048×1152 15초, Pro 1.5K 1:1 → 1536×1536 38초.
   BytePlus 는 모델마다 콘솔에서 "활성화"가 필요할 수 있다 — 새 모델은 일부러 틀린 size 로 한 번 보내 보면
   400(크기 오류)=쓸 수 있음 / 404=없음·권한 없음을 **과금 없이** 가를 수 있다

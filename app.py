@@ -1053,6 +1053,265 @@ _FILENAME_RESERVE_LOCK = threading.Lock()
 
 
 # ==========================================
+# Project files bloated by PowerShell objects (2026-11-18)
+# ==========================================
+# An agent sent prompts read with PowerShell's Get-Content through ConvertTo-Json. Before v2026-11-1801
+# the app str()'d that object, so each image of those batches holds
+# "{'value': '<the prompt>', 'PSPath': ..., 'PSProvider': {...type dumps...}}" three times (prompt,
+# generation_settings.prompt, prompt_sections) - one tab's file reached 2.18 GB: 40 s+ per autosave,
+# ~6 GB to open, a project list that froze. Now refused at the door (_text_problem); a file already that big
+# is cleaned when it is opened: each such text becomes the prompt it wrapped, the original is kept
+# beside it as <name>.bloated.bak (".bak", so the project list does not pick it up).
+PROJECT_REPAIR_MIN_BYTES = 64 * 1024 * 1024
+PROJECT_LIST_FULL_READ_MAX = 32 * 1024 * 1024
+_PS_WRAPPED_RE = re.compile(r"""\{'value': ('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"), 'PSPath': """)
+_JSON_KEY_RE = re.compile(r'"[A-Za-z_]+": ')
+
+
+def _unwrap_ps_text(s):
+    """str() of one PowerShell string ("{'value': 'a cat', 'PSPath': ...}"), of Get-Content's lines
+    ("[{'value': 'line 1', 'PSPath': ...}, {...}]") or of those lines kept as one array
+    ("{'value': [{'value': 'line 1', 'PSPath': ...}, ...], 'Count': 2}", Write-Output -NoEnumerate)
+    -> the text it wrapped. None when s is not that."""
+    import ast
+    if not isinstance(s, str):
+        return None
+    if s.startswith("{'value': [{'value': "):
+        found = list(_PS_WRAPPED_RE.finditer(s))
+        if not found or found[0].start() != 11:
+            return None
+    elif s.startswith("{'value': "):
+        m = _PS_WRAPPED_RE.match(s)
+        found = [m] if m else []
+    elif s.startswith("[{'value': "):
+        found = list(_PS_WRAPPED_RE.finditer(s))
+        if not found or found[0].start() != 1:
+            return None
+    else:
+        return None
+    parts = []
+    for m in found:
+        try:
+            v = ast.literal_eval(m.group(1))
+        except Exception:
+            return None
+        if not isinstance(v, str):
+            return None
+        parts.append(v)
+    if not parts:
+        return None
+    return "\n".join(parts).strip()
+
+
+def _repair_project_line(line):
+    """One line of a project file (json.dump indent=2 puts every string on a line of its own):
+    the same line with a PowerShell-wrapped string replaced by its text, or None to keep it."""
+    # Plain cuts, not a regex: a regex over a 400 KB string line took 85 ms (a 2 GB file: minutes).
+    body = line.rstrip("\r\n")
+    end = line[len(body):]
+    comma = "," if body.endswith(",") else ""
+    core = body[:len(body) - len(comma)]
+    stripped = core.lstrip(" ")
+    indent = core[:len(core) - len(stripped)]
+    m = _JSON_KEY_RE.match(stripped[:80])          # '"prompt": ' - only these simple key names
+    head = indent + (m.group(0) if m else "")
+    value = core[len(head):]
+    if not (value.startswith('"') and value.endswith('"')):
+        return None
+    try:
+        s = json.loads(value)
+    except Exception:
+        return None
+    t = _unwrap_ps_text(s)
+    if t is None:
+        return None
+    return head + json.dumps(t, ensure_ascii=False) + comma + end
+
+
+_REPAIR_MARK = b"{'value': "
+_REPAIR_LOCKS = {}
+_REPAIR_LOCKS_LOCK = threading.Lock()
+
+
+def _quiet_remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _retry(fn, tries=5):
+    """A just-written file can be held for a moment (antivirus, sync, indexer): try again a little later."""
+    for i in range(tries):
+        try:
+            fn()
+            return True
+        except OSError:
+            if i + 1 < tries:
+                time.sleep(0.25 * (i + 1))
+    return False
+
+
+def _file_contains(path, needle, chunk=16 * 1024 * 1024):
+    with open(path, "rb") as f:
+        tail = b""
+        while True:
+            b = f.read(chunk)
+            if not b:
+                return False
+            if needle in tail + b:
+                return True
+            tail = b[-(len(needle) - 1):]
+
+
+def _repair_bloated_project(filepath):
+    """Clean a big project file before it is read (above). Never raises and never makes opening worse:
+    on any failure the original stays where it was and the caller reads it the old way.
+    Returns (texts_fixed, bytes_before, bytes_after, backup_path) or None when nothing was changed."""
+    try:
+        if os.path.getsize(filepath) < PROJECT_REPAIR_MIN_BYTES:
+            return None
+    except OSError:
+        return None
+    # One at a time per file: restore at start-up and an open from the list can reach the same file
+    # together (the restore's tab is only findable once its load ends; cleaning 2 GB takes 10 s+).
+    key = os.path.normcase(os.path.abspath(filepath))
+    with _REPAIR_LOCKS_LOCK:
+        lock = _REPAIR_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        try:
+            return _repair_bloated_locked(filepath)
+        except Exception:
+            return None
+
+
+def _repair_bloated_locked(filepath):
+    size = os.path.getsize(filepath)
+    # A read-only file cannot be replaced, and a hard link to it is read-only too (it would stay behind).
+    if not os.access(filepath, os.W_OK):
+        return None
+    # A normal big file has no such text: a fast byte search, nothing written.
+    if not _file_contains(filepath, _REPAIR_MARK):
+        return None
+    tmp = "%s.repairing-%d" % (filepath, os.getpid())
+    fixed, off, dst = 0, 0, None
+    try:
+        # Bytes, line by line (a 2 GB file never sits in memory). Nothing is written until the first
+        # line that needs it: a prompt that merely contains "{'value': " costs one read, no copy.
+        with open(filepath, "rb") as src:
+            for raw in src:
+                if _REPAIR_MARK in raw:
+                    try:
+                        nl = _repair_project_line(raw.decode("utf-8"))
+                    except UnicodeDecodeError:
+                        nl = None
+                    if nl is not None:
+                        if dst is None:
+                            dst = open(tmp, "wb")
+                            with open(filepath, "rb") as head:
+                                left = off
+                                while left:
+                                    b = head.read(min(left, 16 * 1024 * 1024))
+                                    if not b:
+                                        raise OSError("source shrank while cleaning")
+                                    dst.write(b)
+                                    left -= len(b)
+                        dst.write(nl.encode("utf-8"))
+                        fixed += 1
+                        off += len(raw)
+                        continue
+                if dst is not None:
+                    dst.write(raw)
+                off += len(raw)
+        if dst is None:
+            return None
+        dst.close()
+        dst = None
+        with open(tmp, "r", encoding="utf-8") as f:          # must still be a project before it counts
+            data = json.load(f)
+        if not isinstance(data, dict) or "ui_state" not in data:
+            _quiet_remove(tmp)
+            return None
+    except Exception:
+        if dst is not None:
+            try:
+                dst.close()
+            except Exception:
+                pass
+        _quiet_remove(tmp)
+        return None
+    bak = filepath + ".bloated.bak"
+    if os.path.exists(bak):
+        bak = "%s.bloated-%d.bak" % (filepath, int(time.time()))
+    try:
+        os.link(filepath, bak)              # a second name for the original, no 2 GB copy
+        linked = True
+    except OSError:
+        linked = False
+    if linked:
+        # One atomic swap: the path always holds a whole file. If it will not go (file open elsewhere,
+        # read-only), take the second name back and leave everything as it was.
+        if _retry(lambda: os.replace(tmp, filepath)):
+            return fixed, size, os.path.getsize(filepath), bak
+        _quiet_remove(bak)
+        _quiet_remove(tmp)
+        return None
+    # No hard links here (FAT/exFAT, some shares): move the original aside, then the clean file in. If
+    # the second step will not go, the original goes back - its own name is never left empty for long.
+    if not _retry(lambda: os.replace(filepath, bak)):
+        _quiet_remove(tmp)
+        return None
+    if _retry(lambda: os.replace(tmp, filepath)):
+        return fixed, size, os.path.getsize(filepath), bak
+    if _retry(lambda: os.replace(bak, filepath), tries=20):
+        _quiet_remove(tmp)
+    return None
+
+
+_PROJECT_SKIM_CACHE = {}
+
+
+def _skim_project_file(fp):
+    """The project list's facts for a big file without parsing it (a 2 GB file took ~6 GB and froze the
+    list): the prompt and newest pictures from the first 4 MB, the number of pictures by counting the
+    item lines (json.dump indent=2: 6 spaces + "filepath"). Remembered by size and time."""
+    st = os.stat(fp)
+    key = (st.st_size, st.st_mtime)
+    hit = _PROJECT_SKIM_CACHE.get(fp)
+    if hit and hit[0] == key:
+        return hit[1]
+    marker = b'\n      "filepath": '
+    count, tail = 0, b""
+    with open(fp, "rb") as f:
+        head = f.read(4 * 1024 * 1024)
+        f.seek(0)
+        while True:
+            chunk = f.read(16 * 1024 * 1024)
+            if not chunk:
+                break
+            buf = tail + chunk
+            count += buf.count(marker)
+            tail = buf[-(len(marker) - 1):]
+    text = head.decode("utf-8", "replace")
+    prompt = ""
+    m = re.search(r'\n    "prompt": ("(?:[^"\\]|\\.)*")', text)
+    if m:
+        try:
+            prompt = json.loads(m.group(1))
+        except Exception:
+            prompt = ""
+    newest = []
+    for m in re.finditer(r'\n      "filepath": ("(?:[^"\\]|\\.)*")', text):
+        try:
+            newest.append(json.loads(m.group(1)))
+        except Exception:
+            pass
+    out = {"prompt": prompt, "image_count": count, "newest": newest}
+    _PROJECT_SKIM_CACHE[fp] = (key, out)
+    return out
+
+
+# ==========================================
 # Project state — one instance per open tab
 # ==========================================
 # Attributes that belong to the APP rather than a project are exposed here as
@@ -2299,6 +2558,12 @@ class AppState:
         self.project_dirty = was_dirty
 
     def load_project(self, filepath, defer_refs=False):
+        # A file bloated by PowerShell-object prompts (2026-11-18) is cleaned first: read whole it
+        # would need several GB. Normal files under 64 MB are not touched.
+        fixed = _repair_bloated_project(filepath)
+        if fixed:
+            self.log("Project file cleaned: %d PowerShell-wrapped prompt(s) restored, %.0f MB -> %.0f MB, "
+                     "original kept as .bloated.bak" % (fixed[0], fixed[1] / 1e6, fixed[2] / 1e6))
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -2468,6 +2733,17 @@ class AppState:
         candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         for fp in candidates[:limit]:
             try:
+                if os.path.getsize(fp) > PROJECT_LIST_FULL_READ_MAX:
+                    sk = _skim_project_file(fp)
+                    entries.append({
+                        "filepath": fp,
+                        "name": os.path.basename(fp),
+                        "modified_at": os.path.getmtime(fp),
+                        "prompt": sk["prompt"],
+                        "image_count": sk["image_count"],
+                        "preview_path": next((x for x in sk["newest"] if os.path.exists(x)), ""),
+                    })
+                    continue
                 with open(fp, "r", encoding="utf-8") as f:
                     data = json.load(f)
             except Exception:
@@ -3908,6 +4184,18 @@ def update_settings():
     if d.get("pid") and _project_strict(d.get("pid")) is None:
         return _no_such_tab()
     state = _project_from_body(d)      # shadows the module proxy on purpose
+    # 창은 이 칸들을 늘 글자로 보낸다. 글자가 아닌 게 오면(PowerShell 객체 등) str() 이 수십만 자를 만들어
+    # 탭에 저장된다 — 에이전트 생성 요청과 같은 덫(_text_problem). 바꾸기 전에 거절한다.
+    for k in ("model", "aspect", "resolution", "quality", "complexity", "fixed_prompt", "output_dir",
+              "naming_prefix", "naming_delimiter", "naming_index_prefix"):
+        bad = _text_problem(d.get(k), "prompt" if k == "fixed_prompt" else k)
+        if bad:
+            return jsonify(bad)
+    if "prompt_sections" in d and isinstance(d.get("prompt_sections"), list):
+        for x in d["prompt_sections"]:
+            bad = _text_problem(x, "prompt")
+            if bad:
+                return jsonify(bad)
     # Snapshot first: a POST that changes nothing must not mark the project
     # dirty. The page re-sends the whole settings block after opening a project
     # (the mention re-sync fires when a reference file has gone missing), and
@@ -5552,8 +5840,37 @@ def _start_generate_agent(p, d):
             _batch_claims.pop(bid, None)
 
 
+AGENT_PROMPT_MAX = 50000        # 글자 수. 사람이 쓰는 프롬프트는 길어야 수천 자다
+
+
+def _text_problem(v, field, limit=None):
+    """밖에서 온 글자 칸이 글자인지(2026-11-18 제보: 한 탭의 프로젝트 파일이 2.18GB).
+    PowerShell 5.1 은 Get-Content 로 읽은 글을 ConvertTo-Json 으로 보내면 글자가 아니라
+    {"value": 글, "PSPath": ..., "PSProvider": {..}} 객체로 보낸다. str() 하면 40자 글이 38만 자
+    (-Depth 6 이면 4,700만 자)가 되고, 그게 프롬프트로 모델에 가고 그림마다 세 번씩 저장됐다.
+    고쳐 받지 않고 이유와 함께 거절한다. 문제없으면 None."""
+    if v is None or isinstance(v, str):
+        if limit and v and len(v.strip()) > limit:
+            return {"ok": False, "error": "%s_too_long" % field, "field": field,
+                    "limit": limit, "given": len(v.strip())}
+        return None
+    inner = v.get("value") if isinstance(v, dict) and isinstance(v.get("value"), list) else v
+    ps = (isinstance(v, dict) and "PSPath" in v) or (
+        isinstance(inner, list) and bool(inner) and isinstance(inner[0], dict) and "PSPath" in inner[0])
+    out = {"ok": False, "error": "bad_" + field, "field": field,
+           "detail": "%s must be a JSON string, got %s" % (field, "array" if isinstance(v, list) else
+                                                          "object" if isinstance(v, dict) else type(v).__name__)}
+    if ps:
+        out["hint"] = ("PowerShell sent text read with Get-Content as an object (PSPath, PSProvider ...). "
+                       "Send [string](Get-Content <file> -Raw) or [IO.File]::ReadAllText(<file>).")
+    return out
+
+
 def _agent_batch(p, d, batch_id, check_only):
-    prompt = str(d.get("prompt") or "").strip()
+    bad = _text_problem(d.get("prompt"), "prompt", AGENT_PROMPT_MAX)
+    if bad:
+        return jsonify(bad)
+    prompt = (d.get("prompt") or "").strip()
     if not prompt:
         return jsonify({"ok": False, "error": "Empty prompt"})
     s = d.get("settings")
@@ -6091,6 +6408,9 @@ def api_projects_new():
     raw = d.get("activate", True)
     activate = not (raw is False or raw is None or raw == 0
                     or str(raw).strip().lower() in ("false", "0", "no", "off"))
+    bad = _text_problem(d.get("title"), "title", 200)     # 에이전트가 PowerShell 로 보낸 제목도 같은 덫
+    if bad:
+        return jsonify(bad)
     proj = create_project(title=(d.get("title") or None), activate=activate)
     _note_user_tab(proj.pid, on_screen=activate)
     _save_session()
@@ -6554,6 +6874,14 @@ def upload_project():
         proj.push_event({"type": "projects_changed"})
     try:
         os.remove(tmp)
+    except Exception:
+        pass
+    # An uploaded copy that was cleaned leaves its .bloated.bak beside it - a temp file's backup is
+    # nobody's (the person still has their own original). Do not keep 2 GB in the clipboard cache.
+    try:
+        for n in os.listdir(state.temp_ref_dir):
+            if n.startswith(os.path.basename(tmp) + ".bloated") and n.endswith(".bak"):
+                _quiet_remove(os.path.join(state.temp_ref_dir, n))
     except Exception:
         pass
     return jsonify({"ok": ok, "message": msg, "pid": proj.pid if ok else None})

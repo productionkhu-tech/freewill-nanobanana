@@ -2059,6 +2059,9 @@ footer {
 .mp-row input[type=checkbox] { margin: 0 auto; cursor: pointer; }
 .mp-name { font-size: 12px; color: var(--text); cursor: pointer; display: flex; align-items: center; gap: 6px; }
 .mp-current {
+  /* never squeezed onto two lines ("사용 / 중") by a long model name - the name wraps instead */
+  flex: none;
+  white-space: nowrap;
   font-size: 9px;
   color: var(--bg);
   background: var(--accent);

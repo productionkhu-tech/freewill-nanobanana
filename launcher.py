@@ -1046,12 +1046,26 @@ def main():
     # shows it, and it shows by itself when this window is minimised and new work
     # comes in. It must close with this window - pywebview only ends the app
     # when every window is gone.
+    # Made by US once this window is on screen (v2026-11-1901), not before
+    # webview.start(): pywebview makes every window after the first from a thread
+    # that gives the first one only 10 s to show (webview/__init__.py
+    # _create_children, "Main window failed to load"). On a busy PC the start
+    # took longer, the strip was silently never made, and its button then hung
+    # 20 s and failed (2026-11-18 release smoke, twice; reproduced 11/19 with the
+    # main window held back 12 s). Waiting for "shown" here has no deadline.
     if sys.platform == "win32":
         try:
             import app as _app_module
             import mini_window
-            mini_window.start(_app_module, f"{APP_URL}/mini", main_window=_window)
             _window.events.closed += (lambda *a: mini_window.close())
+
+            def _make_mini():
+                try:
+                    _window.events.shown.wait()
+                    mini_window.start(_app_module, f"{APP_URL}/mini", main_window=_window)
+                except Exception as e:
+                    print(f"  mini window: {e}")
+            threading.Thread(target=_make_mini, daemon=True).start()
         except Exception as e:
             print(f"  mini window: {e}")
 

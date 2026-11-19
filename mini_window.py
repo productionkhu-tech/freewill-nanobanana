@@ -204,6 +204,7 @@ def _prefs_save():
 CORNER = {"v": "tr"}             # top-right by default: Windows toasts own the bottom-right (user 11/13)
 LOCKED = {"v": True}             # the pin: on = a drop goes to the nearest corner and stacks, off = stays put
 STATE = {"stacked": False}
+_LOADED_LOCK = threading.Lock()  # the strip's first load starts the watcher once (two callers can race, start())
 MAIN_STATE = {"visible": True}   # the main window is up (not minimised)
 MINI_STATE = {"visible": False}
 AUTO = {"shown": False}          # shown by itself: hides by itself once the list is empty
@@ -1009,18 +1010,35 @@ def start(app_module, url, main_window=None, open_main=None, api=None):
             main_window.events.shown += (lambda *a: main_shown())
         except Exception as e:
             print("mini main events:", e, flush=True)
-    mini = webview.create_window("NanoBanana mini", url, js_api=api or Api(), width=W, height=200,
-                                 resizable=False, frameless=True, min_size=(120, 28), easy_drag=False,
-                                 on_top=True, hidden=True, background_color="#1C1C1E")
+    if CLOSING["v"]:
+        return None                          # the main window is already going: a strip now would keep the app alive
+    # The app calls this after webview.start(), from a thread, once the main window is up (launcher, v2026-11-1901):
+    # pywebview then makes the window right here, so its 'loaded' may come before the handler below is attached.
+    w = webview.create_window("NanoBanana mini", url, js_api=api or Api(), width=W, height=200,
+                              resizable=False, frameless=True, min_size=(120, 28), easy_drag=False,
+                              on_top=True, hidden=True, background_color="#1C1C1E")
+    mini = w
 
     def _loaded(*a):
-        if STATE.get("watching"):
-            return
-        STATE["watching"] = True
+        with _LOADED_LOCK:
+            if STATE.get("watching"):
+                return
+            STATE["watching"] = True
         _decorate()
         threading.Thread(target=_watch, daemon=True).start()
-    mini.events.loaded += _loaded
-    mini.events.closing += _on_closing
+    w.events.loaded += _loaded
+    w.events.closing += _on_closing
+    if w.events.loaded.is_set():
+        _loaded()                            # it loaded before we listened
+    if CLOSING["v"]:
+        # close() ran while the strip was being made and found none to close. Close it here, or pywebview keeps
+        # the process running with nothing on screen (rule 26).
+        try:
+            w.destroy()
+        except Exception as e:
+            print("mini close (made late):", e, flush=True)
+            os._exit(0)
+        return None
     A.MINI_HOOKS["toggle"] = toggle
     A.MINI_HOOKS["visible"] = lambda: MINI_STATE["visible"]
     A.MINI_HOOKS["prefs"] = prefs_view

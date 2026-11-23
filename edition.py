@@ -28,7 +28,10 @@ PERSONAL = EDITION == "personal"
 
 if PERSONAL:
     APP_TITLE = "NanoBanana Personal"
-    PORT = 5657
+    # Outside Windows' dynamic port range on default PCs (49152+) AND on PCs where it was widened down
+    # (this dev PC: 1024-15000) - Hyper-V / WSL reserve 100-port blocks inside that range at boot, and a
+    # reserved port cannot be bound (WinError 10013). 5657 was inside a reserved block here on 2026-11-23.
+    PORT = 35657
     MUTEX_NAME = "NanoBanana-Personal-SingleInstance-v1"
     APP_USER_MODEL_ID = "NanoBanana.Personal"
     DATA_DIRNAME = ".nanobanana-personal"

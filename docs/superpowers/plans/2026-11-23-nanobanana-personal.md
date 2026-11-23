@@ -14,7 +14,7 @@
 
 - 판 결정: frozen 이면 `sys._MEIPASS\EDITION` 내용이 정확히 `personal` 일 때만 개인판, **환경변수 무시**. 소스 실행만 `NANOBANANA_EDITION=personal`.
 - 개인판 분기는 `edition.PERSONAL` 하나로만. 회사판 동작·화면·커넥터·업데이트는 바뀌면 실패.
-- 이름표 (회사 → 개인): EXE `NanoBanana` → `NanoBanana-Personal` · 포트 5656 → **5657** · 잠금 `NanoBanana-AIImageStudio-SingleInstance-v1` → `NanoBanana-Personal-SingleInstance-v1` ·
+- 이름표 (회사 → 개인): EXE `NanoBanana` → `NanoBanana-Personal` · 포트 5656 → **35657** · 잠금 `NanoBanana-AIImageStudio-SingleInstance-v1` → `NanoBanana-Personal-SingleInstance-v1` ·
   창 제목 `NanoBanana` → `NanoBanana Personal` · 미니창 `NanoBanana mini` → `NanoBanana Personal mini` · 데이터 `~/.nanobanana` → `~/.nanobanana-personal` ·
   프로젝트 `문서\NanoBanana JSON` → `문서\NanoBanana Personal JSON` · 캐시 `NanoBanana Clipboard` → `NanoBanana Personal Clipboard` · 출력 `NanoBanana_Output` → `NanoBanana Personal_Output` ·
   미니 자리 `nanobanana` rank 1 → `nanobanana-personal` rank 1.5 · 저장소 `productionkhu-tech/freewill-nanobanana` → `productionkhu-tech/freewill-nanobanana-personal` ·
@@ -24,7 +24,7 @@
 - 회사 키 비교 대상: 워커의 `knownKeyHashes(env)` 집합(현재 OPENAI/STUDIO/ARK + RETIRED + TICKET). 시댄스 키는 범위 밖(사용자 결정).
 - 실행 문자열(print/로그)은 ASCII 만(규칙 11). 화면 문구는 한국어 평문.
 - 시험은 격리(규칙 17): `NANOBANANA_DATA_DIR`·`USERPROFILE`·`HOME`·`NANOBANANA_MINI_DOCK_DIR` 를 임시 폴더로. 시험 러너는 빌드 venv `C:\NanoBanana_build\venv\Scripts\python.exe` (pytest 없음 — 스크립트가 `checks N, failed M` 을 찍고 실패 시 종료코드 1).
-- EXE 시험 직전 5656·5657 과 NanoBanana*.exe 가 비어 있는지 확인, 끌 땐 시험 폴더 경로로만(메모리 `exe-test-never-touch-real-app`).
+- EXE 시험 직전 5656·35657 과 NanoBanana*.exe 가 비어 있는지 확인, 끌 땐 시험 폴더 경로로만(메모리 `exe-test-never-touch-real-app`).
 - git: 작업 브랜치 `personal`(main 에서 분기, 끝나면 main 으로 fast-forward). `git add .` 금지 — 이름으로만. 커밋은 `git commit -F <스크래치 파일>`, 끝 줄 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. 커밋 전 시크릿 스캔(CLAUDE.md §5).
 - 바깥에 나가는 일(공개 저장소 만들기·push·릴리스·워커 배포)은 그 단계에서 사용자에게 먼저 묻는다. 돈 드는 생성은 사용자 확인 뒤.
 
@@ -98,7 +98,7 @@ for t, comp, pers in [("NanoBanana", True, False), ("NanoBanana — a *", True, 
 
 - [ ] **Step 1: 실패하는 시험** `t_names_wired.py` — 판마다 서브프로세스에서 `isolate()` 후 import:
 ```python
-check("launcher port", launcher.PORT == E.PORT)            # 5656 / 5657
+check("launcher port", launcher.PORT == E.PORT)            # 5656 / 35657
 check("updater repo", updater.REPO == E.REPO)
 check("updater assets", updater.asset_names() == (E.EXE_STEM + ".exe", E.EXE_STEM + ".exe.sha256"))
 check("updater state dir", os.path.basename(os.path.dirname(updater.auto_update_state_file())) == E.DATA_DIRNAME)  # USERPROFILE 아래
@@ -345,11 +345,11 @@ ok("other routes untouched", (await rawPath("/health")).status === 200);
 - [ ] **Step 3:** 회사 EXE 스모크 — 지난 릴리스 스모크 스크립트(26건) 그대로 통과 + frozen 회사 EXE 를 `NANOBANANA_EDITION=personal` 환경으로 켜도 5656·회사 제목·HTML 에 토큰 있음
 - [ ] **Step 4:** `exe_both.py` (격리 홈·데이터, 진짜 앱이 떠 있으면 중단):
 ```python
-check("both up", port_open(5656) and port_open(5657))
+check("both up", port_open(5656) and port_open(35657))
 check("titles", own_window(company_pid) == "NanoBanana" and own_window(personal_pid) == "NanoBanana Personal")
 check("data split", exists(home/".nanobanana") and exists(home/".nanobanana-personal"))
-check("personal html no token", token_meta(5657) == "" and token_meta(5656) != "")
-check("personal api closed", http_get(5657, "/api/projects").status == 403)
+check("personal html no token", token_meta(35657) == "" and token_meta(5656) != "")
+check("personal api closed", http_get(35657, "/api/projects").status == 403)
 check("second launch -> own window", relaunch(personal_exe) and foreground_title() .startswith("NanoBanana Personal"))
 check("second launch company -> own window", relaunch(company_exe) and not foreground_title().startswith("NanoBanana Personal"))
 # _MEI: 개인판을 켜고 6분 기다린 뒤(폴더 시각을 과거로 돌려도 됨) 회사판을 켬 → 개인판에서 뷰어·미니창 열기 정상

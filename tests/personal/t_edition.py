@@ -37,7 +37,7 @@ COMPANY_EXPECTED = {
     "REPO": "productionkhu-tech/freewill-nanobanana", "EXE_STEM": "NanoBanana", "UPDATE_LOG": "nanobanana_update.log"}
 PERSONAL_EXPECTED = {
     "EDITION": "personal", "PERSONAL": True, "APP_TITLE": "NanoBanana Personal", "MINI_TITLE": "NanoBanana Personal mini",
-    "PORT": 5657, "MUTEX_NAME": "NanoBanana-Personal-SingleInstance-v1", "APP_USER_MODEL_ID": "NanoBanana.Personal",
+    "PORT": 35657, "MUTEX_NAME": "NanoBanana-Personal-SingleInstance-v1", "APP_USER_MODEL_ID": "NanoBanana.Personal",
     "DATA_DIRNAME": ".nanobanana-personal", "PROJECTS_DIRNAME": "NanoBanana Personal JSON",
     "CLIPBOARD_DIRNAME": "NanoBanana Personal Clipboard", "OUTPUT_DIRNAME": "NanoBanana Personal_Output",
     "DOCK_NAME": "nanobanana-personal", "DOCK_RANK": 1.5, "REPO": "productionkhu-tech/freewill-nanobanana-personal",

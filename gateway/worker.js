@@ -316,6 +316,25 @@ async function knownKeyHashes(env) {
   return [...out];
 }
 
+/** 개인판(NanoBanana Personal, 2026-11-23~): 사용자가 넣은 키가 회사 키인지 — 키도, 키의 지문 전체도 받지 않는다.
+ *  앱이 보낸 sha256 앞 8글자(hex)로 시작하는 회사 키 해시만 돌려주고 비교는 앱이 한다. 출입증 없이 닿는 길이라
+ *  주소마다 10분에 60번까지(이 격리의 메모리 — KV 를 쓰지 않아 무료 한도를 먹지 않는다). 아무것도 남기지 않는다. */
+const _pchk = new Map();
+async function handlePersonalCheck(request, env) {
+  const ip = clientIp(request);
+  const now = Date.now();
+  const e = _pchk.get(ip);
+  if (!e || now - e.t0 > 600000) _pchk.set(ip, { n: 1, t0: now });
+  else if (++e.n > 60) return json({ ok: false, error: "too many requests, try later" }, 429);
+  if (_pchk.size > 5000) _pchk.clear();
+  let b;
+  try { b = await request.json(); } catch { return json({ ok: false, error: "bad request" }, 400); }
+  const p = b && typeof b.p === "string" ? b.p : "";
+  if (!/^[0-9a-f]{8}$/.test(p)) return json({ ok: false, error: "bad request" }, 400);
+  const hashes = (await knownKeyHashes(env)).filter((h) => h.startsWith(p));
+  return json({ ok: true, hashes });
+}
+
 async function keyBundle(env) {
   const id = async (k) => (clean(k) ? (await sha256Hex(clean(k))).slice(0, 12) : "");
   let vertex = null;
@@ -2415,6 +2434,10 @@ export default {
 
     if (path === "/enroll" && request.method === "POST") {
       return handleEnroll(request, env);
+    }
+    // 개인판이 넣은 키가 회사 키인지 (앞 8글자만 받는다).
+    if (path === "/personal/check" && request.method === "POST") {
+      return handlePersonalCheck(request, env);
     }
     if (path === "/key" && request.method === "POST") {
       return handleKey(request, env, ctx);

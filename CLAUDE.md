@@ -246,7 +246,7 @@ launcher  → 본창이 화면에 뜬 뒤(shown) 스레드에서 mini_window.sta
 창 토큰     HTML 에 없다. launcher 가 모든 창을 app.window_url(path) = 주소 + #nbt=<토큰> 으로 연다 → static/nb_token.js 가 조각 → 메모리 + 세션 쿠키 nbt
             (SameSite=Strict) 로 옮기고 주소에서 지운다. 개인판 서버는 GET 포함 모든 /api/* 에 토큰(헤더·쿠키)을 요구 —
             예외는 /api/version 과 /api/back-to-main(두 번째 실행이 본창을 부르는 길) 둘. 회사판은 예전 그대로(메타에 토큰, GET 열림)
-업데이트    productionkhu-tech/freewill-nanobanana-personal (README + 릴리스만, 소스 없음). 자산 NanoBanana-Personal.exe + .sha256.
+업데이트    productionkhu-tech/freewill-nanobanana-personal (README · VERSION · 릴리스만, 소스 없음 — VERSION 은 api.github.com 이 403 일 때 raw 폴백이 읽는다, 릴리스마다 올릴 것). 자산 NanoBanana-Personal.exe + .sha256.
             받는 고정 링크 …/freewill-nanobanana-personal/releases/latest/download/NanoBanana-Personal.exe
 같이 켜기   포트·잠금·창·데이터 따로. 두 번째 실행은 edition.is_own_main_title 로 자기 본창만 찾는다. _MEI 청소는 규칙 31
 ```

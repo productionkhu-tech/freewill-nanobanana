@@ -270,7 +270,8 @@ Start-Process ".\dist\NanoBanana\NanoBanana.exe"
   ```
 - **시험**: `tests/personal/run_all.py` (ALL GREEN) → `tests/personal/exe_personal.py <exe> <VERSION>` → 5656 이 비어 있으면 `tests/personal/exe_both.py`.
   EXE 시험은 진짜 앱이 떠 있으면 스스로 멈춘다(그때는 사용자에게 꺼 달라고)
-- **릴리스**: 저장소 `productionkhu-tech/freewill-nanobanana-personal` (README + 릴리스만). §4 와 똑같이 **draft → 자산 2종 → 공개**, 자산 이름만 다르다:
+- **릴리스**: 저장소 `productionkhu-tech/freewill-nanobanana-personal` (README · VERSION · 릴리스만). **먼저 그 저장소의 `VERSION` 을 새 버전으로 커밋·push**
+  (업데이터의 raw 폴백 `…/main/VERSION` — 빼먹으면 api.github.com 403 일 때 개인판이 새 버전을 못 본다). §4 와 똑같이 **draft → 자산 2종 → 공개**, 자산 이름만 다르다:
   `NanoBanana-Personal.exe` + `NanoBanana-Personal.exe.sha256` (내용 `<hex>  NanoBanana-Personal.exe`). 태그는 그 저장소의 `main` 커밋을 가리킨다
   (`target_commitish: "main"` — 소스 커밋은 거기에 없다). 노트 톤은 §4 그대로(평문 한국어, 회사 이야기 없이)
 - **E2E (개인판)**: 같은 소스의 VERSION 만 옛 값(예: 오늘 날짜 00)으로 바꿔 개인판 EXE 를 따로 빌드 → 격리 홈(`USERPROFILE`·`HOME`·`TEMP` 를 시험 폴더로)에서 켜고

@@ -166,7 +166,7 @@ function rowFor(b) {
   if (el.dataset.ic !== icKey) {
     el.dataset.ic = icKey;
     el.querySelector(".ic").innerHTML = ICON[b.state] + (b.state === "done" && b.thumb
-      ? '<img alt="" src="/api/gallery/thumb?size=96&path=' + encodeURIComponent(b.thumb) + '" onerror="this.remove()">' : "");
+      ? '<img alt="" src="/api/gallery/thumb?size=96&path=' + encodeURIComponent(b.thumb) + '" onerror="if (!window.nbImgRetry || !nbImgRetry(this)) this.remove()">' : "");
   }
   el.classList.toggle("failed", b.state === "failed");
   const prompt = b.prompt || "(프롬프트 없음)";

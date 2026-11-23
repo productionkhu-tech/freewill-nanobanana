@@ -169,9 +169,9 @@ def _sweep_stale_mei(temp_dir=None, our_mei=None, now=None, force=False):
 
     A folder another RUNNING onefile app is using must survive whole (v2026-11-23): rmtree with
     ignore_errors used to leave its loaded DLLs but delete its templates / static files, so the company
-    app and the personal edition running at once broke each other's viewer and mini window. Windows
-    refuses to rename a folder while a file inside is open or mapped - so a folder is first renamed to
-    <name>.nbdel (refused -> in use -> skipped) and only the renamed one is deleted. A .nbdel left by a
+    app and the personal edition running at once broke each other's viewer and mini window. So a folder is
+    left alone when its pythonXY.dll cannot be deleted (a running app has it loaded) or when it cannot be
+    renamed to <name>.nbdel (a file inside is open); only the renamed one is deleted. A .nbdel left by a
     sweep that died half-way is removed too. `force` (tests) skips the frozen / once-only checks."""
     global _sweep_stale_mei_done
     removed = []
@@ -214,6 +214,24 @@ def _sweep_stale_mei(temp_dir=None, our_mei=None, now=None, force=False):
                 continue
             _gone = _path
             if not _half_done:
+                # In use? Every running onefile app has its pythonXY.dll loaded from its own folder, and
+                # Windows refuses to delete a loaded DLL. A rename alone does not tell: a loaded DLL with no
+                # open file handle does not stop it (reviewed 2026-11-24 - it only worked because pywebview
+                # keeps .NET files open). Only the versioned DLL is tried: python3.dll may be unloaded in a
+                # live app that needs it later. Deleting it from a dead folder costs nothing - it goes anyway.
+                _in_use = False
+                try:
+                    for _dll in os.listdir(_path):
+                        if _re.match(r"^python3\d+\.dll$", _dll, _re.I):
+                            try:
+                                os.remove(os.path.join(_path, _dll))
+                            except OSError:
+                                _in_use = True
+                            break
+                except OSError:
+                    _in_use = True
+                if _in_use:
+                    continue
                 _gone = _path + ".nbdel"
                 try:
                     os.rename(_path, _gone)
@@ -285,6 +303,9 @@ def is_port_in_use(port):
 # --- Single-instance guard via a named Win32 mutex.
 # If another NanoBanana is already running, focus its window and exit silently.
 _instance_mutex_handle = None
+
+_VIEWER_SEQ = [0]
+
 
 def _window_url(path):
     """Every window this launcher makes opens app.window_url(path): in the personal edition it carries the
@@ -616,20 +637,28 @@ class JsApi:
         try:
             import urllib.parse
             encoded = urllib.parse.quote(filepath, safe="")
-            viewer_url = _window_url(f"/viewer?path={encoded}")
+            viewer_path = f"/viewer?path={encoded}"
             # Pin the viewer to the project that opened it. Without this it
             # reads whichever tab is active, so switching tabs in the main
             # window would swap the viewer's image list mid-review.
             try:
                 from app import shared as _shared
                 if _shared.active_pid:
-                    viewer_url += "&pid=" + urllib.parse.quote(_shared.active_pid, safe="")
+                    viewer_path += "&pid=" + urllib.parse.quote(_shared.active_pid, safe="")
             except Exception:
                 pass
             title = os.path.basename(filepath) or "Image Viewer"
             if cmp:
-                viewer_url += "&cmp=" + urllib.parse.quote(cmp, safe="")
+                viewer_path += "&cmp=" + urllib.parse.quote(cmp, safe="")
                 title = f"{title} vs {os.path.basename(cmp)}"
+            if _ed.PERSONAL:
+                # The personal address ends in the token fragment (#nbt=), which nb_token.js takes off: the
+                # same picture again would differ only in the fragment and WebView2 would not reload. A
+                # one-off value makes every open a real load (the company address has no fragment).
+                _VIEWER_SEQ[0] += 1
+                viewer_path += "&_r=%d" % _VIEWER_SEQ[0]
+            # The whole query first, the fragment last: anything after #nbt= never reaches the page's query.
+            viewer_url = _window_url(viewer_path)
             for w in list(webview.windows):
                 if w is _window:
                     continue

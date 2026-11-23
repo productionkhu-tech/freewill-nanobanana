@@ -2091,6 +2091,26 @@ footer {
   pointer-events: none;
 }
 .gw-banner.warn { background: #2a1f1f; border-color: #c97a6a; }
+/* 개인판 띠는 [키 넣기] 를 눌러야 하므로 클릭을 받는다 (회사 띠는 읽기만). */
+.gw-banner.personal { pointer-events: auto; z-index: 110; }   /* under the dialogs (.close-modal 120) */
+.gw-banner .gw-btn { margin-top: 8px; }
+/* 개인판 내 키 창 */
+.mykeys-dialog { width: 520px; max-width: calc(100vw - 32px); }
+.mykey-row { border-top: 1px solid var(--border, #333); padding: 12px 0 10px; }
+.mykey-row:first-child { border-top: none; }
+.mykey-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.mykey-name { font-weight: 600; }
+.mykey-what { color: var(--text-dim, #999); font-size: 12px; }
+.mykey-line { display: flex; gap: 8px; align-items: center; }
+.mykey-line input { flex: 1; height: 30px; min-width: 0; background: var(--input-bg); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text); font-size: 12px; font-family: inherit; padding: 0 10px; }
+.mykey-line input:focus { border-color: var(--accent); outline: none; }
+.mykey-state { font-size: 12px; margin-top: 6px; color: var(--text-dim, #999); min-height: 16px; }
+.mykey-state.ok { color: #7fbf7f; }
+.mykey-state.bad { color: #d98a7a; }
+.mykey-note { font-size: 12px; color: var(--text-dim, #999); margin-top: 4px; }
+.mykey-note a { color: var(--accent); }
+.mykeys-foot { margin-top: 10px; }
 .gw-banner .gw-title { font-size: 13px; font-weight: 600; }
 .gw-banner .gw-code {
   margin: 6px 0 2px;

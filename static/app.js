@@ -39,6 +39,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     // only at 3s and 8s: a later restore left the starter on screen for good,
     // and an earlier refresh moved the tab highlight without the content.)
     _shownPid = activePid;
+    applyEditionUI();
     // 탭 라벨을 프로젝트 '이름' 으로 보여주려면 목록이 먼저 있어야 한다.
     loadBillingCatalog(false).then(() => refreshProjects());
     await loadModelPrefs();      // 드롭다운을 채우기 전에 숨김/기본화질부터
@@ -60,6 +61,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   // it left a spare empty tab behind. The picker still exists behind Load.
   initAlwaysOnTopButton();
   initMiniToggle();
+  if (PERSONAL) refreshMyKeys();
   wireProjectNameInputs();
   try {
     const d = await api("/api/delete-confirm-state");
@@ -322,6 +324,10 @@ function setupClipboardPaste() {
   });
 }
 
+// Which app this is - the server writes it into the page (v2026-11-23). The personal edition has
+// "내 키" instead of teams/projects, no key-server banner, no Vertex.
+const PERSONAL = (document.querySelector('meta[name="nb-edition"]')?.content || "") === "personal";
+
 // ==========================================
 // API Helper
 // ==========================================
@@ -531,8 +537,10 @@ function showTabMenu(x, y, p) {
   mk("이름 변경 (F2)", () => renameProjectPrompt(p.pid, p.name));
   // 이 탭으로 옮겨 가지 않고 이 탭의 팀·프로젝트를 고른다 — 에이전트가 "골라 주세요"
   // 하고 멈춘 탭도 화면을 바꾸지 않고 풀 수 있다.
-  mk(p.billing_confirmed === false ? "팀·프로젝트 고르기… (생성 막힘)" : "팀·프로젝트…",
-     () => openBillingModal(p.pid));
+  if (!PERSONAL) {
+    mk(p.billing_confirmed === false ? "팀·프로젝트 고르기… (생성 막힘)" : "팀·프로젝트…",
+       () => openBillingModal(p.pid));
+  }
   // The Stop button only reaches the visible tab; without this a background
   // batch could only be stopped by switching to it first.
   if (p.generating) {
@@ -845,6 +853,7 @@ let _billAfterNotes = false;
 let _closingPid = null;
 
 async function promptBillingIfNeeded() {
+  if (PERSONAL) return;              // no teams or projects in the personal edition
   try {
     // Already asking: a second open reset the choice the person was making.
     const bm = document.getElementById("billingModal");
@@ -1450,6 +1459,8 @@ function rebuildModelSelect(keepModel) {
       const opt = document.createElement("option");
       opt.value = m;
       opt.textContent = modelLabel(m) + (hidden.has(m) ? " (숨김)" : "");
+      const lock = PERSONAL ? _modelLock(m) : "";
+      if (lock) { opt.disabled = true; opt.textContent += " — " + lock; }
       if (isSotaModel(m)) opt.className = "model-sota";
       parent.appendChild(opt);
     });
@@ -4272,6 +4283,7 @@ function _billTeamName(id) {
 // 사이드바 맨 위의 "이 탭은 어디로 달리는지" 표시. 고르기 전에는 강조색으로
 // 남아 생성이 막혀 있다는 사실을 알린다.
 async function refreshBillingBar() {
+  if (PERSONAL) return;
   const bar = document.getElementById("billingBar");
   const txt = document.getElementById("billingBarText");
   if (!bar || !txt) return;
@@ -4293,6 +4305,7 @@ async function refreshBillingBar() {
 }
 
 async function loadBillingCatalog(force) {
+  if (PERSONAL) return "";
   const d = await api("/api/billing/catalog" + (force ? "?refresh=1" : ""));
   if (d && d.ok) {
     _billCatalog = { teams: d.teams || [], projects: d.projects || [], aliases: d.aliases || {} };
@@ -4363,6 +4376,7 @@ let _billTargetPid = null;
 const _BILL_DESC = "탭마다 따로 정할 수 있고, 정하기 전에는 생성이 되지 않습니다.";
 
 async function openBillingModal(pid) {
+  if (PERSONAL) { openMyKeys(); return; }
   _billTargetPid = (pid && pid !== activePid) ? pid : null;
   const target = _billTargetPid;
   const q = target ? "?pid=" + encodeURIComponent(target) : "";
@@ -4645,6 +4659,12 @@ async function pollEvents() {
     // A tab was made without switching to it (an agent, at the person's
     // request) — only the strip needs to know.
     if (ev.type === "projects_changed") { anyOther = true; continue; }
+    // Personal edition: a saved key turned out to be a company key and was removed at start.
+    if (ev.type === "personal_keys") {
+      if (ev.removed_company) showToast("회사 키라서 지웠어요 — 개인 키를 넣어 주세요", "error");
+      refreshMyKeys();
+      continue;
+    }
     // A row or a notice was clicked in the mini window: go to that tab the way a
     // click on the tab strip does (this tab's unsaved inputs first). The server
     // must not switch behind the page's back — the page would show A while its
@@ -4857,6 +4877,7 @@ async function refreshApiStatus() {
 // 클릭을 가로채지 않는다(pointer-events: none) — 읽어 주기만 하면 되는 안내다.
 let _gwPrevState = "";
 function renderGwBanner(gw) {
+  if (PERSONAL) return renderPersonalBanner(gw || {});
   gw = gw || {};
   const st = gw.state || "";
   let el = document.getElementById("gwBanner");
@@ -4898,6 +4919,208 @@ function renderGwBanner(gw) {
   } else {
     add("gw-title", gw.msg || "키 서버에 연결하지 못했어요");
   }
+}
+
+// ==========================================
+// Personal edition - my keys (v2026-11-23)
+// ==========================================
+// The keys are checked for free and kept encrypted on this PC by the server; the page only ever gets
+// "set / last four / state" back. Models of a company without a key are locked in the menu.
+const _MYKEY_ROWS = [
+  { p: "studio", name: "Google AI Studio", what: "Gemini 모델", url: "https://aistudio.google.com/apikey",
+    note: "이미지 모델은 Google 계정에 결제를 연결해야 써요" },
+  { p: "openai", name: "OpenAI", what: "GPT Image", url: "https://platform.openai.com/api-keys",
+    note: "조직 인증이 필요해요", noteUrl: "https://platform.openai.com/settings/organization/general" },
+  { p: "ark", name: "BytePlus", what: "Seedream", url: "https://console.byteplus.com/ark/region:ark+ap-southeast-1/apiKey",
+    note: "모델마다 콘솔에서 활성화가 필요해요" },
+];
+const _MYKEY_PREFIX = { "gemini-": "studio", "gpt-image-": "openai", "seedream-": "ark" };
+const _MYKEY_ERR = {
+  bad_key: "키 모양이 아니에요 — 복사한 키를 그대로 붙여 넣어 주세요",
+  company_key: "회사 키는 개인판에 넣을 수 없어요",
+  invalid_key: "이 키는 받지 않았어요",
+  vault_failed: "이 PC 에 암호화해 저장하지 못했어요",
+  loading: "저장해 둔 키를 불러오는 중이에요 — 잠시 뒤 다시 눌러 주세요",
+};
+let _myKeys = null;             // {phase, keys: {provider: {set, tail, state, company, models_off}}}
+let _myKeyMsg = {};             // provider -> {text, cls} shown under the row until the next refresh
+
+function applyEditionUI() {
+  if (!PERSONAL) return;
+  const bar = document.getElementById("billingBar");
+  if (bar) bar.style.display = "none";
+  const btn = document.getElementById("myKeysBtn");
+  if (btn) btn.style.display = "";
+  const vx = document.getElementById("vertexDot");
+  if (vx) {
+    vx.style.display = "none";
+    const lab = vx.nextElementSibling;
+    if (lab && lab.classList.contains("status-label")) lab.style.display = "none";
+  }
+}
+
+function _modelLock(m) {
+  if (!_myKeys || !_myKeys.keys) return "";
+  const prov = Object.keys(_MYKEY_PREFIX).find(px => String(m || "").startsWith(px));
+  const k = prov ? _myKeys.keys[_MYKEY_PREFIX[prov]] : null;
+  if (!k) return "";
+  if (!k.set) return "키 필요";
+  if ((k.models_off || []).includes(m)) return "활성화 필요";
+  return "";
+}
+
+async function refreshMyKeys() {
+  if (!PERSONAL) return;
+  const d = await api("/api/personal/keys");
+  if (!d || !d.ok) return;
+  _myKeys = d;
+  const n = _MYKEY_ROWS.filter(r => d.keys[r.p] && d.keys[r.p].set).length;
+  const t = document.getElementById("myKeysText");
+  if (t) t.textContent = "🔑 내 키 " + n + "/3";
+  const btn = document.getElementById("myKeysBtn");
+  if (btn) btn.classList.toggle("needs", n === 0);
+  rebuildModelSelect();
+  renderPersonalBanner({ phase: d.phase });
+  if (!document.getElementById("myKeysModal").classList.contains("hidden")) _renderMyKeyRows();
+}
+
+function _myKeyStateText(k) {
+  if (!k || !k.set) return { text: "없음", cls: "" };
+  if (k.state === "rejected") return { text: "거절됨 …" + k.tail + " — 다시 넣어 주세요", cls: "bad" };
+  if (k.state === "unchecked") return { text: "확인 전 …" + k.tail + " — 인터넷이 되면 다음에 켤 때 확인해요", cls: "" };
+  let text = "✓ 확인됨 …" + k.tail;
+  if ((k.models_off || []).length) text += " · 콘솔에서 활성화 필요: " + k.models_off.map(m => (MODEL_LABELS[m] || m)).join(", ");
+  return { text, cls: "ok" };
+}
+
+function _renderMyKeyRows() {
+  const box = document.getElementById("myKeysRows");
+  if (!box) return;
+  box.textContent = "";
+  _MYKEY_ROWS.forEach(r => {
+    const k = (_myKeys && _myKeys.keys && _myKeys.keys[r.p]) || {};
+    const row = document.createElement("div");
+    row.className = "mykey-row";
+    const head = document.createElement("div");
+    head.className = "mykey-head";
+    head.innerHTML = '<span class="mykey-name"></span><span class="mykey-what"></span>';
+    head.children[0].textContent = r.name;
+    head.children[1].textContent = r.what;
+    const line = document.createElement("div");
+    line.className = "mykey-line";
+    const inp = document.createElement("input");
+    inp.type = "password";
+    inp.autocomplete = "off";
+    inp.spellcheck = false;
+    inp.placeholder = k.set ? "새 키로 바꾸려면 붙여 넣기" : "키 붙여 넣기";
+    inp.id = "mykey-" + r.p;
+    inp.addEventListener("keydown", e => { if (e.key === "Enter") saveMyKey(r.p); });
+    const save = document.createElement("button");
+    save.className = "btn-accent-sm";
+    save.textContent = "확인·저장";
+    save.onclick = () => saveMyKey(r.p);
+    line.append(inp, save);
+    if (k.set) {
+      const del = document.createElement("button");
+      del.className = "btn-sm";
+      del.textContent = "지우기";
+      del.onclick = () => deleteMyKey(r.p);
+      line.append(del);
+    }
+    const st = document.createElement("div");
+    const msg = _myKeyMsg[r.p] || _myKeyStateText(k);
+    st.className = "mykey-state " + (msg.cls || "");
+    st.textContent = msg.text;
+    const note = document.createElement("div");
+    note.className = "mykey-note";
+    const a = document.createElement("a");
+    a.href = r.url; a.target = "_blank"; a.rel = "noopener";
+    a.textContent = "키 만드는 곳 ↗";
+    note.append(a, document.createTextNode(" · "));
+    if (r.noteUrl) {
+      const b = document.createElement("a");
+      b.href = r.noteUrl; b.target = "_blank"; b.rel = "noopener";
+      b.textContent = r.note + " ↗";
+      note.append(b);
+    } else {
+      note.append(document.createTextNode(r.note));
+    }
+    row.append(head, line, st, note);
+    box.appendChild(row);
+  });
+}
+
+async function openMyKeys() {
+  if (!PERSONAL) return;
+  _myKeyMsg = {};
+  await refreshMyKeys();
+  _renderMyKeyRows();
+  document.getElementById("myKeysModal").classList.remove("hidden");
+}
+
+function closeMyKeys() {
+  document.getElementById("myKeysModal").classList.add("hidden");
+  _myKeyMsg = {};
+}
+
+async function saveMyKey(provider) {
+  const inp = document.getElementById("mykey-" + provider);
+  const key = (inp && inp.value) || "";
+  if (!key.trim()) return;
+  _myKeyMsg[provider] = { text: "확인하는 중…", cls: "" };
+  _renderMyKeyRows();
+  const d = await api("/api/personal/keys", { method: "POST", body: { provider, key } });
+  if (d && d.ok) {
+    _myKeyMsg[provider] = null;
+    delete _myKeyMsg[provider];
+    if (d.state === "unchecked") showToast("인터넷 문제로 아직 확인하지 못했어요 — 저장해 두고 다음에 켤 때 확인해요", "info");
+    else showToast("키를 저장했어요", "success");
+  } else {
+    const why = _MYKEY_ERR[(d && d.error) || ""] || ((d && d.error) || "저장하지 못했어요");
+    _myKeyMsg[provider] = { text: why + (d && d.reason ? " (" + d.reason + ")" : ""), cls: "bad" };
+  }
+  await refreshMyKeys();
+  _renderMyKeyRows();
+}
+
+async function deleteMyKey(provider) {
+  const d = await api("/api/personal/keys", { method: "DELETE", body: { provider } });
+  if (!d || !d.ok) showToast(_MYKEY_ERR[(d && d.error) || ""] || "지우지 못했어요", "error");
+  await refreshMyKeys();
+  _renderMyKeyRows();
+}
+
+let _personalBannerKey = "";
+function renderPersonalBanner(gw) {
+  const phase = gw.phase || (_myKeys && _myKeys.phase) || "";
+  if (_myKeys && phase && _myKeys.phase !== phase) {   // loading -> ready / unreadable: read the keys again
+    _myKeys.phase = phase;
+    refreshMyKeys();
+    return;
+  }
+  let el = document.getElementById("gwBanner");
+  const none = _myKeys && _myKeys.keys && !_MYKEY_ROWS.some(r => _myKeys.keys[r.p] && _myKeys.keys[r.p].set);
+  let title = "";
+  if (phase === "unreadable") title = "저장해 둔 키를 열지 못했어요 — 다시 넣어 주세요";
+  else if (phase === "ready" && none) title = "개인판이에요 — 내 키를 넣어야 생성돼요";
+  if (!title) { if (el) el.remove(); _personalBannerKey = ""; return; }
+  if (el && _personalBannerKey === title) return;
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "gwBanner";
+    document.body.appendChild(el);
+  }
+  _personalBannerKey = title;
+  el.className = "gw-banner personal" + (phase === "unreadable" ? " warn" : "");
+  el.textContent = "";
+  const t = document.createElement("div");
+  t.className = "gw-title";
+  t.textContent = title;
+  const b = document.createElement("button");
+  b.className = "btn-accent-sm gw-btn";
+  b.textContent = "키 넣기";
+  b.onclick = openMyKeys;
+  el.append(t, b);
 }
 
 // ==========================================

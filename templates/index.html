@@ -51,6 +51,12 @@
         <span id="billingBarText">선택 필요</span>
         <span class="bill-caret" aria-hidden="true"></span>
       </button>
+      <!-- 개인판(v2026-11-23): 팀·프로젝트 자리에 '내 키'. 회사판에선 숨어 있다. -->
+      <button id="myKeysBtn" class="bill-select" onclick="openMyKeys()" style="display:none"
+              title="내 키 — Google AI Studio · OpenAI · BytePlus">
+        <span id="myKeysText">내 키</span>
+        <span class="bill-caret" aria-hidden="true"></span>
+      </button>
 
       <!-- Model -->
       <div class="section-title model-title">
@@ -448,6 +454,19 @@
 
 <!-- MODEL PREFS (which models show + starting resolution; app-wide) -->
 <!-- 비용 귀속 선택. 탭마다 따로 달리고, 앱을 켤 때와 새 탭을 열 때 한 번씩 확인받는다. -->
+<!-- 개인판(v2026-11-23) 내 키 — 회사마다 넣기 · 무료 확인 · 이 PC 에 암호화 저장. 키는 다시 보여 주지 않는다(끝 네 글자만). -->
+<div id="myKeysModal" class="close-modal hidden">
+  <div class="close-dialog mykeys-dialog">
+    <h2>내 키</h2>
+    <p class="close-desc">있는 회사 키만 넣어도 돼요. 키가 없는 회사의 모델은 메뉴에서 잠겨요.</p>
+    <div id="myKeysRows"></div>
+    <p class="hint mykeys-foot">키는 이 PC · 이 윈도우 계정에서만 풀리게 암호화해 둬요.<br>생성 요금은 각 회사가 본인 계정에 청구해요.</p>
+    <div class="close-buttons">
+      <button class="btn-accent-sm" onclick="closeMyKeys()">닫기</button>
+    </div>
+  </div>
+</div>
+
 <div id="billingModal" class="close-modal hidden">
   <div class="close-dialog">
     <h2>어느 팀 · 프로젝트 작업인가요?</h2>

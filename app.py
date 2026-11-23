@@ -31,6 +31,7 @@ from google import genai
 from google.genai import types
 
 import nb_gateway as _nbgw
+import edition as _ed   # company app or personal edition - every per-edition name lives there
 
 try:
     from openai import OpenAI as _OpenAI
@@ -1015,10 +1016,10 @@ class _Shared:
         # Ref cache + default save dir are shared on purpose: the same pasted
         # image reused in two projects must resolve to the same cached file.
         self.temp_ref_dir = os.path.join(
-            os.path.expanduser("~/Pictures"), "Screenshots", "NanoBanana Clipboard")
+            os.path.expanduser("~/Pictures"), "Screenshots", _ed.CLIPBOARD_DIRNAME)
         self.temp_ref_paths = set()
         self.project_default_save_dir = os.path.join(
-            os.path.expanduser("~/Documents"), "NanoBanana JSON")
+            os.path.expanduser("~/Documents"), _ed.PROJECTS_DIRNAME)
 
         # --- Open projects (tabs) ---
         self.projects = {}        # pid -> AppState
@@ -1340,7 +1341,7 @@ class AppState:
         self.batches = {}
         self.batch_lock = threading.Lock()
         self.active_job_count = 0
-        self.output_dir = os.path.join(os.path.expanduser("~"), "Desktop", "NanoBanana_Output")
+        self.output_dir = os.path.join(os.path.expanduser("~"), "Desktop", _ed.OUTPUT_DIRNAME)
         self.file_counter = 0
         self.file_counter_lock = threading.Lock()   # parallel-worker safe naming
         # Protect the parallel lists ref_images/ref_path_list/ref_pinned
@@ -2709,7 +2710,7 @@ class AppState:
         # Scan both the current save dir and the legacy Desktop location
         search_dirs = [
             self.get_project_save_dir(),
-            os.path.join(os.path.expanduser("~/Desktop"), "NanoBanana_Output", "NanoBanana JSON"),
+            os.path.join(os.path.expanduser("~/Desktop"), _ed.OUTPUT_DIRNAME, _ed.PROJECTS_DIRNAME),
         ]
         candidates = []
         seen = set()
@@ -3814,7 +3815,7 @@ def _user_data_dir():
             return override
         except Exception:
             pass
-    d = os.path.join(os.path.expanduser("~"), ".nanobanana")
+    d = os.path.join(os.path.expanduser("~"), _ed.DATA_DIRNAME)
     try:
         os.makedirs(d, exist_ok=True)
     except Exception:
@@ -3831,7 +3832,7 @@ def _fetch_release_notes(version_tag):
     try:
         import urllib.request
         req = urllib.request.Request(
-            f"https://api.github.com/repos/productionkhu-tech/freewill-nanobanana/releases/tags/{version_tag}",
+            f"https://api.github.com/repos/{_ed.REPO}/releases/tags/{version_tag}",
             headers={
                 "User-Agent": "NanoBanana",
                 "Accept": "application/vnd.github+json",
@@ -3902,10 +3903,18 @@ def _no_cache_static(resp):
     return resp
 
 
+def _edition_marks(html):
+    """The page learns its edition and titles from the server only (spec section 4)."""
+    return (html.replace("__EDITION__", _ed.EDITION)
+                .replace("__MINI_TITLE__", _ed.MINI_TITLE)
+                .replace("__APP_TITLE__", _ed.APP_TITLE))
+
+
 def _render_html(template_name):
     html = render_template(template_name)
     html = html.replace("__VERSION__", _read_version() + "." + _BUILD_ID)
     html = html.replace("__CSRF_TOKEN__", CSRF_TOKEN)
+    html = _edition_marks(html)
     resp = Response(html)
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     return resp
@@ -4776,7 +4785,7 @@ def _is_path_allowed(fp):
         [lambda d=d: d for d in out_dirs] + [
         lambda: state.temp_ref_dir,
         lambda: state.get_project_save_dir(),
-        lambda: os.path.join(os.path.expanduser("~/Desktop"), "NanoBanana_Output", "NanoBanana JSON"),
+        lambda: os.path.join(os.path.expanduser("~/Desktop"), _ed.OUTPUT_DIRNAME, _ed.PROJECTS_DIRNAME),
     ]):
         try:
             d = os.path.realpath(getter())
@@ -7218,7 +7227,7 @@ def _find_nanobanana_hwnd():
                 user32.GetWindowTextW(hwnd, buf, length + 1)
                 # Not the mini window (v2026-11-1601): it is topmost, so it comes first
                 # and the pin would pin it instead of the app (review 2026-11-16).
-                if buf.value.startswith("NanoBanana") and buf.value != "NanoBanana mini":
+                if _ed.is_own_main_title(buf.value):
                     found[0] = hwnd
                     return False
             except Exception:
@@ -7614,7 +7623,7 @@ def api_mini():
 
 @app.route("/mini")
 def mini_page():
-    return render_template("mini.html", build_id=_BUILD_ID)
+    return _edition_marks(render_template("mini.html", build_id=_BUILD_ID))
 
 
 @app.route("/api/mini/visible", methods=["GET"])
@@ -8521,5 +8530,5 @@ atexit.register(cleanup)
 
 if __name__ == "__main__":
     threading.Thread(target=init_app, daemon=True).start()
-    print("NanoBanana Web starting on http://127.0.0.1:5656")
-    app.run(host="127.0.0.1", port=5656, debug=False, threaded=True)
+    print("NanoBanana Web starting on http://127.0.0.1:%d" % _ed.PORT)
+    app.run(host="127.0.0.1", port=_ed.PORT, debug=False, threaded=True)

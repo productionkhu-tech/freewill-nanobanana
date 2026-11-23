@@ -31,7 +31,10 @@ import tempfile
 import urllib.request
 import urllib.error
 
-REPO = "productionkhu-tech/freewill-nanobanana"
+import edition as _ed
+
+# Where this edition updates from (the personal EXE has its own public release repo).
+REPO = _ed.REPO
 BRANCH = "main"
 REMOTE_VERSION_URL = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}/VERSION"
 RELEASES_API = f"https://api.github.com/repos/{REPO}/releases"
@@ -62,7 +65,7 @@ AUTO_UPDATE_MAX_ATTEMPTS = 2
 
 
 def auto_update_state_file():
-    d = os.path.join(os.path.expanduser("~"), ".nanobanana")
+    d = os.path.join(os.path.expanduser("~"), _ed.DATA_DIRNAME)
     try:
         os.makedirs(d, exist_ok=True)
     except Exception:
@@ -220,6 +223,18 @@ def check_for_update():
     return has_update, current, remote
 
 
+def asset_names():
+    """This edition's release assets: (exe, sha256 sidecar)."""
+    return _ed.EXE_STEM + ".exe", _ed.EXE_STEM + ".exe.sha256"
+
+
+def temp_names(exe_dir):
+    """Where the swap puts the downloaded EXE and the replaced one (next to the running EXE).
+    Company: NanoBanana.new.exe / NanoBanana.exe.old, exactly as before."""
+    return (os.path.join(exe_dir, _ed.EXE_STEM + ".new.exe"),
+            os.path.join(exe_dir, _ed.EXE_STEM + ".exe.old"))
+
+
 def _find_release_assets(version_tag):
     """Return (exe_url, expected_sha256) for the release at `version_tag`.
     If the release body contains a line like "sha256: <hex>" or there's a
@@ -228,6 +243,7 @@ def _find_release_assets(version_tag):
     exe_url = ""
     sha_url = ""
     inline_sha = ""
+    exe_name, sha_name = asset_names()
     try:
         req = urllib.request.Request(
             f"{RELEASES_API}/tags/{version_tag}",
@@ -240,9 +256,9 @@ def _find_release_assets(version_tag):
             data = json.loads(resp.read().decode("utf-8"))
         for asset in data.get("assets", []):
             name = asset.get("name", "").lower()
-            if name == "nanobanana.exe":
+            if name == exe_name.lower():
                 exe_url = asset.get("browser_download_url", "")
-            elif name == "nanobanana.exe.sha256":
+            elif name == sha_name.lower():
                 sha_url = asset.get("browser_download_url", "")
         # Inline sha256 in release body (preferred, no second asset needed)
         body = (data.get("body") or "")
@@ -255,9 +271,9 @@ def _find_release_assets(version_tag):
         # and the URL is fully determined by the tag — construct it.
         print(f"  release API lookup failed ({e}); using constructed asset URLs")
     if not exe_url:
-        exe_url = f"https://github.com/{REPO}/releases/download/{version_tag}/NanoBanana.exe"
+        exe_url = f"https://github.com/{REPO}/releases/download/{version_tag}/{exe_name}"
     if not sha_url and not inline_sha:
-        sha_url = f"https://github.com/{REPO}/releases/download/{version_tag}/NanoBanana.exe.sha256"
+        sha_url = f"https://github.com/{REPO}/releases/download/{version_tag}/{sha_name}"
     # Fetch sidecar sha256 file if present
     remote_sha = ""
     if sha_url:
@@ -384,9 +400,9 @@ def apply_update_and_relaunch(version_tag, on_progress=None):
 
     url, expected_sha = _find_release_assets(version_tag)
     if not url:
-        raise RuntimeError(f"No NanoBanana.exe asset found for {version_tag}")
+        raise RuntimeError(f"No {asset_names()[0]} asset found for {version_tag}")
 
-    new_exe_path = os.path.join(exe_dir, "NanoBanana.new.exe")
+    new_exe_path = temp_names(exe_dir)[0]
     print(f"  Downloading {version_tag} EXE...")
     _download_with_retry(url, new_exe_path, on_progress=on_progress)
     size = os.path.getsize(new_exe_path)

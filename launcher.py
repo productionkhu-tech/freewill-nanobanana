@@ -112,7 +112,10 @@ if sys.platform == "win32":
             except Exception:
                 pass
 
-PORT = 5656
+import edition as _ed
+
+# Every per-edition name comes from edition.py (company app or personal edition).
+PORT = _ed.PORT
 APP_URL = f"http://127.0.0.1:{PORT}"
 
 if getattr(sys, 'frozen', False):
@@ -143,8 +146,8 @@ except Exception:
 try:
     if getattr(sys, "frozen", False) and sys.platform == "win32":
         _exe_dir = os.path.dirname(sys.executable)
-        for _name in ("NanoBanana.new.exe", "NanoBanana.exe.old"):
-            _orphan = os.path.join(_exe_dir, _name)
+        from updater import temp_names as _temp_names
+        for _orphan in _temp_names(_exe_dir):
             if os.path.isfile(_orphan):
                 try:
                     os.remove(_orphan)
@@ -334,7 +337,7 @@ def _focus_existing_nanobanana_window():
                 user32.GetWindowTextW(hwnd, buf, length + 1)
                 # Not the mini window: it is topmost, so it comes first in the
                 # enumeration and would be "focused" instead of the app.
-                if buf.value.startswith("NanoBanana") and buf.value != "NanoBanana mini":
+                if _ed.is_own_main_title(buf.value):
                     found_hwnd[0] = hwnd
                     return False  # stop enumeration
             except Exception:
@@ -465,7 +468,7 @@ def acquire_single_instance():
         kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
         kernel32.CreateMutexW.restype = wintypes.HANDLE
         _instance_mutex_handle = kernel32.CreateMutexW(
-            None, False, "NanoBanana-AIImageStudio-SingleInstance-v1"
+            None, False, _ed.MUTEX_NAME
         )
         err = ctypes.get_last_error()
         if err == ERROR_ALREADY_EXISTS:
@@ -746,7 +749,7 @@ def _run_as_updater(target_path):
     our_path = sys.executable
     log_path = os.path.join(
         os.environ.get("TEMP", os.path.expanduser("~")),
-        "nanobanana_update.log",
+        _ed.UPDATE_LOG,
     )
 
     def _log(msg):
@@ -838,7 +841,7 @@ def _run_as_updater(target_path):
             ctypes.windll.user32.MessageBoxW(
                 0,
                 f"업데이트 적용 실패:\n{e}\n\n기존 버전으로 실행합니다.",
-                "NanoBanana", 0x10,
+                _ed.APP_TITLE, 0x10,
             )
         except Exception: pass
         try:
@@ -907,7 +910,7 @@ def main():
                             "NanoBanana이 Program Files에 설치되어 있어요.\n\n"
                             "이 위치에서는 자동 업데이트가 작동하지 않습니다.\n"
                             "바탕화면 같은 일반 폴더로 EXE를 옮긴 뒤 다시 실행해주세요.",
-                            "NanoBanana", 0x30,
+                            _ed.APP_TITLE, 0x30,
                         )
                         break
                 except ValueError:
@@ -926,7 +929,7 @@ def main():
                 "Microsoft Edge WebView2 런타임이 필요합니다.\n\n"
                 "https://go.microsoft.com/fwlink/p/?LinkId=2124703 에서\n"
                 "다운로드해 설치한 뒤 앱을 다시 실행해주세요.",
-                "NanoBanana",
+                _ed.APP_TITLE,
                 MB_OK | MB_ICONWARN,
             )
         except Exception:
@@ -1027,13 +1030,13 @@ def main():
 
     print("  Waiting for server...")
     if not wait_for_server("127.0.0.1", PORT, timeout=15):
-        show_error_and_exit("NanoBanana", "서버가 시작되지 않았습니다.")
+        show_error_and_exit(_ed.APP_TITLE, "서버가 시작되지 않았습니다.")
     print("  Server ready!")
 
     print("  Opening window...")
     js_api = JsApi()
     window_kwargs = dict(
-        title="NanoBanana",
+        title=_ed.APP_TITLE,
         url=APP_URL,
         width=1500, height=920,
         min_size=(1000, 600),
@@ -1078,7 +1081,7 @@ def main():
             import ctypes
             # Set AppUserModelID so Windows groups windows under our icon
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "NanoBanana.AIImageStudio"
+                _ed.APP_USER_MODEL_ID
             )
             # Find and set icon on the window handle
             IMAGE_ICON = 1
@@ -1102,7 +1105,7 @@ def main():
             def apply():
                 try:
                     # Find our window by title
-                    hwnd = user32.FindWindowW(None, "NanoBanana")
+                    hwnd = user32.FindWindowW(None, _ed.APP_TITLE)
                     if hwnd:
                         if hicon_small:
                             user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)

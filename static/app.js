@@ -4969,8 +4969,10 @@ async function newProjectSaveAndContinue() {
 }
 
 // Keep the window title in sync with project state ("NanoBanana — name *")
+// The edition's window title ("NanoBanana" / "NanoBanana Personal"), as the server wrote it into <title>.
+const NB_APP_TITLE = document.title || "NanoBanana";
 function updateTitleDirty(dirty, projectName) {
-  let base = "NanoBanana";
+  let base = NB_APP_TITLE;
   if (projectName) base += ` — ${projectName}`;
   if (dirty) base += " *";
   document.title = base;

@@ -223,7 +223,9 @@ PLACE_LOCK = threading.Lock()
 # slot is our real height. Records are in "the screen's pixels / that monitor's scale" (Seedance since 11/16
 # 18:47); we also write `px` (screen pixels) and read others relative to the work area, so a monitor whose
 # origin differs between Electron and us still matches. 2 s heartbeat; a record older than 6 s is ignored.
-DOCK_NAME, DOCK_RANK, DOCK_GAP, DOCK_MARGIN, DOCK_STALE_MS = "nanobanana", 1, 6, 14, 6000
+import edition as _ed
+DOCK_NAME, DOCK_RANK = _ed.DOCK_NAME, _ed.DOCK_RANK       # nanobanana 1 / nanobanana-personal 1.5
+DOCK_GAP, DOCK_MARGIN, DOCK_STALE_MS = 6, 14, 6000
 DOCK_TOP = 14                    # window edges 14 from every side (user 11/16 "14 14 느낌"); cards land 22 in
 CLAIM_MS, TIE_MS = 250, 300      # claim, wait, then look; closer than TIE_MS -> rank decides
 SINCE = {"v": 0.0}               # ms this strip took its corner; 0 while hidden
@@ -1014,7 +1016,7 @@ def start(app_module, url, main_window=None, open_main=None, api=None):
         return None                          # the main window is already going: a strip now would keep the app alive
     # The app calls this after webview.start(), from a thread, once the main window is up (launcher, v2026-11-1901):
     # pywebview then makes the window right here, so its 'loaded' may come before the handler below is attached.
-    w = webview.create_window("NanoBanana mini", url, js_api=api or Api(), width=W, height=200,
+    w = webview.create_window(_ed.MINI_TITLE, url, js_api=api or Api(), width=W, height=200,
                               resizable=False, frameless=True, min_size=(120, 28), easy_drag=False,
                               on_top=True, hidden=True, background_color="#1C1C1E")
     mini = w

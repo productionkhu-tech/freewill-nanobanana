@@ -2,8 +2,10 @@
 """Task 5: the personal edition's keys inside the app (spec 5.2, 5.3, 5.4).
 
 Runs as an employee PC would look: company-looking keys in the environment, a company key vault and
-gateway token in ~/.nanobanana. The personal edition must use none of it, call nb_gateway only for the
-gateway address and its own vault, and send the gateway nothing but /personal/check.
+gateway token in ~/.nanobanana. The personal edition must use none of it and call nb_gateway only for its
+own DPAPI vault. It has nothing to do with the company (user 2026-11-23: own keys in, it works - nothing
+more, nothing less): it never asks the gateway anything, not even whether a key is a company key - a
+gateway that would call every key a company key is never asked and changes nothing.
 usage: python tests/personal/t_personal_app.py"""
 import hashlib
 import json
@@ -20,8 +22,8 @@ def sha(s):
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-COMPANY_KEY = "AIzaCompanyStudio1234"
-company_set = {sha(COMPANY_KEY)}
+# a gateway that would call every key here a company key - it must never be asked
+company_set = {sha(k) for k in ("sk-good1234", "AIzaMine12345678", "ark-k1234567")}
 
 
 def gw(req):
@@ -106,7 +108,7 @@ def restart():
     A._init_personal_keys(background=False)
 
 
-check("company zero: nb_gateway calls", set(gw_calls) <= {"gateway_url", "vault_get", "vault_put"}, sorted(set(gw_calls)))
+check("company zero: nb_gateway calls", set(gw_calls) <= {"vault_get", "vault_put"}, sorted(set(gw_calls)))
 check("company zero: no env keys used", applied and applied[-1] == {"studio": "", "openai": "", "ark": "", "vertex": None}, applied[-1:])
 check("company zero: no usage spool", not os.path.exists(os.path.join(P["data"], "usage_spool.jsonl")))
 check("company zero: company folder untouched", sorted(os.listdir(co)) == ["gateway.json", "gw_keys.vault", "gw_token.vault"])
@@ -117,29 +119,27 @@ check("save ok", r.get("ok") and r.get("state") == "ok" and applied[-1]["openai"
 check("client built", A.shared.client_openai is not None)
 r = post({"provider": "openai", "key": "sk-bad12345"})
 check("invalid not saved", r.get("error") == "invalid_key" and keys()["openai"]["tail"] == "1234", r)
-r = post({"provider": "studio", "key": COMPANY_KEY})
-check("company refused", r.get("error") == "company_key" and not keys()["studio"]["set"], r)
+r = post({"provider": "studio", "key": "AIzaMine12345678"})
+check("any working key is taken (no company check)", r.get("ok") and r.get("state") == "ok" and keys()["studio"]["set"], r)
 check("bad provider", post({"provider": "vertex", "key": "abcdefgh123"}).get("error") == "bad_provider")
 check("bad key", post({"provider": "openai", "key": "sk 1"}).get("error") == "bad_key")
-check("gateway saw prefixes only", all(set((x.body or {}).keys()) == {"p"} and len(x.body["p"]) == 8 for x in fake_gw.calls))
-check("gateway paths", {x.path for x in fake_gw.calls} == {"/personal/check"})
+check("gateway never asked", fake_gw.calls == [], [x.path for x in fake_gw.calls])
+check("no company field on the screen", all("company" not in v for v in keys().values()), keys()["studio"])
 
 # Review Focus 2 - a key put in while offline
 providers(False)
 r = post({"provider": "ark", "key": "ark-k1234567"})
 check("offline: saved, not checked yet", r.get("ok") and r.get("state") == "unchecked", r)
-check("offline: company unknown", keys()["ark"]["company"] == "unknown")
 providers(True)
 restart()
-check("next start: checked", keys()["ark"]["state"] == "ok" and keys()["ark"]["company"] == "clear", keys()["ark"])
+check("next start: checked", keys()["ark"]["state"] == "ok", keys()["ark"])
 check("next start: seedream 5.5 locked", keys()["ark"]["models_off"] == ["seedream-5-5-261028"])
 A.current_project().model = "seedream-5-5-261028"
 g = c.post("/api/generate", headers=H).get_json()
 check("locked seedream refused before sending", (g.get("error") or "").startswith("BytePlus 콘솔"), g)
-company_set.add(sha("ark-k1234567"))
 restart()
-check("company key found at start -> removed", not keys()["ark"]["set"] and applied[-1]["ark"] == "")
-company_set.discard(sha("ark-k1234567"))
+check("a start never removes a saved key", keys()["ark"]["set"] and applied[-1]["ark"] == "ark-k1234567")
+check("gateway still never asked", fake_gw.calls == [], [x.path for x in fake_gw.calls])
 
 # a provider turns the key down while generating
 check("auth error marks the key rejected, no gateway reload", A._keys_changed_since(A._keys_rt["ids"], "OpenAI") is False
@@ -166,7 +166,7 @@ check("hint auth", "다시 넣어" in A._personal_hint("Error code: 401 - Incorr
 check("hint passes others", A._personal_hint("500 internal") == "500 internal")
 blob = json.dumps(list(getattr(A.state, "logs", [])), default=str, ensure_ascii=False) + json.dumps(c.get("/api/logs?all=1", headers=H).get_json())
 check("no key text in logs", "sk-good1234" not in blob and "ark-k1234567" not in blob)
-check("company zero at the end", set(gw_calls) <= {"gateway_url", "vault_get", "vault_put"}, sorted(set(gw_calls)))
+check("company zero at the end", set(gw_calls) <= {"vault_get", "vault_put"} and fake_gw.calls == [], sorted(set(gw_calls)))
 
 from _h import run_py  # noqa: E402
 r = run_py("company", "import app as A\nc = A.app.test_client()\n"

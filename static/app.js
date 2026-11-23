@@ -4659,9 +4659,8 @@ async function pollEvents() {
     // A tab was made without switching to it (an agent, at the person's
     // request) — only the strip needs to know.
     if (ev.type === "projects_changed") { anyOther = true; continue; }
-    // Personal edition: a saved key turned out to be a company key and was removed at start.
+    // Personal edition: the saved keys changed behind the window (checked at start, turned down while generating).
     if (ev.type === "personal_keys") {
-      if (ev.removed_company) showToast("회사 키라서 지웠어요 — 개인 키를 넣어 주세요", "error");
       refreshMyKeys();
       continue;
     }
@@ -4937,12 +4936,11 @@ const _MYKEY_ROWS = [
 const _MYKEY_PREFIX = { "gemini-": "studio", "gpt-image-": "openai", "seedream-": "ark" };
 const _MYKEY_ERR = {
   bad_key: "키 모양이 아니에요 — 복사한 키를 그대로 붙여 넣어 주세요",
-  company_key: "회사 키는 개인판에 넣을 수 없어요",
   invalid_key: "이 키는 받지 않았어요",
   vault_failed: "이 PC 에 암호화해 저장하지 못했어요",
   loading: "저장해 둔 키를 불러오는 중이에요 — 잠시 뒤 다시 눌러 주세요",
 };
-let _myKeys = null;             // {phase, keys: {provider: {set, tail, state, company, models_off}}}
+let _myKeys = null;             // {phase, keys: {provider: {set, tail, state, models_off}}}
 let _myKeyMsg = {};             // provider -> {text, cls} shown under the row until the next refresh
 
 function applyEditionUI() {

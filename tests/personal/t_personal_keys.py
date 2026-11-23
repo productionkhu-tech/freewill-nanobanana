@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Task 4: personal_keys - tidy a pasted key, check it for free, store it with DPAPI, ask the gateway
-whether it is a company key with only 8 characters of its fingerprint (spec 5.3, 5.4).
+"""Task 4: personal_keys - tidy a pasted key, check it for free with its own provider, store it with DPAPI
+(spec 5.3, 5.4). No company-key check: the personal edition has nothing to do with the company (2026-11-23).
 usage: python tests/personal/t_personal_keys.py"""
 import hashlib
 import json
@@ -20,7 +20,6 @@ def sha(s):
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-KEY_A = "sk-company-AAAA1111"      # the gateway knows this one
 KEY_B = "sk-mine-BBBB2222"
 
 
@@ -41,14 +40,8 @@ def ark(req):
     return 400, {"error": {"code": "InvalidParameter", "message": "size"}}
 
 
-def gw(req):
-    p = (req.body or {}).get("p", "")
-    return 200, {"ok": True, "hashes": [h for h in (sha(KEY_A),) if h.startswith(p)]}
-
-
 fake = FakeHTTP({("GET", "/v1beta/models"): gemini, ("GET", "/v1/models"): openai,
                  ("POST", "/api/v3/images/generations"): ark})
-fake_gw = FakeHTTP({("POST", "/personal/check"): gw})
 os.environ["NANOBANANA_TEST_GEMINI_BASE"] = fake.base
 os.environ["NANOBANANA_TEST_OPENAI_BASE"] = fake.base
 
@@ -80,14 +73,10 @@ check("net", K.verify("openai", "sk-good1234")["result"] == "net")
 os.environ["NANOBANANA_TEST_OPENAI_BASE"] = fake.base
 check("reason never carries the key", "sk-bad12345" not in json.dumps(K.verify("openai", "sk-bad12345")))
 
-check("company yes", K.company_match(KEY_A, fake_gw.base) is True)
-check("company no", K.company_match(KEY_B, fake_gw.base) is False)
-check("company sends the prefix only", fake_gw.calls[-1].body == {"p": K.fingerprint_prefix(KEY_B)} and len(K.fingerprint_prefix(KEY_B)) == 8)
-check("company down -> None", K.company_match(KEY_B, "http://127.0.0.1:9") is None)
-check("no gateway -> None", K.company_match(KEY_B, "") is None)
+check("no company-key check left", not hasattr(K, "company_match") and not hasattr(K, "fingerprint_prefix"))
 
-REC = {"v": 1, "keys": {"openai": {"key": KEY_B, "state": "ok", "company": "clear", "checked_at": "x", "models_off": []},
-                        "ark": {"key": "k3-good123", "state": "unchecked", "company": "unknown", "checked_at": "", "models_off": ["seedream-5-5-261028"]}}}
+REC = {"v": 1, "keys": {"openai": {"key": KEY_B, "state": "ok", "checked_at": "x", "models_off": []},
+                        "ark": {"key": "k3-good123", "state": "unchecked", "checked_at": "", "models_off": ["seedream-5-5-261028"]}}}
 dd = tempfile.mkdtemp(prefix="nb_t_vault_")
 check("vault roundtrip", K.save(dd, REC) and K.load(dd) == ("ok", REC))
 vault = os.path.join(dd, K.VAULT_NAME + nb_gateway.VAULT_SUFFIX)

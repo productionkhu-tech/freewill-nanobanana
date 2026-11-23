@@ -28,8 +28,7 @@ def images(req):
 
 
 fake = FakeHTTP({("GET", "/v1/models"): lambda r: (200, {"data": []}),
-                 ("POST", "/v1/images/generations"): images,
-                 ("POST", "/personal/check"): lambda r: (200, {"ok": True, "hashes": []})})
+                 ("POST", "/v1/images/generations"): images})
 os.environ.update({"NANOBANANA_TEST_OPENAI_BASE": fake.base, "OPENAI_BASE_URL": fake.base + "/v1",
                    "NANOBANANA_GATEWAY_URL": fake.base})
 

@@ -18,13 +18,5 @@ for t in TESTS:
         bad.append(t)
         print("\n".join(l for l in r.stdout.splitlines() if l.startswith("FAIL"))[:2000])
         print(r.stderr[-1500:])
-mjs = os.path.join(HERE, "t_worker_check.mjs")
-if os.path.isfile(mjs):
-    r = subprocess.run(["node", mjs], capture_output=True, text=True, encoding="utf-8", errors="replace")
-    last = [l for l in r.stdout.splitlines() if l.startswith("checks ")]
-    print("%-22s %s" % ("t_worker_check.mjs", last[-1] if last else "NO RESULT (exit %d)" % r.returncode))
-    if r.returncode != 0:
-        bad.append("t_worker_check.mjs")
-        print(r.stdout[-1500:], r.stderr[-1500:])
 print("\nALL GREEN" if not bad else "\nFAILED: " + ", ".join(bad))
 sys.exit(1 if bad else 0)

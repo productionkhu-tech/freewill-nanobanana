@@ -8512,25 +8512,18 @@ def _init_personal_keys(background=True):
 
 
 def _personal_recheck():
-    """At every start: is any saved key a company key now (removed if so), and check the keys that were
-    saved without a check (no internet then). Only entries the person has not changed meanwhile are updated."""
+    """At every start: check the keys that were saved without a check (no internet then) with their own
+    provider. Nothing goes anywhere else. Only entries the person has not changed meanwhile are updated."""
     import copy
     with _personal_lock:
         snap = copy.deepcopy(_personal["rec"])
     if not snap.get("keys"):
         return
-    url = _nbgw.gateway_url(_user_data_dir())
-    updates, removed = {}, []
+    updates = {}
     for prov, k in snap["keys"].items():
         key = k.get("key") or ""
-        m = _pk.company_match(key, url)
-        if m is True:
-            updates[prov] = None
-            removed.append(prov)
-            continue
         new = dict(k)
-        if m is False:
-            new["company"] = "clear"
+        new.pop("company", None)             # written by the first builds of 2026-11-23, no longer used
         if new.get("state") == "unchecked":
             v = _pk.verify(prov, key, ark_models=_personal_ark_models() if prov == "ark" else None)
             if v["result"] == "ok":
@@ -8546,15 +8539,10 @@ def _personal_recheck():
         for prov, new in updates.items():
             if (rec["keys"].get(prov) or {}).get("key") != snap["keys"][prov].get("key"):
                 continue                     # changed by the person meanwhile
-            if new is None:
-                rec["keys"].pop(prov, None)
-            else:
-                rec["keys"][prov] = new
-    _personal_update(_merge)
-    for prov in removed:
-        state.log("personal keys: a company key was removed (%s)" % prov)
+            rec["keys"][prov] = new
+    if _personal_update(_merge):
         try:
-            current_project().push_event({"type": "personal_keys", "removed_company": prov, "pid": None})
+            current_project().push_event({"type": "personal_keys", "pid": None})
         except Exception:
             pass
 
@@ -8607,7 +8595,6 @@ def api_personal_keys():
     with _personal_lock:
         if _personal["phase"] == "loading":
             return jsonify({"ok": False, "error": "loading"})
-    dd = _user_data_dir()
     if request.method == "DELETE":
         if _personal_update(lambda rec: rec["keys"].pop(prov, None) and None, "ready") is False:
             return jsonify({"ok": False, "error": "vault_failed"})
@@ -8615,14 +8602,11 @@ def api_personal_keys():
     key, err = _pk.clean_key(d.get("key"))
     if err:
         return jsonify({"ok": False, "error": err})
-    m = _pk.company_match(key, _nbgw.gateway_url(dd))
-    if m is True:
-        return jsonify({"ok": False, "error": "company_key"})
     v = _pk.verify(prov, key, ark_models=_personal_ark_models() if prov == "ark" else None)
     if v["result"] == "invalid":
         return jsonify({"ok": False, "error": "invalid_key", "reason": v["reason"]})
     ok = v["result"] == "ok"
-    entry = {"key": key, "state": "ok" if ok else "unchecked", "company": "clear" if m is False else "unknown",
+    entry = {"key": key, "state": "ok" if ok else "unchecked",
              "checked_at": _pk.now_iso() if ok else "", "models_off": v["models_off"] if ok else []}
     if _personal_update(lambda rec: rec["keys"].__setitem__(prov, entry), "ready") is False:
         return jsonify({"ok": False, "error": "vault_failed"})

@@ -2,16 +2,13 @@
 """The personal edition's own keys (v2026-11-23 design, spec 5.3 / 5.4).
 
 People put in their own Google AI Studio / OpenAI / BytePlus keys inside the app. Each key is tidied,
-checked for free (nothing is generated), refused if it is a company key, and kept in a DPAPI vault that
-only this Windows account on this PC can open - never in plain text. The screen only ever gets the last
-four characters back.
+checked for free (nothing is generated), and kept in a DPAPI vault that only this Windows account on this
+PC can open - never in plain text. The screen only ever gets the last four characters back.
 
-Company-key check: the gateway gets the first 8 hex characters of the key's sha256 and answers with the
-full hashes of company keys that start with them; the comparison happens here. Neither the key nor its
-whole fingerprint leaves the PC.
+The personal edition has nothing to do with the company (user 2026-11-23): no gateway, no company-key
+check - a key goes only to its own provider.
 
 No Flask, no app import: app.py wires this in (edition.PERSONAL only)."""
-import hashlib
 import json
 import os
 import re
@@ -79,10 +76,6 @@ def clean_key(raw):
     if not (8 <= len(k) <= 400) or re.search(r"\s", k) or not all(33 <= ord(c) < 127 for c in k):
         return None, "bad_key"
     return k, None
-
-
-def fingerprint_prefix(key):
-    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
 
 
 # ------------------------------------------------------------------ talking to the outside
@@ -157,21 +150,6 @@ def verify(provider, key, ark_models=None, ark_base=None):
     return out
 
 
-def company_match(key, gateway_url):
-    """True = a company key, False = not, None = could not ask."""
-    if not gateway_url:
-        return None
-    try:
-        st, obj = _http("POST", gateway_url.rstrip("/") + "/personal/check", body={"p": fingerprint_prefix(key)},
-                        timeout=8)
-    except Exception:
-        return None
-    if st != 200 or not isinstance(obj, dict) or not obj.get("ok"):
-        return None
-    full = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    return full in [str(h).lower() for h in (obj.get("hashes") or [])]
-
-
 # ------------------------------------------------------------------ what the screen and the clients get
 def public_status(rec):
     keys = (rec or {}).get("keys") or {}
@@ -179,7 +157,7 @@ def public_status(rec):
     for p in PROVIDERS:
         k = keys.get(p) or {}
         out[p] = {"set": bool(k.get("key")), "tail": (k.get("key") or "")[-4:], "state": k.get("state") or "",
-                  "company": k.get("company") or "", "models_off": list(k.get("models_off") or [])}
+                  "models_off": list(k.get("models_off") or [])}
     return out
 
 

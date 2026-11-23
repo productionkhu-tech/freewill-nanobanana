@@ -32,8 +32,7 @@ def slow_gemini(req):
     return (200, {"models": []}) if req.headers.get("x-goog-api-key") == "AIzaMine12345678" else (400, {})
 
 
-fake = FakeHTTP({("GET", "/v1/models"): slow_openai, ("GET", "/v1beta/models"): slow_gemini,
-                 ("POST", "/personal/check"): lambda r: (200, {"ok": True, "hashes": []})})
+fake = FakeHTTP({("GET", "/v1/models"): slow_openai, ("GET", "/v1beta/models"): slow_gemini})
 os.environ.update({"NANOBANANA_TEST_OPENAI_BASE": fake.base, "NANOBANANA_TEST_GEMINI_BASE": fake.base,
                    "NANOBANANA_GATEWAY_URL": fake.base, "OPENAI_BASE_URL": fake.base + "/v1"})
 import app as A  # noqa: E402

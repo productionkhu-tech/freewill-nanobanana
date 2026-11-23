@@ -709,7 +709,9 @@ function _updateProjectTab(tab, p) {
   tab.classList.toggle("active", p.pid === activePid);
   const title = (p.path || p.name) + (p.dirty ? "  (저장 안 됨)" : "");
   // 라벨로 탭을 어지럽히는 대신 툴팁으로 알린다 — 사이드바에 크게 떠 있다.
-  const _bill = p.billing_project_id
+  // The personal edition has no teams or projects: its tabs never say anything about them.
+  const _bill = PERSONAL ? ""
+    : p.billing_project_id
     ? "\n" + _billTeamName(p.billing_team_id) + " · " + _billProjectName(p.billing_project_id)
     : "\n팀·프로젝트 미설정 — 이 탭은 생성이 막혀 있습니다";
   if (tab.title !== title + _bill) tab.title = title + _bill;

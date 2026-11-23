@@ -33,7 +33,7 @@ a = Analysis(
         # imported inside launcher.main() (v2026-11-1601) - named here so it is never left out
         'mini_window',
         # the edition switch (v2026-11-23) and the key server client - named so they are never left out
-        'edition', 'nb_gateway',
+        'edition', 'nb_gateway', 'personal_keys',
         'tkinter', 'tkinter.filedialog',
     ],
     hookspath=[],

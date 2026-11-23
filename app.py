@@ -2814,7 +2814,7 @@ class AppState:
         self.log(f"[{idx+1}/{total}] Queued on {label} (size {img_cfg.get('size')}, q={img_cfg.get('quality')})")
         if not self.client_openai:
             return {"status": "failed", "index": idx, "seed": seed,
-                    "error": "OpenAI client not configured", "elapsed": 0.0}
+                    "error": _no_client_error("OpenAI"), "elapsed": 0.0}
         size = img_cfg.get("size", "1024x1024")
         quality = img_cfg.get("quality", "high")
         max_retries = 5
@@ -2956,7 +2956,7 @@ class AppState:
         self.log(f"[{idx+1}/{total}] Queued on {label} ({model}, size {size})")
         if not self.client_seedream:
             return {"status": "failed", "index": idx, "seed": seed,
-                    "error": "Seedream not connected", "elapsed": 0.0}
+                    "error": _no_client_error("Seedream"), "elapsed": 0.0}
         # [Image N] -> "image N" so Seedream's positional referencing works.
         prompt_s = _seedream_prompt(prompt)
         # Method 2: convey the aspect ratio in the prompt so the model maps it to
@@ -3168,6 +3168,8 @@ class AppState:
         return _end({"status": "cancelled", "index": idx, "seed": seed})
 
     def _spool_usage_row(self, job, result, filepath, elapsed, api_used, model):
+        if _ed.PERSONAL:
+            return        # the personal edition keeps no usage for the company
         """이미지 한 장의 과금 근거를 로컬 spool 에 적는다.
 
         귀속은 job 스냅샷에서 읽는다 — 생성이 도는 동안 사용자가 탭의 팀/
@@ -3536,13 +3538,13 @@ class AppState:
                             self._spool_usage_row(job, result, None, result.get("elapsed", 0),
                                                   result.get("api_used") or "", model)
                         self.fail_count += 1
-                        self._batch_note(job.get("batch_id"), "failed", error=result.get("error", ""),
+                        self._batch_note(job.get("batch_id"), "failed", error=_personal_hint(result.get("error", "")),
                                          charge=_result_charge(result))
                         self.push_event({
                             "type": "image_failed",
                             "batch_id": job.get("batch_id", ""),
                             "index": idx,
-                            "error": result.get("error", ""),
+                            "error": _personal_hint(result.get("error", "")),
                             "done": self.done_count,
                             "failed": self.fail_count,
                             "total": self.queue_count,
@@ -4104,8 +4106,9 @@ def api_status():
         "any_generating": any_project_generating(),
         "openai_detail": state.openai_detail,
         # 키 서버 상태: 승인 대기면 화면 위에 번호를 띄운다.
-        "gw": {"state": shared.gw_state, "code": shared.gw_code, "msg": shared.gw_msg,
-               "source": _keys_rt["source"]},
+        "gw": ({"state": "personal", "phase": _personal["phase"]} if _ed.PERSONAL else
+               {"state": shared.gw_state, "code": shared.gw_code, "msg": shared.gw_msg,
+                "source": _keys_rt["source"]}),
         "done": state.done_count,
         "failed": state.fail_count,
         "total": state.queue_count,
@@ -5456,6 +5459,14 @@ def start_generate():
 
 def _client_gate(model):
     """None when a client for `model` is up, else the JSON refusal."""
+    if _ed.PERSONAL:
+        with _personal_lock:
+            phase = _personal["phase"]
+            off = ((_personal["rec"].get("keys") or {}).get("ark") or {}).get("models_off") or []
+        if phase == "loading":
+            return jsonify({"ok": False, "error": "키를 불러오는 중이에요 — 잠시 뒤 다시 눌러 주세요"})
+        if model in SEEDREAM_MODEL_IDS and model in off:
+            return jsonify({"ok": False, "error": "BytePlus 콘솔에서 이 모델을 활성화해 주세요 (%s)" % model})
     if model in OPENAI_MODEL_IDS:
         if not shared.client_openai:
             return jsonify({"ok": False, "error": _no_client_error("OpenAI")})
@@ -8359,8 +8370,183 @@ def _after_failed_fetch(kind):
         threading.Thread(target=_retry_keys_until_ok, daemon=True).start()
 
 
+# ---------------------------------------------------------------- personal edition keys (v2026-11-23)
+# The personal edition never asks the key server for keys: people put in their own (personal_keys.py,
+# DPAPI vault). Nothing here runs in the company app. Spec docs/superpowers/specs/2026-11-23-...
+import personal_keys as _pk
+
+PERSONAL_RETRY_S = 0.5          # vault not openable yet (right after logon): try again this often, 60 times
+_personal_lock = threading.Lock()
+_personal = {"phase": "loading", "rec": _pk.empty()}
+_PERSONAL_PROVIDER = {"openai": "openai", "seedream": "ark", "gemini": "studio", "studio": "studio"}
+_PERSONAL_NAME = {"Seedream": "BytePlus", "Gemini": "Google AI Studio"}
+
+
+def _personal_ark_models():
+    """Seedream models as {app id: the id BytePlus is sent} - the free check tries each one."""
+    return {m: _seedream_endpoint(m) for m in SEEDREAM_MODEL_IDS}
+
+
+def _personal_publish(rec, phase=None):
+    """Make `rec` the keys in use: remember it, rebuild the clients."""
+    with _personal_lock:
+        _personal["rec"] = rec
+        if phase:
+            _personal["phase"] = phase
+    _apply_keys(_pk.client_keys(rec), "personal")
+
+
+def _init_personal_keys(background=True):
+    """Startup (personal edition). A vault that is there but cannot be opened is retried before it is
+    called unreadable - saving over it on a "no keys" guess would throw the keys away."""
+    with _personal_lock:
+        _personal["phase"] = "loading"
+    dd = _user_data_dir()
+    kind, rec = "unreadable", None
+    for _ in range(60):
+        kind, rec = _pk.load(dd)
+        if kind != "unreadable":
+            break
+        time.sleep(PERSONAL_RETRY_S)
+    if kind == "unreadable":
+        state.log("personal keys: the saved keys could not be opened on this account")
+    _personal_publish(rec if kind == "ok" else _pk.empty(), "unreadable" if kind == "unreadable" else "ready")
+    _set_gw("personal")
+    if background:
+        threading.Thread(target=_personal_recheck, daemon=True).start()
+    else:
+        _personal_recheck()
+
+
+def _personal_recheck():
+    """At every start: is any saved key a company key now (removed if so), and check the keys that were
+    saved without a check (no internet then). Only entries the person has not changed meanwhile are updated."""
+    import copy
+    with _personal_lock:
+        snap = copy.deepcopy(_personal["rec"])
+    if not snap.get("keys"):
+        return
+    url = _nbgw.gateway_url(_user_data_dir())
+    updates, removed = {}, []
+    for prov, k in snap["keys"].items():
+        key = k.get("key") or ""
+        m = _pk.company_match(key, url)
+        if m is True:
+            updates[prov] = None
+            removed.append(prov)
+            continue
+        new = dict(k)
+        if m is False:
+            new["company"] = "clear"
+        if new.get("state") == "unchecked":
+            v = _pk.verify(prov, key, ark_models=_personal_ark_models() if prov == "ark" else None)
+            if v["result"] == "ok":
+                new.update(state="ok", models_off=v["models_off"], checked_at=_pk.now_iso())
+            elif v["result"] == "invalid":
+                new.update(state="rejected", checked_at=_pk.now_iso())
+        if new != k:
+            updates[prov] = new
+    if not updates:
+        return
+    with _personal_lock:
+        rec = copy.deepcopy(_personal["rec"])
+        for prov, new in updates.items():
+            if (rec["keys"].get(prov) or {}).get("key") != snap["keys"][prov].get("key"):
+                continue                     # changed by the person meanwhile
+            if new is None:
+                rec["keys"].pop(prov, None)
+            else:
+                rec["keys"][prov] = new
+    _pk.save(_user_data_dir(), rec)
+    _personal_publish(rec)
+    for prov in removed:
+        state.log("personal keys: a company key was removed (%s)" % prov)
+        try:
+            current_project().push_event({"type": "personal_keys", "removed_company": prov, "pid": None})
+        except Exception:
+            pass
+
+
+def _personal_mark_rejected(label):
+    """A provider turned the key down while generating: show it as rejected until it is put in again."""
+    import copy
+    prov = _PERSONAL_PROVIDER.get(str(label or "").lower())
+    if not prov:
+        return
+    with _personal_lock:
+        rec = copy.deepcopy(_personal["rec"])
+        k = rec["keys"].get(prov)
+        if not k or k.get("state") == "rejected":
+            return
+        k["state"] = "rejected"
+        _personal["rec"] = rec
+    _pk.save(_user_data_dir(), rec)
+
+
+def _personal_hint(err):
+    """The personal edition explains the provider refusals people hit with their own accounts."""
+    if not _ed.PERSONAL or not err:
+        return err
+    low = err.lower()
+    if "organization must be verified" in low:
+        return "OpenAI 조직 인증이 필요해요 — platform.openai.com 설정 > Organization 에서 인증해 주세요 (%s)" % err
+    if "limit: 0" in low and ("429" in low or "resource_exhausted" in low):
+        return "Google 계정에 결제를 연결해야 이 이미지 모델을 쓸 수 있어요 (%s)" % err
+    if _is_auth_error(err):
+        return "키가 거절됐어요 — 내 키에서 다시 넣어 주세요 (%s)" % err
+    return err
+
+
+@app.route("/api/personal/keys", methods=["GET", "POST", "DELETE"])
+def api_personal_keys():
+    """The personal edition's key window. Never returns a key - the last four characters only."""
+    import copy
+    if not _ed.PERSONAL:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    if request.method == "GET":
+        with _personal_lock:
+            return jsonify({"ok": True, "phase": _personal["phase"], "keys": _pk.public_status(_personal["rec"])})
+    d = request.get_json(silent=True, force=True) or {}
+    prov = d.get("provider") if isinstance(d, dict) else None
+    if prov not in _pk.PROVIDERS:
+        return jsonify({"ok": False, "error": "bad_provider"})
+    with _personal_lock:
+        if _personal["phase"] == "loading":
+            return jsonify({"ok": False, "error": "loading"})
+    dd = _user_data_dir()
+    if request.method == "DELETE":
+        with _personal_lock:
+            rec = copy.deepcopy(_personal["rec"])
+        rec["keys"].pop(prov, None)
+        if not _pk.save(dd, rec):
+            return jsonify({"ok": False, "error": "vault_failed"})
+        _personal_publish(rec, "ready")
+        return jsonify({"ok": True})
+    key, err = _pk.clean_key(d.get("key"))
+    if err:
+        return jsonify({"ok": False, "error": err})
+    m = _pk.company_match(key, _nbgw.gateway_url(dd))
+    if m is True:
+        return jsonify({"ok": False, "error": "company_key"})
+    v = _pk.verify(prov, key, ark_models=_personal_ark_models() if prov == "ark" else None)
+    if v["result"] == "invalid":
+        return jsonify({"ok": False, "error": "invalid_key", "reason": v["reason"]})
+    ok = v["result"] == "ok"
+    entry = {"key": key, "state": "ok" if ok else "unchecked", "company": "clear" if m is False else "unknown",
+             "checked_at": _pk.now_iso() if ok else "", "models_off": v["models_off"] if ok else []}
+    with _personal_lock:
+        rec = copy.deepcopy(_personal["rec"])
+    rec["keys"][prov] = entry
+    if not _pk.save(dd, rec):
+        return jsonify({"ok": False, "error": "vault_failed"})
+    _personal_publish(rec, "ready")
+    return jsonify({"ok": True, "state": entry["state"], "reason": v["reason"], "models_off": entry["models_off"]})
+
+
 def _init_keys():
     """Startup. Never blocks on the network when an encrypted copy exists."""
+    if _ed.PERSONAL:
+        return _init_personal_keys()
     os.environ.setdefault("NANOBANANA_APP_VERSION", _read_version())
     dd = _user_data_dir()
     cached = _nbgw.cached_keys(dd)
@@ -8419,6 +8605,9 @@ def _keys_changed_since(ids_before, provider):
     clients now hold different, usable keys. Workers that fail while a reload is
     in flight wait for it: after a rotation every image of a running batch picks
     up the new key, not just the first one to notice."""
+    if _ed.PERSONAL:                 # no key server: the person's own key was turned down
+        _personal_mark_rejected(provider)
+        return False
     if not _reload_lock.acquire(timeout=45):
         ids = _keys_rt["ids"]
         return ids is not None and ids != ids_before
@@ -8440,6 +8629,8 @@ def _keys_changed_since(ids_before, provider):
 
 def _no_client_error(what):
     """Why a provider is not available, in words the user can act on."""
+    if _ed.PERSONAL:
+        return "%s 키가 없어요 — 왼쪽 위 '내 키' 에서 넣어 주세요" % _PERSONAL_NAME.get(what, what)
     if shared.gw_state == "pending" and shared.gw_code:
         return "이 PC는 아직 관리자 승인 전입니다 — 관리자에게 번호 %s 를 알려 주세요" % shared.gw_code
     if shared.gw_state in ("revoked", "denied", "error") and shared.gw_msg:
@@ -8448,6 +8639,8 @@ def _no_client_error(what):
 
 
 def _start_usage_flusher():
+    if _ed.PERSONAL:
+        return            # the personal edition sends no usage anywhere
     """쌓인 사용량을 주기적으로 올린다.
 
     생성 경로와 완전히 분리된 데몬 스레드다. 네트워크가 죽어 있으면 spool 에

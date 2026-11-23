@@ -3,7 +3,7 @@
 멀티 프로바이더 AI 이미지 생성 데스크톱 앱 (Flask + pywebview + PyInstaller).
 이 문서 하나로 **구조 · 원리 · 규칙 · 배포 · 관리**를 파악할 수 있게 씁니다. 낡은 내용을 발견하면 즉시 고칠 것.
 
-> 최종 갱신: 2026-11-19 (v2026-11-1901 기준 — 미니창은 본창이 뜬 뒤 앱이 직접 만든다(pywebview 의 10초 제한 피함) §2.4·규칙 26·§7. 1801: 에이전트 프롬프트는 글자만 · PowerShell 객체로 부푼 프로젝트 파일을 열 때 정리 · 큰 파일은 목록에서 훑기만 §2.2·규칙 27·§7. 1702: 미니창에서 같은 일 여러 번 = 한 줄 ×N §2.4. 1701: 본창과 미니창 둘 중 하나만. 1601: 미니창(작업 상태를 화면 구석에, 시댄스 미니창과 자리 나누기) §2.4·규칙 26, DPI 모니터별 v2. 1301: 묶음 id 를 실행 내내 기억해 두 번 생성 막음 · 레퍼런스 읽는 사이 닫힌 탭엔 생성 안 함 §2.2·규칙 25. 1201: Gemini 512 를 문서 값 "512" 로 §6.1. 1001: 시드림 5.5·투명 배경 §6.1, 재시도 판단을 예외 우선으로 §7)
+> 최종 갱신: 2026-11-24 (개인판 — 같은 소스로 회사와 아무 관련 없는 `NanoBanana-Personal.exe` 를 따로 만들어 공개 저장소로 배포 §2.5·규칙 28~31·§4.6·§7, `_MEI` 청소가 쓰는 중인 폴더를 안 건드림. 1901 — 미니창은 본창이 뜬 뒤 앱이 직접 만든다(pywebview 의 10초 제한 피함) §2.4·규칙 26·§7. 1801: 에이전트 프롬프트는 글자만 · PowerShell 객체로 부푼 프로젝트 파일을 열 때 정리 · 큰 파일은 목록에서 훑기만 §2.2·규칙 27·§7. 1702: 미니창에서 같은 일 여러 번 = 한 줄 ×N §2.4. 1701: 본창과 미니창 둘 중 하나만. 1601: 미니창(작업 상태를 화면 구석에, 시댄스 미니창과 자리 나누기) §2.4·규칙 26, DPI 모니터별 v2. 1301: 묶음 id 를 실행 내내 기억해 두 번 생성 막음 · 레퍼런스 읽는 사이 닫힌 탭엔 생성 안 함 §2.2·규칙 25. 1201: Gemini 512 를 문서 값 "512" 로 §6.1. 1001: 시드림 5.5·투명 배경 §6.1, 재시도 판단을 예외 우선으로 §7)
 
 ---
 
@@ -22,6 +22,8 @@
   화면의 탭도, 그 탭의 입력칸도 안 바뀐다. 모르는 pid 는 404. §2.2
 - **미니창** (v2026-11-1601~, Windows): 돌고 있는 작업만 화면 구석에 띄우는 작은 창. 본창 📌 옆 버튼으로 켜고, 본창을 내렸을 때 새 작업이 오면 저절로 뜬다.
   시댄스 미니창과 같은 구석에 오면 겹치지 않게 쌓인다(`%APPDATA%\Freewill\mini-dock`). §2.4
+- **개인판** (2026-11-24~, Windows): 같은 소스로 만드는 두 번째 EXE `NanoBanana-Personal.exe`. **회사와 아무 관련 없다**(게이트웨이·팀·프로젝트·사용량·회사 키 확인 전부 없음) —
+  각자 자기 키를 앱의 '🔑 내 키' 에 넣어 쓴다. MCP·바깥 프로그램은 못 보낸다. 배포는 공개 저장소 `freewill-nanobanana-personal` 의 릴리스만. §2.5
 - **배포**: GitHub Release에 EXE 업로드 → 사용자는 **앱을 껐다 켜기만 하면 자동 설치** (클릭 불필요)
 - **버전**: `vYYYY-MM-DDNN` — **오늘 날짜 기준**, 같은 날 재릴리스는 NN 증가, 날짜 바뀌면 01부터
 - **맥**: EXE 없이 소스 실행 (`server_mac.py` + `keys.env`), git pull로 업데이트
@@ -37,10 +39,16 @@
 ├── mini_window.py          # 미니창(Windows): 창 자리·크기·시댄스와 쌓기·메뉴·저절로 뜨기 (v2026-11-1601~, §2.4)
 ├── updater.py              # 버전 체크 + 자산 다운로드/검증 + EXE 자기교체 + 자동설치 시도 예산
 ├── nb_gateway.py           # 게이트웨이 클라이언트: 출입증·키 받기, DPAPI 금고, 승인 요청, 평문 정리, 사용량 spool
+├── edition.py            # 회사판/개인판 판별 + 판마다 다른 이름(포트·제목·폴더·저장소…). 번들 안 EDITION 파일 하나가 정한다 (§2.5)
+├── personal_keys.py      # 개인판 '내 키': 다듬기·무료 확인·DPAPI 금고 (회사판에선 안 쓰임)
+├── edition_personal/     # 개인판에만 번들: EDITION ("personal") + app.ico (개인판 아이콘, 바나나)
+├── NanoBananaPersonal.spec  # 개인판 PyInstaller 설정 = NanoBanana.spec + edition_personal/
 ├── gateway/worker.js       # Cloudflare Worker (키 배포·승인·사용량 집계·관리자 페이지). wrangler deploy
 ├── VERSION                 # 현재 버전 (커밋 대상, EXE에 번들됨)
 ├── NanoBanana.spec         # PyInstaller onefile 설정
 ├── static/app.js           # 프론트 로직 전부 (~5100줄)   static/style.css
+├── static/nb_token.js      # 모든 페이지 맨 앞: 창 토큰 받기 (개인판은 주소 조각 #nbt= → 메모리+쿠키, §2.5)
+├── tests/personal/         # 개인판 시험: run_all.py (소스, 돈 0) · exe_personal.py · exe_both.py (빌드한 EXE)
 ├── templates/index.html    # 메인 UI
 ├── templates/viewer.html   # 프리뷰 창 (자체 완결 — 뷰어 로직 전부 이 파일)
 ├── templates/prompt_popup.html
@@ -71,6 +79,8 @@ C:\NanoBanana_build\
 ~/.nanobanana/mini_window.json           # 미니창 설정 (구석·핀·투명도·저절로 뜨기·마지막 모니터)
 ~/.nanobanana/mini_today.json            # 미니창 "오늘 N장 · 실패 M" (날짜가 바뀌면 0부터)
 %APPDATA%/Freewill/mini-dock/            # 미니창 자리 파일 — 시댄스와 같이 쓰는 폴더 (자기 파일만 쓴다, §2.4)
+~/.nanobanana-personal/                  # 개인판 데이터 (personal_keys.vault = 내 키 DPAPI 금고, 그 밖은 회사판과 같은 파일 이름)
+~/Documents/NanoBanana Personal JSON/ · ~/Desktop/NanoBanana Personal_Output/ · ~/Pictures/Screenshots/NanoBanana Personal Clipboard/   # 개인판 폴더
 ~/Documents/NanoBanana JSON/             # 프로젝트 세션 JSON
 ~/Pictures/Screenshots/NanoBanana Clipboard/  # 클립보드·업로드 ref 캐시 (SHA1 이름)
 ~/Desktop/NanoBanana_Output/             # 기본 출력 폴더
@@ -214,6 +224,38 @@ launcher  → 본창이 화면에 뜬 뒤(shown) 스레드에서 mini_window.sta
 - **DPI**: launcher 가 모니터별 v2 를 먼저 켠다(안 되면 예전 v1). 창 좌표 = 화면 실제 픽셀이라는 전제를 미니창의 자리 계산이 쓴다
 - 시험(격리, 돈 안 듦): `mini_harness.py`(데모 가짜 생성기·시험용 시댄스 + 진짜 app.py·mini_window.py) 위에서 크기·부하·두 모니터·모델별 4종 — 스크래치에 있다. 실제 시댄스 시험판과의 측정은 `qa_live.py`
 
+### 2.5 개인판 (설계 2026-11-23, 첫 릴리스 2026-11-24)
+설계서 `docs/superpowers/specs/2026-11-23-nanobanana-personal-design.md` · 계획 `docs/superpowers/plans/2026-11-23-nanobanana-personal.md`.
+사용자: **"개인판은 회사랑 아무 관련이 없고 그냥 자기 키 넣어두면 쓸 수 있다는 거임.. 그거 이하 이상 없어"** (11/23).
+```
+판 정하기   frozen 이면 sys._MEIPASS\EDITION 이 정확히 "personal" 일 때만 개인판 — 환경변수는 무시(회사 PC 에서 섞이지 않게).
+            소스 실행만 NANOBANANA_EDITION=personal (시험용). 분기는 edition.PERSONAL 하나
+이름표      회사 / 개인: 포트 5656 / 35657 · 잠금 이름 · 창 제목 NanoBanana / NanoBanana Personal (미니 "… mini") · 데이터 ~/.nanobanana / ~/.nanobanana-personal ·
+            프로젝트·출력·클립보드 폴더 · 미니 자리 nanobanana 1 / nanobanana-personal 1.5 · 저장소 · 교체 로그 · AppUserModelID — 전부 edition.py 상수
+회사 것 0   게이트웨이(키·승인·사용량·카탈로그·Vertex 토큰)·환경변수 키·~/.nanobanana 를 읽지도 부르지도 않는다. nb_gateway 는 DPAPI 도우미(vault_get/put)만.
+            회사 키 막기도 없다 — 키 지문 앞 8글자로 게이트웨이에 묻는 길을 만들어 배포까지 했다가 위 결정으로 같은 날 뺐다(워커도 되돌림)
+내 키       왼쪽 위 '🔑 내 키 N/3'. 붙여 넣은 키 다듬기(공백·따옴표·"Bearer ") → 자기 프로바이더로 무료 확인:
+            Gemini 모델 목록(키는 헤더로) · OpenAI 모델 목록(200·403=됨 — 이미지 전용으로 권한을 줄인 키는 목록이 403) ·
+            BytePlus 모델마다 size "1x1" 로 보내 400=씀 / 403·404=콘솔에서 활성화 필요 / 401=틀림
+            → DPAPI 금고 personal_keys.vault (못 쓰면 저장 안 함, 평문 대체 없음). 화면엔 끝 네 글자만. 인터넷이 없으면 '확인 전' 으로 저장 → 다음에 켤 때 확인.
+            저장·삭제·확인 결과 반영은 _personal_update 하나로 차례로(동시에 두 키를 저장하면 하나가 사라지던 것 11/23 재현·수정).
+            금고를 못 열면(로그인 직후) 뒤에서 다시 시도 — 켜기를 붙잡지 않는다. 생성 중 키가 거절되면 바로 '거절됨'
+키 없는 모델 메뉴에서 잠김(회색 + "키 필요"), 생성도 요청을 내보내기 전에 "OO 키가 없어요 — 왼쪽 위 '내 키' 에서 넣어 주세요"
+팀·프로젝트 없음: _billing_usable True · _billing_gate 통과 · /api/billing/* 404 · 탭 툴팁·탭 메뉴·Status 칸·새 탭 어디에도 안 나온다
+에이전트    /api/generate 에 pid·batch_id·check_only → not_in_personal(403). /api/projects features [] · agent_pid false
+창 토큰     HTML 에 없다. launcher 가 모든 창을 app.window_url(path) = 주소 + #nbt=<토큰> 으로 연다 → static/nb_token.js 가 조각 → 메모리 + 세션 쿠키 nbt
+            (SameSite=Strict) 로 옮기고 주소에서 지운다. 개인판 서버는 GET 포함 모든 /api/* 에 토큰(헤더·쿠키)을 요구 —
+            예외는 /api/version 과 /api/back-to-main(두 번째 실행이 본창을 부르는 길) 둘. 회사판은 예전 그대로(메타에 토큰, GET 열림)
+업데이트    productionkhu-tech/freewill-nanobanana-personal (README + 릴리스만, 소스 없음). 자산 NanoBanana-Personal.exe + .sha256.
+            받는 고정 링크 …/freewill-nanobanana-personal/releases/latest/download/NanoBanana-Personal.exe
+같이 켜기   포트·잠금·창·데이터 따로. 두 번째 실행은 edition.is_own_main_title 로 자기 본창만 찾는다. _MEI 청소는 규칙 31
+```
+- 시험: `tests/personal/run_all.py`(소스·격리·돈 0) · `exe_personal.py`(개인판 EXE 혼자, UI Automation 으로 본창·뷰어·미니창 글자 확인) ·
+  `exe_both.py`(두 EXE + 시험용 시댄스 미니창 기록, 5656 이 비어야 한다). EXE 시험은 진짜 앱이 떠 있으면 멈추고, 끌 땐 시험 폴더 경로로만
+- 포트 35657 인 이유: 이 개발 PC 는 윈도우 동적 포트 범위가 1024~15000 이라 Hyper-V/WSL 이 켤 때 100개씩 예약하는데 처음 고른 5657 이 그 안에 들었다(WinError 10013).
+  35657 은 기본 범위(49152~)에도 이 PC 범위에도 없다. 회사판 5656 도 같은 이유로 막힐 수 있다(§7)
+- 맥: 개인판 없음(윈도우만)
+
 ### 프론트 ↔ 서버
 - 상태는 `AppState` 싱글톤 하나에 전부 (설정·갤러리·ref 슬롯·큐·로그·이벤트)
 - 통신은 **폴링**: `/api/status` 500ms, `/api/events` 800ms, `/api/logs` 2s (pagehide에서 clearInterval)
@@ -344,6 +386,14 @@ gen_worker:
     미니창 제목("NanoBanana mini")은 두 번째 실행이 본창을 찾을 때 빼고 찾는다(항상 위라 먼저 잡힌다)
 27. **밖에서 온 글자 칸을 `str()` 로 글자로 만들지 말 것 — `_text_problem` 으로 글자인지 보고 아니면 거절.** 객체가 오면 `str()` 은 그 객체 전체(PowerShell 이면 형식 정보 수십만~수천만 자)를 만든다.
     그게 프롬프트로 모델에 가고(돈) 그림마다 세 번 저장돼 프로젝트 파일이 GB 가 된다(2026-11-18, §2.2·§7). 숫자 칸은 `_safe_int`, 고르는 칸은 `allowed` 목록처럼 칸마다 맞는 검사를 쓸 것
+28. **판마다 다른 건 `edition.py` 상수에만, 분기는 `edition.PERSONAL` 하나로 — 회사판 동작은 그대로.** 코드에 "NanoBanana"·5656·`.nanobanana` 를 새로 박지 말 것.
+    frozen 에서 판을 환경변수로 바꾸게 하지 말 것(회사 PC 에서 누가 켜면 회사 것과 섞인다)
+29. **개인판은 회사 것(게이트웨이 전부 · 환경변수 키 · `~/.nanobanana` · Vertex)을 읽지도 부르지도 않는다.** 사용자 결정 2026-11-23 "회사랑 아무 관련 없다" —
+    회사 키 막기도 이 이유로 뺐다. 다시 넣지 말 것. `t_personal_app.py` 가 게이트웨이 요청 0 · nb_gateway 호출은 vault_get/put 만인지 본다
+30. **개인판 창 토큰을 HTML·로그·주소(조각 말고)에 두지 말 것, 새 창은 `_window_url` 로만 열 것, 토큰 없는 길을 늘리지 말 것**(지금 `/api/version`·`/api/back-to-main` 둘).
+    토큰이 없으면 MCP·다른 프로그램·웹 페이지가 개인 키로 생성할 수 있다
+31. **`_MEI` 청소는 쓰는 중인 폴더를 건드리지 않는다** — 먼저 `<이름>.nbdel` 로 바꿔 보고(쓰는 중이면 윈도우가 거절) 바뀐 것만 지운다(`_sweep_stale_mei`).
+    예전처럼 `rmtree(ignore_errors=True)` 로 바로 지우면 잠긴 DLL 만 남고 templates/static 이 지워져, 같이 켠 다른 판(또는 다른 버전)의 뷰어·미니창이 빈 화면이 된다
 
 ---
 
@@ -395,6 +445,13 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 - 핸즈프리 확인: 구버전 EXE를 켜고 **아무 조작 없이** 새 버전이 되는지
 
 ---
+
+### 4.6 개인판 릴리스 (회사판과 같은 VERSION 으로 같이)
+- 빌드: `NanoBananaPersonal.spec` → `dist\NanoBanana-Personal.exe`. 회사 EXE 엔 `EDITION` 이 없어야 한다(`PyInstaller.archive.readers.CArchiveReader` 로 목록 확인)
+- 시험: `tests/personal/run_all.py` → `exe_personal.py` → (5656 이 비면) `exe_both.py`
+- 저장소 `productionkhu-tech/freewill-nanobanana-personal` 에 태그(그 저장소의 커밋, 소스 커밋 아님) → **draft** → `NanoBanana-Personal.exe` + `NanoBanana-Personal.exe.sha256` → 공개. 노트는 §4.4 그대로
+- E2E: 같은 소스를 옛 VERSION 으로 찍은 개인판 EXE 를 격리 홈에서 켜고 손대지 않고 새 버전이 되는지 + sha256. 고정 링크가 200 이고 sha256 같은지
+- 절차 전문은 배포 스킬
 
 ## 5. Git 관리
 
@@ -548,6 +605,7 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 |---|---|
 | **CLAUDE.md** (이 문서) | 구조·원리·규칙·배포·관리 — 상시 최신 유지 |
 | `.claude/skills/나노바나나api배포/SKILL.md` | 배포 실행 절차 + 스크립트 전문 |
+| `docs/superpowers/specs/2026-11-23-nanobanana-personal-design.md` · `plans/…` | 개인판 설계서·계획 (§2.5) |
 | `인수인계_2026-07-30_전체.md` | 현행 인수인계 (제품 현황·최근 이력·다음 할 일) |
 | `맥_실행_가이드.md` | 맥 고객 배포용 안내 |
 | `seedream *.md` / `API_레퍼런스_종횡비.md` | 외부 API 스펙 + 실측 주석 (`Reve API 문서.md`는 서비스 종료로 이력용) |
@@ -591,6 +649,8 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   같은 파일을 둘이 동시에 열면(켤 때 복원 + 목록에서 열기) 파일마다 잠금으로 한 번만 정리. 이런 글이 없는 큰 파일은 바이트 검색만 하고 아무것도 쓰지 않는다. `Write-Output -NoEnumerate` 꼴(`{'value': [..], 'Count': N}`)도 정리한다.
   남은 한계: 창의 고정 프롬프트 뒤에 붙은 경우(에이전트 그림을 Load setup 한 뒤 창에서 생성)처럼 글 일부만 그런 경우는 안 고친다(드묾, 그 칸의 prompt_sections 는 고쳐진다). 목록은 32MB 넘는 파일을 읽지 않고 훑는다(`_skim_project_file`: 앞 4MB 의 프롬프트·새 그림, 그림 수는 줄 세기, 크기·시각으로 기억). 정상 그림은 한 장 6~11KB(프롬프트 세 벌) — 8,414장이면 90MB 가 정상이다 |
 | `/api/batch` 가 `no_such_batch` | 안 들어갔거나 거절됨, 앱 재시작(집계는 메모리), 또는 그 탭의 최근 50개 밖 | 갤러리 `?batch_id=` 로 찾기. 앱이 그대로면 같은 호출자 id 로 다시 보내도 두 번 안 만든다(1301~ 그림이 지워졌거나 탭이 닫혀도 — `batch_id_run`. 그 전 앱은 50개 밖 + 그림 없음이면 새로 만들었다). 재시작 뒤 그림이 없으면 새로 만들고, 돌던 장은 값이 나갔을 수 있다 — 사람에게 물을 것 (§2.2) |
+| 회사판이 켜자마자 조용히 꺼짐 (창이 안 뜸, 2026-11-23 개발 PC) | 5656 이 윈도우 예약 포트 범위 안 — 동적 포트 범위가 1024~ 로 넓혀진 PC 에서 Hyper-V/WSL 이 켤 때 100개씩 예약한다(`netsh int ipv4 show excludedportrange protocol=tcp`). `is_port_in_use` 가 바인드 실패(10013)를 "이미 켜져 있음" 으로 읽고 끝낸다 | 관리자 PowerShell 에서 `net stop winnat` → `net start winnat`, 또는 재부팅. 앱에서는 아직 안 고침(포트를 바꾸면 커넥터가 따라와야 한다) |
+| 회사판과 개인판(또는 두 버전)을 같이 켜면 먼저 켠 쪽 뷰어·미니창이 빈 화면 (11/23 이전 빌드) | 나중에 켠 쪽의 시작 `_MEI` 청소가 남의 폴더를 rmtree — 잠긴 DLL 만 남고 templates/static 이 지워짐 | 2026-11-24 빌드부터 이름 바꾸기로 먼저 확인(규칙 31). 옛 회사판이 개인판 폴더를 지울 수 있으니 회사판도 같이 업데이트 |
 
 ---
 

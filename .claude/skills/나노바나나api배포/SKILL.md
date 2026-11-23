@@ -39,8 +39,10 @@ node --check static\app.js
 # ⚠ nb_gateway.py 도 반드시 — 2026-10-08 까지 이 목록에 없었다. 그 파일이 9/17 이후 안 바뀐 동안만
 #   우연히 맞았고, 바뀐 채로 빌드했다면 옛 모듈이 들어가 앱이 키를 못 받았을 것이다.
 # ⚠ mini_window.py · templates\mini.html (미니창, v2026-11-1601~) 도 반드시. spec 도 같이(hiddenimports 에 mini_window).
-Copy-Item ".\app.py",".\launcher.py",".\updater.py",".\nb_gateway.py",".\mini_window.py",".\VERSION",".\NanoBanana.spec" "C:\NanoBanana_build\src\" -Force
-Copy-Item ".\static\app.js",".\static\style.css" "C:\NanoBanana_build\src\static\" -Force
+Copy-Item ".\app.py",".\launcher.py",".\updater.py",".\nb_gateway.py",".\mini_window.py",".\edition.py",".\personal_keys.py",".\VERSION",".\app.ico",".\NanoBanana.spec",".\NanoBananaPersonal.spec" "C:\NanoBanana_build\src\" -Force
+Copy-Item ".\static\app.js",".\static\style.css",".\static\nb_token.js" "C:\NanoBanana_build\src\static\" -Force
+New-Item -ItemType Directory -Force "C:\NanoBanana_build\src\edition_personal" | Out-Null
+Copy-Item ".\edition_personal\EDITION",".\edition_personal\app.ico" "C:\NanoBanana_build\src\edition_personal\" -Force   # 개인판에만 번들 (§9)
 Copy-Item ".\templates\index.html",".\templates\viewer.html",".\templates\prompt_popup.html",".\templates\mini.html" "C:\NanoBanana_build\src\templates\" -Force
 # 클린 빌드 (캐시 재사용 금지 — Remove-Item은 훅 오해 방지를 위해 개별 명령으로)
 # ⚠ 사용자가 쓰는 앱(예: Desktop\앱 백업\nanobanana)이 떠 있으면 아래 줄은 건너뛴다 — 빌드는
@@ -252,3 +254,27 @@ Start-Process ".\dist\NanoBanana\NanoBanana.exe"
 | 스크래치 테스트가 사라짐 | Windows 저장 공간 센스가 임시 폴더를 정리한다(세션 scratchpad 포함). 오래 둘 테스트는 임시 폴더 밖에 둘 것 |
 | E2E 뒤 이 PC 환경변수 키가 사라짐 | 정상 — 0801+ 는 실제 데이터 폴더로 켜지면 이 PC 도 평문 정리를 한다. 그 뒤 옛 EXE 로 하는 E2E 는 `NANOBANANA_STUDIO_KEY=managed-by-gateway` 표시 덕에 부팅하므로 오히려 "정리된 PC 에서 옛 EXE 가 스스로 업데이트되나" 까지 같이 검증된다 |
 | 테스트 빌드를 사용자 PC 에서 미리 띄울 때 | `NANOBANANA_DATA_DIR`(+사용량 집계를 살리려면 `NANOBANANA_USAGE_UPLOAD=1`)로 띄우면 평문 정리가 안 돈다 — 배포 전에 사용자의 기존 앱(구버전)을 망가뜨리지 않는다. 새 PC 흉내는 키 환경변수를 지운 프로세스로 띄우면 승인 번호가 뜬다 |
+
+## 9. 개인판 (2026-11-24~, 같은 VERSION 으로 회사판과 같이)
+
+회사와 아무 관련 없는 두 번째 EXE (CLAUDE.md §2.5·§4.6·규칙 28~31). 소스는 이 저장소 하나, 배포만 따로.
+
+- **동기화**: §2 목록 그대로 (edition.py·personal_keys.py·nb_token.js·edition_personal\·NanoBananaPersonal.spec 포함). 스크래치에 둘 다 한 번에 하는
+  스크립트를 두면 편하다 — 문법 확인 → 동기화 → build/dist 삭제 → 두 spec 각각 클린 빌드 → 크기·sha256
+- **빌드**: `PyInstaller "C:\NanoBanana_build\src\NanoBananaPersonal.spec" --noconfirm --clean --distpath ...\dist --workpath ...\build` → `dist\NanoBanana-Personal.exe`.
+  확인: 회사 EXE 엔 `EDITION` 이 없고 개인판엔 있다
+  ```python
+  from PyInstaller.archive.readers import CArchiveReader
+  print("EDITION" in CArchiveReader(r"C:\NanoBanana_build\src\dist\NanoBanana.exe").toc)            # False 여야 함
+  print("EDITION" in CArchiveReader(r"C:\NanoBanana_build\src\dist\NanoBanana-Personal.exe").toc)   # True
+  ```
+- **시험**: `tests/personal/run_all.py` (ALL GREEN) → `tests/personal/exe_personal.py <exe> <VERSION>` → 5656 이 비어 있으면 `tests/personal/exe_both.py`.
+  EXE 시험은 진짜 앱이 떠 있으면 스스로 멈춘다(그때는 사용자에게 꺼 달라고)
+- **릴리스**: 저장소 `productionkhu-tech/freewill-nanobanana-personal` (README + 릴리스만). §4 와 똑같이 **draft → 자산 2종 → 공개**, 자산 이름만 다르다:
+  `NanoBanana-Personal.exe` + `NanoBanana-Personal.exe.sha256` (내용 `<hex>  NanoBanana-Personal.exe`). 태그는 그 저장소의 `main` 커밋을 가리킨다
+  (`target_commitish: "main"` — 소스 커밋은 거기에 없다). 노트 톤은 §4 그대로(평문 한국어, 회사 이야기 없이)
+- **E2E (개인판)**: 같은 소스의 VERSION 만 옛 값(예: 오늘 날짜 00)으로 바꿔 개인판 EXE 를 따로 빌드 → 격리 홈(`USERPROFILE`·`HOME`·`TEMP` 를 시험 폴더로)에서 켜고
+  아무것도 부르지 않은 채 `http://127.0.0.1:35657/api/version` 만 지켜본다(열린 길) → 새 버전 + 바뀐 파일 sha256 == 릴리스 sha256. 공개 뒤 1분 넘게 기다릴 것(§8).
+  고정 링크 `https://github.com/productionkhu-tech/freewill-nanobanana-personal/releases/latest/download/NanoBanana-Personal.exe` 가 200 이고 sha256 같은지도
+- **함정**: 개인판 E2E 는 `/api/apply-update` 를 직접 부를 수 없다(토큰이 HTML 에 없다) — 핸즈프리로만. 회사판 E2E 는 5656 이 윈도우 예약 범위에 들면 못 한다
+  (`netsh int ipv4 show excludedportrange protocol=tcp` — CLAUDE.md §7)

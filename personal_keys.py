@@ -119,7 +119,8 @@ def _reason(obj, key):
 def verify(provider, key, ark_models=None, ark_base=None):
     """Check a key without generating anything. {'result': 'ok'|'invalid'|'net', 'reason', 'models_off'}.
 
-    studio: the model list (key in a header, never in the address). openai: the model list.
+    studio: the model list (key in a header, never in the address). openai: the model list (403 is a
+    real key without the "list models" permission - accepted).
     ark: one request per Seedream model with a size BytePlus rejects before doing any work -
     400 = the model can be used, 403/404 = not activated on this account, 401 = wrong key."""
     out = {"result": "net", "reason": "", "models_off": []}
@@ -130,7 +131,8 @@ def verify(provider, key, ark_models=None, ark_base=None):
             out["reason"] = "" if st == 200 else _reason(obj, key) or ("HTTP %d" % st)
         elif provider == "openai":
             st, obj = _http("GET", _base("OPENAI") + "/v1/models", {"Authorization": "Bearer " + key})
-            out["result"] = "ok" if st == 200 else "invalid" if st in (401, 403) else "net"
+            # 403 = the key is real but may not list models (a key restricted to images) - it works.
+            out["result"] = "ok" if st in (200, 403) else "invalid" if st == 401 else "net"
             out["reason"] = "" if st == 200 else _reason(obj, key) or ("HTTP %d" % st)
         elif provider == "ark":
             base = (ark_base or _base("ARK")).rstrip("/")

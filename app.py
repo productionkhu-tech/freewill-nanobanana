@@ -1577,8 +1577,13 @@ class AppState:
             # The dot went green just because the client object constructed, so a
             # dead key still looked connected until a generation failed 30
             # seconds later. Report what the API actually answered.
-            self.openai_status = "error"
             low = f"{type(e).__name__}: {e}".lower()
+            if _ed.PERSONAL and ("missing scopes" in low or "insufficient permissions" in low):
+                # A personal key restricted to images may not list models - it still generates.
+                self.openai_status = "connected"
+                self.openai_detail = "이미지 전용 키 — 정상"
+                return
+            self.openai_status = "error"
             if "invalid_organization" in low or "organization tied to the api key" in low:
                 self.log("OpenAI: the org/project behind this API key is not accessible "
                          "- check the project is still active and the key belongs to it")
@@ -8447,11 +8452,29 @@ def _personal_publish(rec, phase=None):
     _apply_keys(_pk.client_keys(rec), "personal")
 
 
-def _init_personal_keys(background=True):
-    """Startup (personal edition). A vault that is there but cannot be opened is retried before it is
-    called unreadable - saving over it on a "no keys" guess would throw the keys away."""
-    with _personal_lock:
-        _personal["phase"] = "loading"
+_personal_write_lock = threading.Lock()
+
+
+def _personal_update(mutate, phase=None):
+    """Change the saved keys, one change at a time: copy -> mutate(rec) -> save -> publish. Two saves at
+    the same moment (two windows, quick clicks) each used to copy the record and write their copy back,
+    so the later one wiped the other's key (reproduced 2026-11-23). mutate returning False skips.
+    Returns True (saved), False (the vault could not be written), None (skipped)."""
+    import copy
+    with _personal_write_lock:
+        with _personal_lock:
+            rec = copy.deepcopy(_personal["rec"])
+        if mutate(rec) is False:
+            return None
+        if not _pk.save(_user_data_dir(), rec):
+            return False
+        _personal_publish(rec, phase)
+        return True
+
+
+def _personal_open_vault(background):
+    """Open the vault, retrying while it cannot be opened (right after logon DPAPI may not be ready yet);
+    in the end "unreadable" - never "no keys", which a save would then write over."""
     dd = _user_data_dir()
     kind, rec = "unreadable", None
     for _ in range(60):
@@ -8462,7 +8485,26 @@ def _init_personal_keys(background=True):
     if kind == "unreadable":
         state.log("personal keys: the saved keys could not be opened on this account")
     _personal_publish(rec if kind == "ok" else _pk.empty(), "unreadable" if kind == "unreadable" else "ready")
+    if background:
+        threading.Thread(target=_personal_recheck, daemon=True).start()
+    else:
+        _personal_recheck()
+
+
+def _init_personal_keys(background=True):
+    """Startup (personal edition). The first try is right here (keys ready before the page asks); a vault
+    that cannot be opened yet is retried in the background, so the tab restore is not held for it."""
+    with _personal_lock:
+        _personal["phase"] = "loading"
     _set_gw("personal")
+    kind, rec = _pk.load(_user_data_dir())
+    if kind == "unreadable":
+        if background:
+            threading.Thread(target=_personal_open_vault, args=(True,), daemon=True).start()
+        else:
+            _personal_open_vault(False)
+        return
+    _personal_publish(rec if kind == "ok" else _pk.empty(), "ready")
     if background:
         threading.Thread(target=_personal_recheck, daemon=True).start()
     else:
@@ -8499,8 +8541,8 @@ def _personal_recheck():
             updates[prov] = new
     if not updates:
         return
-    with _personal_lock:
-        rec = copy.deepcopy(_personal["rec"])
+
+    def _merge(rec):
         for prov, new in updates.items():
             if (rec["keys"].get(prov) or {}).get("key") != snap["keys"][prov].get("key"):
                 continue                     # changed by the person meanwhile
@@ -8508,8 +8550,7 @@ def _personal_recheck():
                 rec["keys"].pop(prov, None)
             else:
                 rec["keys"][prov] = new
-    _pk.save(_user_data_dir(), rec)
-    _personal_publish(rec)
+    _personal_update(_merge)
     for prov in removed:
         state.log("personal keys: a company key was removed (%s)" % prov)
         try:
@@ -8520,18 +8561,20 @@ def _personal_recheck():
 
 def _personal_mark_rejected(label):
     """A provider turned the key down while generating: show it as rejected until it is put in again."""
-    import copy
     prov = _PERSONAL_PROVIDER.get(str(label or "").lower())
     if not prov:
         return
-    with _personal_lock:
-        rec = copy.deepcopy(_personal["rec"])
+
+    def _mark(rec):
         k = rec["keys"].get(prov)
         if not k or k.get("state") == "rejected":
-            return
+            return False
         k["state"] = "rejected"
-        _personal["rec"] = rec
-    _pk.save(_user_data_dir(), rec)
+    if _personal_update(_mark):
+        try:
+            current_project().push_event({"type": "personal_keys", "rejected": prov, "pid": None})
+        except Exception:
+            pass
 
 
 def _personal_hint(err):
@@ -8566,12 +8609,8 @@ def api_personal_keys():
             return jsonify({"ok": False, "error": "loading"})
     dd = _user_data_dir()
     if request.method == "DELETE":
-        with _personal_lock:
-            rec = copy.deepcopy(_personal["rec"])
-        rec["keys"].pop(prov, None)
-        if not _pk.save(dd, rec):
+        if _personal_update(lambda rec: rec["keys"].pop(prov, None) and None, "ready") is False:
             return jsonify({"ok": False, "error": "vault_failed"})
-        _personal_publish(rec, "ready")
         return jsonify({"ok": True})
     key, err = _pk.clean_key(d.get("key"))
     if err:
@@ -8585,12 +8624,8 @@ def api_personal_keys():
     ok = v["result"] == "ok"
     entry = {"key": key, "state": "ok" if ok else "unchecked", "company": "clear" if m is False else "unknown",
              "checked_at": _pk.now_iso() if ok else "", "models_off": v["models_off"] if ok else []}
-    with _personal_lock:
-        rec = copy.deepcopy(_personal["rec"])
-    rec["keys"][prov] = entry
-    if not _pk.save(dd, rec):
+    if _personal_update(lambda rec: rec["keys"].__setitem__(prov, entry), "ready") is False:
         return jsonify({"ok": False, "error": "vault_failed"})
-    _personal_publish(rec, "ready")
     return jsonify({"ok": True, "state": entry["state"], "reason": v["reason"], "models_off": entry["models_off"]})
 
 

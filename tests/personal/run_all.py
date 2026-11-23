@@ -6,7 +6,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TESTS = ["t_edition.py", "t_names_wired.py", "t_mei_sweep.py", "t_personal_keys.py", "t_personal_app.py",
-         "t_personal_paths.py", "t_token.py"]
+         "t_personal_paths.py", "t_token.py", "t_personal_races.py"]
 env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
 bad = []
 for t in TESTS:

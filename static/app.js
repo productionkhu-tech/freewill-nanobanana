@@ -325,7 +325,8 @@ function setupClipboardPaste() {
 // ==========================================
 // API Helper
 // ==========================================
-const _NB_CSRF = document.querySelector('meta[name="nb-csrf"]')?.content || "";
+// static/nb_token.js sets it (the personal edition's windows get it in the address, not in the page).
+const _NB_CSRF = window.NB_TOKEN || document.querySelector('meta[name="nb-csrf"]')?.content || "";
 async function api(url, opts = {}) {
   opts.headers = { "X-NB-Token": _NB_CSRF, ...(opts.headers || {}) };
   if (opts.body && typeof opts.body === "object" && !(opts.body instanceof FormData)) {

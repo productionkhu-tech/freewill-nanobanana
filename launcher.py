@@ -286,6 +286,13 @@ def is_port_in_use(port):
 # If another NanoBanana is already running, focus its window and exit silently.
 _instance_mutex_handle = None
 
+def _window_url(path):
+    """Every window this launcher makes opens app.window_url(path): in the personal edition it carries the
+    window token in the address fragment - the only way a page there gets it."""
+    import app as _a
+    return _a.window_url(path)
+
+
 def _ask_running_app_back_to_main():
     """The running instance shows only its mini window: ask it, over its own HTTP API, to bring the main window
     back (the same route as the main window's button). Print strings stay ASCII (rule 11)."""
@@ -293,6 +300,11 @@ def _ask_running_app_back_to_main():
         import json as _json
         import re as _re
         import urllib.request as _u
+        if _ed.PERSONAL:
+            # No token in the page there: the one route that only brings the main window back.
+            req = _u.Request(APP_URL + "/api/back-to-main", method="POST", data=b"{}",
+                             headers={"Content-Type": "application/json"})
+            return bool(_json.loads(_u.urlopen(req, timeout=5).read()).get("shown"))
         st = _json.loads(_u.urlopen(APP_URL + "/api/mini/visible", timeout=3).read())
         if not st.get("visible"):
             return False
@@ -604,7 +616,7 @@ class JsApi:
         try:
             import urllib.parse
             encoded = urllib.parse.quote(filepath, safe="")
-            viewer_url = f"{APP_URL}/viewer?path={encoded}"
+            viewer_url = _window_url(f"/viewer?path={encoded}")
             # Pin the viewer to the project that opened it. Without this it
             # reads whichever tab is active, so switching tabs in the main
             # window would swap the viewer's image list mid-review.
@@ -679,7 +691,7 @@ class JsApi:
             import urllib.parse, base64
             b64 = base64.b64encode((prompt or "").encode("utf-8")).decode("ascii")
             safe_name = urllib.parse.quote(filename or "prompt", safe="")
-            url = f"{APP_URL}/prompt-popup?b64={b64}&name={safe_name}"
+            url = _window_url(f"/prompt-popup?b64={b64}&name={safe_name}")
             webview.create_window(
                 title=f"Prompt - {filename or ''}",
                 url=url,
@@ -1057,7 +1069,7 @@ def main():
     js_api = JsApi()
     window_kwargs = dict(
         title=_ed.APP_TITLE,
-        url=APP_URL,
+        url=_window_url("/"),
         width=1500, height=920,
         min_size=(1000, 600),
         js_api=js_api,
@@ -1085,7 +1097,7 @@ def main():
             def _make_mini():
                 try:
                     _window.events.shown.wait()
-                    mini_window.start(_app_module, f"{APP_URL}/mini", main_window=_window)
+                    mini_window.start(_app_module, _window_url("/mini"), main_window=_window)
                 except Exception as e:
                     print(f"  mini window: {e}")
             threading.Thread(target=_make_mini, daemon=True).start()

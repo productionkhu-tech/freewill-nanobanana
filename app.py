@@ -3752,6 +3752,7 @@ def _api_unhandled(e):
 # custom header whose value we print into the HTML template; local pages
 # in a browser won't see that value and will be rejected.
 import secrets as _secrets
+import hmac as _hmac
 CSRF_TOKEN = _secrets.token_urlsafe(32)
 
 # Endpoints exempt from CSRF (GET is safe; our /api/status polling is GET-only)
@@ -3759,8 +3760,29 @@ _CSRF_EXEMPT_METHODS = {"GET", "HEAD", "OPTIONS"}
 _CSRF_EXEMPT_PATHS = {"/api/version"}  # any public-ish read-only endpoints
 
 
+# The personal edition (v2026-11-23) does not print the token into its pages: only the windows the
+# launcher makes get it (window_url -> #nbt= -> static/nb_token.js -> header + session cookie), and every
+# /api/* needs it there, GET included - an MCP connector or any other program reading the page has nothing
+# to send. Open there: the version, and the second launch asking for the main window back (shows a window,
+# nothing else).
+_PERSONAL_OPEN_PATHS = {"/api/version", "/api/back-to-main"}
+
+
+def window_url(path="/"):
+    """The address a window of this app opens. The personal edition's carries the token in the fragment."""
+    base = "http://127.0.0.1:%d%s" % (_ed.PORT, path)
+    return base + "#nbt=" + CSRF_TOKEN if _ed.PERSONAL else base
+
+
 @app.before_request
 def _csrf_guard():
+    if _ed.PERSONAL:
+        if not request.path.startswith("/api/") or request.path in _PERSONAL_OPEN_PATHS:
+            return None
+        tok = request.headers.get("X-NB-Token", "") or request.cookies.get("nbt", "")
+        if not tok or not _hmac.compare_digest(tok, CSRF_TOKEN):
+            return ("forbidden", 403)
+        return None
     # Skip if it's our own UI (served from same origin with token)
     if request.method in _CSRF_EXEMPT_METHODS:
         return None
@@ -3915,7 +3937,7 @@ def _edition_marks(html):
 def _render_html(template_name):
     html = render_template(template_name)
     html = html.replace("__VERSION__", _read_version() + "." + _BUILD_ID)
-    html = html.replace("__CSRF_TOKEN__", CSRF_TOKEN)
+    html = html.replace("__CSRF_TOKEN__", "" if _ed.PERSONAL else CSRF_TOKEN)
     html = _edition_marks(html)
     resp = Response(html)
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
@@ -7660,6 +7682,20 @@ def api_mini_visible():
         return jsonify({"available": fn is not None, "visible": bool(fn()) if fn else False})
     except Exception:
         return jsonify({"available": fn is not None, "visible": False})
+
+
+@app.route("/api/back-to-main", methods=["POST"])
+def api_back_to_main():
+    """A second launch asks for the main window back (launcher). Shows the main window when the mini window
+    is up - nothing else, so the personal edition takes it without the window token."""
+    vis, tog = MINI_HOOKS.get("visible"), MINI_HOOKS.get("toggle")
+    try:
+        if vis and tog and vis():
+            tog()
+            return jsonify({"ok": True, "shown": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:200]})
+    return jsonify({"ok": True, "shown": False})
 
 
 @app.route("/api/mini/toggle", methods=["POST"])

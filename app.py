@@ -5290,6 +5290,8 @@ def _save_catalog_disk(payload):
 
 @app.route("/api/billing/catalog")
 def billing_catalog():
+    if _ed.PERSONAL:              # no teams or projects in the personal edition
+        return jsonify({"ok": False, "error": "not_in_personal"}), 404
     force = request.args.get("refresh") == "1"
     now = time.time()
     # 5분 캐시. 모달을 열 때마다 네트워크를 타면 느리고, 그렇다고 영구 캐시면
@@ -5324,6 +5326,8 @@ def billing_catalog():
 
 @app.route("/api/billing/state")
 def billing_state():
+    if _ed.PERSONAL:              # no teams or projects in the personal edition
+        return jsonify({"ok": False, "error": "not_in_personal"}), 404
     # ?pid= : the tab menu's "팀·프로젝트…" opens this window for a tab that is
     # not on screen, and an agent asks before sending whether that tab may spend.
     state = _tab_for_read()                 # shadows the module proxy on purpose
@@ -5344,6 +5348,8 @@ def billing_state():
 
 @app.route("/api/billing/set", methods=["POST"])
 def billing_set():
+    if _ed.PERSONAL:              # no teams or projects in the personal edition
+        return jsonify({"ok": False, "error": "not_in_personal"}), 404
     d = request.get_json(silent=True) or {}
     # pid: the person picked billing for a tab from its right-click menu without
     # switching to it. Strict — the pick must land on exactly that tab.
@@ -5419,6 +5425,8 @@ def _billing_usable(p):
     탭 줄이 자주 부르므로 네트워크를 타지 않는다. 저장된 팀·프로젝트가 목록에서 빠졌으면
     생성을 눌러 보기 전에 탭의 "!" 와 Status 칸에 드러나야 한다. 생성 직전의 판단은 여전히
     _billing_gate 몫이다."""
+    if _ed.PERSONAL:
+        return True        # the personal edition has no teams or projects - the person pays
     if not (p.billing_confirmed and p.billing_team_id and p.billing_project_id):
         return False
     data = _catalog_cache.get("data")
@@ -5445,6 +5453,10 @@ def start_generate():
     d = request.get_json(silent=True, force=True) if request.get_data().strip() else {}
     if not isinstance(d, dict):
         return jsonify({"ok": False, "error": "bad_json"})
+    # The personal edition has no agent path (no MCP): nothing an agent would send is taken, and
+    # nothing is generated for it. Outside programs cannot reach the API there anyway (window token).
+    if _ed.PERSONAL and ("pid" in d or d.get("batch_id") or "check_only" in d):
+        return jsonify({"ok": False, "error": "not_in_personal"}), 403
     if "pid" in d:
         p = _project_strict(d.get("pid"))
         if p is None:
@@ -5484,6 +5496,8 @@ def _billing_gate(p, write=True):
     비용 귀속이 확인되지 않은 탭은 생성하지 않는다. 이 검사가 없으면 어디에 달아야
     할지 모르는 이미지가 쌓이고, 나중에 소급할 방법이 없다. 에이전트도 같은 문을
     지난다 — 팀·프로젝트는 사람만 고른다. write=False: 값 검사 — 같은 답을 하되 탭은 그대로 둔다."""
+    if _ed.PERSONAL:
+        return None        # no teams or projects; a company file's values stay in it untouched
     if not (p.billing_confirmed and p.billing_team_id and p.billing_project_id):
         return jsonify({"ok": False, "error": "팀과 프로젝트를 먼저 선택해 주세요",
                         "needs_billing": True, "pid": p.pid, "tab": p.display_name()})
@@ -6405,13 +6419,14 @@ def api_projects():
     # would ask about is usually about to go).
     return jsonify({"projects": items, "active": active,
                     "restoring": bool(shared.session_restoring),
-                    "agent_pid": True,
+                    "agent_pid": not _ed.PERSONAL,
                     # agent_model_defaults: 에이전트 요청의 빠진 값은 탭이 아니라 모델 기본이다(§2.2).
                     # 옛 앱과 섞여 있는 동안 커넥터가 어느 규칙인지 알 수 있게 한다.
                     # caller_batch_id·check_only 는 꼭 보고 보낼 것 — 옛 앱은 이 칸을 모르고 그대로 생성한다.
                     # batch_id_run: 이 실행에서 받은 묶음 id 는 집계에서 빠지거나 그림이 지워지거나 탭이 닫혀도
                     # 다시 보내면 duplicate 다(v2026-11-1301~). 이게 없는 앱은 50개가 지난 그림 없는 묶음을 새로 만든다.
-                    "features": ["agent_pid", "agent_model_defaults", "caller_batch_id", "batch_billing",
+                    "features": [] if _ed.PERSONAL else
+                                ["agent_pid", "agent_model_defaults", "caller_batch_id", "batch_billing",
                                  "check_only", "waiting_tabs", "batch_id_run"],
                     "waiting_tabs": waiting})
 

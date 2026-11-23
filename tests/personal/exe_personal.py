@@ -70,8 +70,13 @@ check("data in ~/.nanobanana-personal only", os.path.isdir(os.path.join(home, ".
       and not os.path.exists(os.path.join(home, ".nanobanana")), os.listdir(home))
 
 pids = X.pids_under(work)
-w = X.windows(pids)
-main = (w.get("NanoBanana Personal") or [None])[0]
+main, w = None, {}
+for _ in range(60):                                  # a busy PC shows the main window late
+    w = X.windows(pids)
+    main = next((h for h in (w.get("NanoBanana Personal") or []) if X.visible(h)), None)
+    if main:
+        break
+    time.sleep(0.5)
 mini = (w.get("NanoBanana Personal mini") or [None])[0]
 check("main window titled NanoBanana Personal", X.visible(main), list(w))
 for _ in range(20):                                  # the mini window is made after the main one shows
@@ -90,21 +95,34 @@ check("main window: no team/project prompt", "팀·프로젝트" not in text and
       [l for l in text.splitlines() if "팀" in l][:5])
 check("main window: the seeded tab is there", "seed_0001" in text or "seed prompt" in text, "")
 
-# viewer: double-click the picture (a real click, the pointer goes back)
-card = X.uia(main, "rect", "seed_0001").split()     # the card's own text (not its buttons)
-before = set(X.windows(pids))
-if len(card) == 4:
-    x, y, cw, ch = map(int, card)
-    X.dblclick(x + cw // 2, y + ch // 2)
-    time.sleep(3)
-new = [t for t in X.windows(pids) if t not in before]
-viewer = (X.windows(pids).get(new[0]) or [None])[0] if new else None
-check("viewer window opened", bool(viewer), (card, new))
-if viewer:
-    ok, vt = X.wait_text(viewer, "seed_0001", secs=15)
-    check("viewer loaded with the token (shows the picture's name)", ok, vt[:300])
-    X.close_window(viewer)
-    time.sleep(1)
+# viewer: double-click the picture (a real click, the pointer goes back). A locked screen takes no clicks:
+# then this part is reported as skipped, not passed.
+if X.screen_locked():
+    print("SKIP viewer: the screen is locked - real clicks reach no app", flush=True)
+else:
+    X.bring_front(main)
+    card = X.uia(main, "rect", "seed_0001").split()     # the card's own text (not its buttons)
+    before = set(X.windows(pids))
+    clicked = False
+    if len(card) == 4:
+        x, y, cw, ch = map(int, card)
+        clicked = X.dblclick(x + cw // 2, y + ch // 2, pids=pids)   # only onto the test's own window
+    check("viewer: the card was on top to click", clicked, card)
+    new = []
+    for _ in range(30):                                  # the viewer window can take a few seconds on a busy PC
+        time.sleep(0.5)
+        new = [t for t in X.windows(pids) if t not in before]
+        if new:
+            break
+    X.bring_front(main, on=False)
+    viewer = (X.windows(pids).get(new[0]) or [None])[0] if new else None
+    check("viewer window opened", bool(viewer), (card, new))
+    if viewer:
+        ok, vt = X.wait_text(viewer, "seed_0001", secs=15)
+        check("viewer loaded with the token (shows the picture's name)", ok, vt[:300])
+        X.close_window(viewer)
+        time.sleep(1)
+
 
 # mini: the main window's button (token-only route) -> the mini window shows, the main window hides
 inv = X.uia(main, "invoke", "미니창으로 보기")

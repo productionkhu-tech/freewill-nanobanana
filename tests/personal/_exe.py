@@ -171,18 +171,63 @@ def foreground_title():
     return b.value
 
 
-def dblclick(x, y):
-    """A real double-click at screen pixel (x, y); the pointer goes back where it was."""
+def screen_locked():
+    """True while Windows shows the lock screen: no foreground window and no screen grab - real clicks
+    would not reach any app then."""
+    if u.GetForegroundWindow():
+        return False
+    try:
+        from PIL import ImageGrab
+        ImageGrab.grab(bbox=(0, 0, 8, 8))
+        return False
+    except Exception:
+        return True
+
+
+def window_pid_at(x, y):
+    u.WindowFromPoint.restype = ctypes.c_void_p
+    u.WindowFromPoint.argtypes = [wintypes.POINT]
+    h = u.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+    # the page itself is a WebView2 child window of the msedgewebview2 process - ask its top-level window
+    u.GetAncestor.restype = ctypes.c_void_p
+    u.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    h = u.GetAncestor(ctypes.c_void_p(h), 2) or h           # GA_ROOT
+    pid = wintypes.DWORD()
+    u.GetWindowThreadProcessId(ctypes.c_void_p(h), ctypes.byref(pid))
+    return pid.value
+
+
+def bring_front(h, on=True):
+    """Put the test's window above everything for a moment (a background process may not take the focus,
+    but it may set a window topmost); on=False puts it back."""
+    u.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    if on:
+        u.ShowWindow(ctypes.c_void_p(h), 9)      # SW_RESTORE
+    u.SetWindowPos(ctypes.c_void_p(h), ctypes.c_void_p(-1 if on else -2), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+    if on:
+        u.SetForegroundWindow(ctypes.c_void_p(h))
+    time.sleep(0.6)
+
+
+def dblclick(x, y, pids=None):
+    """A real double-click at screen pixel (x, y); the pointer goes back where it was. With `pids`, it clicks
+    only when the window under that point belongs to the test's own processes (never the person's screen)."""
+    if pids is not None and window_pid_at(x, y) not in pids:
+        return False
     old = wintypes.POINT()
     u.GetCursorPos(ctypes.byref(old))
     u.SetCursorPos(int(x), int(y))
     time.sleep(0.15)
+    u.mouse_event(0x0002, 0, 0, 0, 0)               # one click first: it activates the window (and may be eaten)
+    u.mouse_event(0x0004, 0, 0, 0, 0)
+    time.sleep(0.8)
     for _ in range(2):
         u.mouse_event(0x0002, 0, 0, 0, 0)
         u.mouse_event(0x0004, 0, 0, 0, 0)
         time.sleep(0.05)
     time.sleep(0.2)
     u.SetCursorPos(old.x, old.y)
+    return True
 
 
 def close_window(h):

@@ -164,23 +164,32 @@ except Exception as _e:
 # racing the extractor). The sweep is pure housekeeping — it doesn't need
 # to happen before the app starts.
 _sweep_stale_mei_done = False
-def _sweep_stale_mei():
+def _sweep_stale_mei(temp_dir=None, our_mei=None, now=None, force=False):
+    """Remove other runs' leftover _MEI folders. Returns the paths removed.
+
+    A folder another RUNNING onefile app is using must survive whole (v2026-11-23): rmtree with
+    ignore_errors used to leave its loaded DLLs but delete its templates / static files, so the company
+    app and the personal edition running at once broke each other's viewer and mini window. Windows
+    refuses to rename a folder while a file inside is open or mapped - so a folder is first renamed to
+    <name>.nbdel (refused -> in use -> skipped) and only the renamed one is deleted. A .nbdel left by a
+    sweep that died half-way is removed too. `force` (tests) skips the frozen / once-only checks."""
     global _sweep_stale_mei_done
-    if _sweep_stale_mei_done:
-        return
+    removed = []
+    if _sweep_stale_mei_done and not force:
+        return removed
     _sweep_stale_mei_done = True
     try:
-        if not (getattr(sys, "frozen", False) and sys.platform == "win32"):
-            return
+        if not force and not (getattr(sys, "frozen", False) and sys.platform == "win32"):
+            return removed
         import tempfile as _tempfile
         import shutil as _shutil
         import re as _re
         import time as _time
-        _temp = _tempfile.gettempdir()
-        _our_mei = os.path.normcase(getattr(sys, "_MEIPASS", "") or "")
+        _temp = temp_dir or _tempfile.gettempdir()
+        _our_mei = os.path.normcase(our_mei or getattr(sys, "_MEIPASS", "") or "")
         if not _our_mei:
-            return  # belt-and-suspenders: never sweep when we can't identify ourselves
-        now = _time.time()
+            return removed  # belt-and-suspenders: never sweep when we can't identify ourselves
+        now = _time.time() if now is None else now
         # Skip any _MEI folder modified in the last 5 minutes. A concurrent
         # NanoBanana launch is actively extracting into its own _MEI and any
         # rmtree we do there will corrupt its runtime (e.g. "ModuleNotFoundError:
@@ -188,7 +197,8 @@ def _sweep_stale_mei():
         # any reasonable PyInstaller extraction + run-to-stable window.
         FRESH_WINDOW_SEC = 300
         for _name in os.listdir(_temp):
-            if not _re.match(r"^_MEI[0-9a-fA-F]+$", _name):
+            _half_done = bool(_re.match(r"^_MEI[0-9a-fA-F]+\.nbdel$", _name))
+            if not (_half_done or _re.match(r"^_MEI[0-9a-fA-F]+$", _name)):
                 continue
             _path = os.path.join(_temp, _name)
             if os.path.normcase(_path) == _our_mei:
@@ -202,12 +212,22 @@ def _sweep_stale_mei():
                     continue
             except OSError:
                 continue
+            _gone = _path
+            if not _half_done:
+                _gone = _path + ".nbdel"
+                try:
+                    os.rename(_path, _gone)
+                except OSError:
+                    continue      # a running app holds it - leave the whole folder alone
             try:
-                _shutil.rmtree(_path, ignore_errors=True)
+                _shutil.rmtree(_gone, ignore_errors=True)
+                if not os.path.exists(_gone):
+                    removed.append(_path)
             except Exception:
                 pass
     except Exception as _e:
         print(f"  _MEI sweep: {_e}")
+    return removed
 
 
 # --- Auto-update attempt bookkeeping ---------------------------------------

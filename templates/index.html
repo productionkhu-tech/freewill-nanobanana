@@ -52,9 +52,16 @@
         <span class="bill-caret" aria-hidden="true"></span>
       </button>
       <!-- 개인판(v2026-11-23): 팀·프로젝트 자리에 '내 키'. 회사판에선 숨어 있다. -->
-      <button id="myKeysBtn" class="bill-select" onclick="openMyKeys()" style="display:none"
+      <!-- 2026-11-24: 이모지 대신 선 열쇠 + 개수. 회사마다의 상태는 오른쪽 위 점(실시간)이 보여 준다 — 여기엔 두지 않는다. -->
+      <button id="myKeysBtn" class="bill-select mykeys-btn" onclick="openMyKeys()" style="display:none"
               title="내 키 — Google AI Studio · OpenAI · BytePlus">
-        <span id="myKeysText">내 키</span>
+        <span class="mk-main">
+          <span class="mk-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none"
+            stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3 20 3M16 7l3 3M14 9l2 2"/></svg></span>
+          <span class="mk-label">내 키</span>
+        </span>
+        <span id="myKeysText" class="mk-count">0/3</span>
         <span class="bill-caret" aria-hidden="true"></span>
       </button>
 

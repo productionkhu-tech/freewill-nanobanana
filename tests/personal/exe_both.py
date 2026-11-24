@@ -121,7 +121,12 @@ def seedance():
         t = os.path.join(dock, "seedance.json.tmp")
         with open(t, "w", encoding="utf-8") as fh:
             json.dump(rec, fh)
-        os.replace(t, os.path.join(dock, "seedance.json"))
+        for _ in range(20):                   # an app reading the record at that moment blocks the swap
+            try:
+                os.replace(t, os.path.join(dock, "seedance.json"))
+                break
+            except PermissionError:
+                time.sleep(0.05)
         stop.wait(1.0)
 
 
@@ -130,7 +135,9 @@ time.sleep(2)
 r = X.post(5656, "/api/mini/toggle", {}, token=tok.group(1) if tok else None)
 check("company mini on", '"visible": true' in r[1] or '"visible":true' in r[1], r)
 time.sleep(1.5)
-inv = X.uia(pe_main, "invoke", "미니창으로 보기")
+X.bring_front(pe_main)                    # covered windows may not answer UI Automation
+inv = X.invoke(pe_main, "미니창으로 보기")
+X.bring_front(pe_main, on=False)
 check("personal mini on (its own button)", "INVOKED" in inv, inv)
 time.sleep(4)
 co_mini = (X.windows(co_pids).get("NanoBanana mini") or [None])[0]
@@ -156,7 +163,7 @@ check("dock records: nanobanana 1, nanobanana-personal 1.5", (recs.get("nanobana
 stop.set()
 
 # 6. close both: each ends on its own
-X.uia(pe_mini, "invoke", "본창 열기")
+X.invoke(pe_mini, "본창 열기")
 time.sleep(1)
 X.post(5656, "/api/mini/toggle", {}, token=tok.group(1) if tok else None)
 time.sleep(1)

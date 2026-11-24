@@ -84,6 +84,8 @@ header {
 }
 .dot.connected { background: var(--success); }
 .dot.error     { background: var(--error); }
+/* 개인판: 키를 넣었지만 아직 확인 전(인터넷이 없을 때) */
+.dot.checking  { background: var(--warning); }
 .status-label  { margin: 0 8px 0 2px; font-size: 10px; }
 
 /* Hide Panel button: w92 h30 r999 */
@@ -1632,6 +1634,25 @@ footer {
 /* 아직 안 고른 탭은 생성이 막혀 있다 — 글자색만으로 알린다(박스는 그대로). */
 .bill-select.needs { border-color: var(--accent); }
 .bill-select.needs > span:first-child { color: var(--accent); }
+
+/* 개인판 '내 키' 버튼 (2026-11-24) — 같은 칸 모양에 열쇠 타일 · 개수. 회사마다의 상태는 오른쪽 위 점이 보여 준다. */
+.mykeys-btn { height: 40px; padding: 0 12px 0 6px; gap: 10px; justify-content: flex-start; }
+.mykeys-btn .mk-main { display: flex; align-items: center; gap: 8px; flex: none; }
+.mk-icon {
+  width: 28px; height: 28px; border-radius: 7px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent); background: rgba(212, 165, 116, 0.13);
+  transition: background .15s ease;
+}
+.mk-icon svg { width: 16px; height: 16px; }
+.mykeys-btn:hover .mk-icon { background: rgba(212, 165, 116, 0.22); }
+.mk-label { font-size: 13px; font-weight: 600; letter-spacing: -0.1px; color: var(--text); }
+.mk-count { flex: none; margin-left: auto; font-size: 12px; color: var(--text2); font-variant-numeric: tabular-nums; }
+.mykeys-btn.needs { border-color: var(--accent); }
+.mykeys-btn.needs .mk-label, .mykeys-btn.needs .mk-count { color: var(--accent); }
+/* 개인판: 오른쪽 위 점 줄을 누르면 '내 키' 가 열린다 */
+.api-status.mykeys-link { cursor: pointer; border-radius: 8px; padding: 4px 2px 4px 8px; }
+.api-status.mykeys-link:hover { background: var(--surface2); }
 
 /* 비용 귀속 선택 모달의 한 줄 (라벨 + 드롭다운) */
 .bill-row { display: flex; align-items: center; gap: 10px; margin: 10px 0; }

@@ -4847,9 +4847,11 @@ async function refreshApiStatus() {
     // A red dot with no explanation reads as "my key is broken". When the key
     // is only a ticket into the company server, the real reason is usually
     // "that server is not reachable from here" — say so.
-    openaiDot.title = d.openai_detail || "";
-    const row = openaiDot.closest(".api-row") || openaiDot.parentElement;
-    if (row) row.title = d.openai_detail || "";
+    if (!PERSONAL) {                 // the personal edition's dots carry the key state as their tooltip
+      openaiDot.title = d.openai_detail || "";
+      const row = openaiDot.closest(".api-row") || openaiDot.parentElement;
+      if (row) row.title = d.openai_detail || "";
+    }
   }
   const seedreamDot = document.getElementById("seedreamDot");
   if (seedreamDot) seedreamDot.className = "dot " + (d.seedream || "disconnected");
@@ -4951,6 +4953,12 @@ function applyEditionUI() {
   if (bar) bar.style.display = "none";
   const btn = document.getElementById("myKeysBtn");
   if (btn) btn.style.display = "";
+  // the top-right dots are the keys' live state here - clicking them opens my keys
+  const dots = document.querySelector(".api-status");
+  if (dots) {
+    dots.classList.add("mykeys-link");
+    dots.addEventListener("click", openMyKeys);
+  }
   const vx = document.getElementById("vertexDot");
   if (vx) {
     vx.style.display = "none";
@@ -4974,14 +4982,36 @@ async function refreshMyKeys() {
   const d = await api("/api/personal/keys");
   if (!d || !d.ok) return;
   _myKeys = d;
-  const n = _MYKEY_ROWS.filter(r => d.keys[r.p] && d.keys[r.p].set).length;
-  const t = document.getElementById("myKeysText");
-  if (t) t.textContent = "🔑 내 키 " + n + "/3";
-  const btn = document.getElementById("myKeysBtn");
-  if (btn) btn.classList.toggle("needs", n === 0);
+  _renderMyKeysBtn(d);
   rebuildModelSelect();
   renderPersonalBanner({ phase: d.phase });
   if (!document.getElementById("myKeysModal").classList.contains("hidden")) _renderMyKeyRows();
+}
+
+// The sidebar button: key tile + how many of the three keys are in. Each company's state is shown live by
+// the top-right dots (user 2026-11-24) - this only sets their tooltips, the colours come from /api/status.
+function _renderMyKeysBtn(d) {
+  const keys = (d && d.keys) || {};
+  const btn = document.getElementById("myKeysBtn");
+  const t = document.getElementById("myKeysText");
+  if (!btn || !t) return;
+  let n = 0;
+  const tips = [];
+  const dotOf = { studio: "studioDot", openai: "openaiDot", ark: "seedreamDot" };
+  _MYKEY_ROWS.forEach(r => {
+    const k = keys[r.p] || {};
+    if (k.set) n++;
+    const tip = r.name + " — " + _myKeyStateText(k).text;
+    tips.push(tip);
+    const dot = document.getElementById(dotOf[r.p]);
+    if (dot) {
+      dot.title = tip;
+      if (dot.nextElementSibling) dot.nextElementSibling.title = tip;
+    }
+  });
+  t.textContent = n + "/3";
+  btn.classList.toggle("needs", n === 0);
+  btn.title = ["내 키 · 눌러서 넣기·바꾸기"].concat(tips).join(String.fromCharCode(10));
 }
 
 function _myKeyStateText(k) {

@@ -86,7 +86,9 @@ for _ in range(20):                                  # the mini window is made a
     mini = (X.windows(pids).get("NanoBanana Personal mini") or [None])[0]
 check("mini window made, hidden", bool(mini) and not X.visible(mini))
 
-# the main window got the token: its key button and banner come from token-only routes
+# the main window got the token: its key button and banner come from token-only routes. Kept on top while it
+# is read - a window covered by the person's browser may not answer UI Automation (11/24)
+X.bring_front(main)
 ok, text = X.wait_text(main, "내 키")
 check("main window: my-keys button (token reached the page)", ok and "0/3" in text, text[:300])
 check("main window: personal banner", "개인판" in text)
@@ -100,7 +102,6 @@ check("main window: the seeded tab is there", "seed_0001" in text or "seed promp
 if X.screen_locked():
     print("SKIP viewer: the screen is locked - real clicks reach no app", flush=True)
 else:
-    X.bring_front(main)
     card = X.uia(main, "rect", "seed_0001").split()     # the card's own text (not its buttons)
     before = set(X.windows(pids))
     clicked = False
@@ -114,18 +115,21 @@ else:
         new = [t for t in X.windows(pids) if t not in before]
         if new:
             break
-    X.bring_front(main, on=False)
     viewer = (X.windows(pids).get(new[0]) or [None])[0] if new else None
     check("viewer window opened", bool(viewer), (card, new))
     if viewer:
+        X.bring_front(main, on=False)                    # the viewer on top while it is read, then main again
+        X.bring_front(viewer)
         ok, vt = X.wait_text(viewer, "seed_0001", secs=15)
         check("viewer loaded with the token (shows the picture's name)", ok, vt[:300])
         X.close_window(viewer)
         time.sleep(1)
+        X.bring_front(main)
 
 
 # mini: the main window's button (token-only route) -> the mini window shows, the main window hides
-inv = X.uia(main, "invoke", "미니창으로 보기")
+inv = X.invoke(main, "미니창으로 보기")
+X.bring_front(main, on=False)
 time.sleep(2)
 check("mini button pressed", "INVOKED" in inv, inv)
 check("mini shows, main hides", X.visible(mini) and not X.visible(main))

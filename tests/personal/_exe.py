@@ -153,6 +153,18 @@ def uia(hwnd, mode="text", name=""):
     return r.stdout
 
 
+def invoke(hwnd, name, secs=10):
+    """Press the element whose name starts with `name`, retrying: right after the window comes up (or another
+    window changes) the page's accessibility tree can lag a few seconds behind (11/24: NOT_FOUND, then INVOKED)."""
+    out = ""
+    for _ in range(secs):
+        out = uia(hwnd, "invoke", name)
+        if "INVOKED" in out:
+            return out
+        time.sleep(1)
+    return out
+
+
 def wait_text(hwnd, needle, secs=20):
     t = ""
     for _ in range(secs):

@@ -27,6 +27,16 @@ if ($Mode -eq "invoke") {
     }
     Write-Output "NOT_FOUND"; exit 3
 }
+if ($Mode -eq "probe") {
+    foreach ($e in $all) {
+        $n = $e.Current.Name
+        if ($n -and $n.StartsWith($Name)) {
+            $pats = ($e.GetSupportedPatterns() | ForEach-Object { $_.ProgrammaticName }) -join ","
+            Write-Output ("{0} | enabled={1} offscreen={2} | {3}" -f $e.Current.ControlType.ProgrammaticName, $e.Current.IsEnabled, $e.Current.IsOffscreen, $pats)
+        }
+    }
+    exit 0
+}
 if ($Mode -eq "rect") {
     foreach ($e in $all) {
         $n = $e.Current.Name

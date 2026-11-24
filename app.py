@@ -4122,11 +4122,12 @@ def api_status():
     # Piggyback the close-requested flag here so JS doesn't need a separate poll
     close_req = state.close_requested
     state.close_requested = False
+    dots = _personal_dots() if _ed.PERSONAL else None
     return jsonify({
         "vertex": state.vertex_status,
-        "studio": state.studio_status,
-        "openai": state.openai_status,
-        "seedream": state.seedream_status,
+        "studio": dots["studio"] if dots else state.studio_status,
+        "openai": dots["openai"] if dots else state.openai_status,
+        "seedream": dots["seedream"] if dots else state.seedream_status,
         "is_generating": state.is_generating,
         # Whether ANY tab is busy — the auto-updater and the close flow must
         # look at this, not at the visible tab alone.
@@ -8436,6 +8437,28 @@ _personal_lock = threading.Lock()
 _personal = {"phase": "loading", "rec": _pk.empty()}
 _PERSONAL_PROVIDER = {"openai": "openai", "seedream": "ark", "gemini": "studio", "studio": "studio"}
 _PERSONAL_NAME = {"Seedream": "BytePlus", "Gemini": "Google AI Studio"}
+
+
+def _personal_dots():
+    """The top-right dots in the personal edition = each company's key, live (user 2026-11-24: the
+    my-keys button needs no chips, the dots prove it): no key grey, checked green, not checked yet
+    yellow, rejected red (at the check or by a 401 while generating) - a built client alone is not
+    'connected' when the company turned the key down."""
+    with _personal_lock:
+        pub = _pk.public_status(_personal["rec"])
+    built = {"studio": shared.studio_status, "openai": shared.openai_status, "ark": shared.seedream_status}
+    out = {}
+    for prov, name in (("studio", "studio"), ("openai", "openai"), ("ark", "seedream")):
+        k = pub.get(prov) or {}
+        if not k.get("set"):
+            out[name] = "disconnected"
+        elif k.get("state") == "rejected" or built[prov] == "error":
+            out[name] = "error"
+        elif k.get("state") == "unchecked":
+            out[name] = "checking"
+        else:
+            out[name] = "connected"
+    return out
 
 
 def _personal_ark_models():

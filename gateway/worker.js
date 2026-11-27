@@ -754,15 +754,16 @@ async function handleAdmin(request, env, path) {
       await env.USAGE_DB.prepare(
         `INSERT INTO prices
            (model, effective_from, provider, mode, in_text_per_m, in_image_per_m, out_per_m,
-            out_text_per_m, per_image, per_image_hi, px_threshold, in_per_image, in_free_count,
-            verified, note, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            out_text_per_m, per_image, per_image_hi, px_threshold, per_image_hi2, px_threshold2,
+            in_per_image, in_free_count, verified, note, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(model, effective_from) DO UPDATE SET
            provider=excluded.provider, mode=excluded.mode,
            in_text_per_m=excluded.in_text_per_m, in_image_per_m=excluded.in_image_per_m,
            out_per_m=excluded.out_per_m, out_text_per_m=excluded.out_text_per_m,
            per_image=excluded.per_image,
            per_image_hi=excluded.per_image_hi, px_threshold=excluded.px_threshold,
+           per_image_hi2=excluded.per_image_hi2, px_threshold2=excluded.px_threshold2,
            in_per_image=excluded.in_per_image, in_free_count=excluded.in_free_count,
            verified=excluded.verified, note=excluded.note, updated_at=excluded.updated_at`)
         .bind(model, eff,
@@ -779,6 +780,9 @@ async function handleAdmin(request, env, path) {
               // 있고 저장이 안 돼 고쳐도 조용히 원래 값으로 남았다.
               num(b.per_image_hi, prev && prev.per_image_hi),
               num(b.px_threshold, prev && prev.px_threshold),
+              // 두 번째 고화소 구간 (prices3.sql, 2026-11-27: 시드림 5.5 4K $0.079)
+              num(b.per_image_hi2, prev && prev.per_image_hi2),
+              num(b.px_threshold2, prev && prev.px_threshold2),
               num(b.in_per_image, prev && prev.in_per_image),
               num(b.in_free_count, prev && prev.in_free_count),
               b.verified ? 1 : 0, String(b.note || "").slice(0, 200), nowIso()).run();
@@ -1833,6 +1837,7 @@ async function loadPrices() {
   let h = '<table><tr><th>모델</th><th>적용 시작</th><th>방식</th>'
         + '<th class="num">입력 텍스트 / 이미지 (1M)</th><th class="num">출력 이미지 / 텍스트·생각 (1M)</th>'
         + '<th class="num">장당</th><th class="num">장당(고화소)</th><th class="num">픽셀 기준</th>'
+        + '<th class="num">장당(고화소2) / 픽셀 기준2</th>'
         + '<th class="num">레퍼런스 장당 / 무료</th><th>상태</th><th></th></tr>';
   rows.forEach((p, i) => {
     const id = "p_" + i;
@@ -1849,6 +1854,8 @@ async function loadPrices() {
       + '<td class="num"><input id="' + id + '_pi" value="' + p.per_image + '" size="5"></td>'
       + '<td class="num"><input id="' + id + '_ph" value="' + p.per_image_hi + '" size="5"></td>'
       + '<td class="num"><input id="' + id + '_px" value="' + p.px_threshold + '" size="8"></td>'
+      + '<td class="num"><input id="' + id + '_ph2" value="' + (p.per_image_hi2 || 0) + '" size="5"> / '
+      + '<input id="' + id + '_px2" value="' + (p.px_threshold2 || 0) + '" size="8"></td>'
       + '<td class="num"><input id="' + id + '_ip" value="' + p.in_per_image + '" size="5"> / '
       + '<input id="' + id + '_if" value="' + p.in_free_count + '" size="2"></td>'
       + '<td>' + (p.verified ? '<span class="ok">확인됨</span>' : '<span class="pill">확인 필요</span>') + '</td>'
@@ -1870,6 +1877,7 @@ async function savePrice(model, id, eff) {
     model, effective_from: when, mode: v("_mode"),
     in_text_per_m: v("_it"), in_image_per_m: v("_ii"), out_per_m: v("_o"), out_text_per_m: v("_ot"),
     per_image: v("_pi"), per_image_hi: v("_ph"), px_threshold: v("_px"),
+    per_image_hi2: v("_ph2"), px_threshold2: v("_px2"),
     in_per_image: v("_ip"), in_free_count: v("_if"), verified: 1 }) });
   if (!d.ok) return alert(d.error || "실패");
   loadPrices();
@@ -2209,12 +2217,15 @@ const GROUPS = {
  * 같은 행을 모은 것이라, 토큰과 장수는 합을 곱하고 레퍼런스는 행 수(rows_n)를 곱한다.
  *
  * mode='image' 는 장당가인데 출력 픽셀이 px_threshold 를 넘으면 고화소 단가를 쓰고
- * (seedream-5-0-pro: 2.61M px 초과 $0.09), 레퍼런스는 무료 장수를 뺀 만큼만 붙는다.
+ * (seedream-5-0-pro: 2.61M px 초과 $0.09), px_threshold2 를 넘으면 두 번째 고화소 단가
+ * (seedream-5-5: 4.63M px 초과 = 4K $0.079, prices3.sql), 레퍼런스는 무료 장수를 뺀 만큼만 붙는다.
  */
 const COST_USD = `
   COALESCE(
     CASE WHEN p.mode='image'
-         THEN e.images * (CASE WHEN p.px_threshold > 0 AND e.out_px > p.px_threshold
+         THEN e.images * (CASE WHEN COALESCE(p.px_threshold2, 0) > 0 AND e.out_px > p.px_threshold2
+                               THEN p.per_image_hi2
+                               WHEN p.px_threshold > 0 AND e.out_px > p.px_threshold
                                THEN p.per_image_hi ELSE p.per_image END)
             + e.rows_n * MAX(e.ref_images - p.in_free_count, 0) * p.in_per_image
          ELSE e.in_text_tokens  * p.in_text_per_m  / 1000000.0

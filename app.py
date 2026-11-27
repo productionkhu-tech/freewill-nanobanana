@@ -19,6 +19,7 @@ import time
 import random
 import threading
 import base64
+import collections
 import atexit
 import urllib.request
 import urllib.error
@@ -364,11 +365,18 @@ _SEEDREAM_5_SIZES = {
     "2K": {"1:1": "2048x2048", "4:3": "2368x1776", "3:4": "1776x2368", "16:9": "2816x1584",
            "9:16": "1584x2816", "3:2": "2496x1664", "2:3": "1664x2496", "21:9": "3136x1344"},
 }
-# aspect+resolution -> "WxH" (BytePlus official mapping). 5.5 lists the same levels and ratios as
-# 5.0 pro. Its one-pager says 4K, the API does not: "4K" and anything over 4,624,220 px are
-# refused (2026-11-10, checked without generating).
+# 5.5 4K (2026-11-27, checked without generating - a broken reference makes BytePlus check the size first):
+# 5.5 now takes 921,600..8,294,400 px (3840x2160 = 2880x2880 = the top; 2881x2880 refused). There is no
+# "4K"/"3K" preset ("must be 'WIDTHxHEIGHT' or a supported size preset"), so 4K is sent as these exact
+# pixels - each the largest 16-multiple size of its ratio under the cap. 5.0 pro / flash still stop at
+# 4,624,220. On 11/10 the same probe refused 3840x2160 and 2880x1620 for 5.5.
+_SEEDREAM_55_4K = {"1:1": "2880x2880", "4:3": "3264x2448", "3:4": "2448x3264", "16:9": "3840x2160",
+                   "9:16": "2160x3840", "3:2": "3504x2336", "2:3": "2336x3504", "21:9": "4368x1872"}
+# Levels that are not BytePlus presets: sent as the table's pixels, never as the level name.
+_SEEDREAM_PIXEL_LEVELS = {("seedream-5-5-261028", "4K")}
+# aspect+resolution -> "WxH" (BytePlus official mapping). 5.5 = 5.0 pro's levels and ratios + 4K.
 _SEEDREAM_SIZES = {
-    "seedream-5-5-261028": _SEEDREAM_5_SIZES,
+    "seedream-5-5-261028": dict(_SEEDREAM_5_SIZES, **{"4K": _SEEDREAM_55_4K}),
     "seedream-5-0-pro-260628": _SEEDREAM_5_SIZES,
     "seedream-5-0-flash-260915": _SEEDREAM_5_SIZES,
     "seedream-4-5-251128": {
@@ -384,7 +392,7 @@ _SEEDREAM_SIZES = {
 # custom sizes that BytePlus would actually have accepted (e.g. 4800x960 =
 # 4,608,000 px, valid, was being cut to 4576x912). Do NOT drop the 1.1025.
 _SEEDREAM_CUSTOM = {
-    "seedream-5-5-261028": (921_600, 4_624_220),         # measured: 2160x2160 and 3840x2160 refused
+    "seedream-5-5-261028": (921_600, 8_294_400),         # measured 2026-11-27 (was 4,624,220 on 11/10)
     "seedream-5-0-pro-260628": (921_600, 4_624_220),
     "seedream-5-0-flash-260915": (921_600, 4_624_220),   # same documented bounds as pro
     "seedream-4-5-251128": (3_686_400, 16_777_216),
@@ -474,6 +482,91 @@ def _seedream_endpoint(model):
         # The only id BytePlus documents for 5.5. Same reason as flash for no env override.
         return "dola-seedream-5-5-261028"
     return model
+
+
+# BytePlus image input limits (docs "Image input limitations"): up to 30 MB per image, at most
+# 6000x6000 = 36,000,000 px. 2026-11-26 another PC got 400 "the size of the input image (31.74 MiB)
+# exceeds the limit (30 MiB)": references go as lossless PNG in base64, and a 4K photo is 20+ MB as PNG.
+# Not knowing whether BytePlus counts the file or its base64, the base64 itself stays under the limit.
+SEEDREAM_REF_MAX_B64 = int(30 * 1024 * 1024 * 0.97)
+SEEDREAM_REF_MAX_PX = 6000 * 6000
+# Fitted refs by sha1 of the PNG, newest last. A batch sends the same refs once per picture and its pictures
+# run at once; one picture fits, the others wait for it (review 11/26: 10 at once each re-encoding a 45 MP
+# photo took +4.3 GB). Room for a whole set of refs (Seedream takes up to 14) and a little more.
+_seedream_ref_cache = collections.OrderedDict()
+_SEEDREAM_REF_CACHE_MAX = 16
+_seedream_ref_lock = threading.Lock()      # the cache dict
+_seedream_fit_lock = threading.Lock()      # one big re-encode at a time in the whole app (memory)
+_seedream_fit_runs = 0                     # slow-path count, for the tests
+
+
+def _b64_len(n):
+    return 4 * ((n + 2) // 3)
+
+
+def _seedream_ref_url(png_bytes, log=None):
+    """The data URL for one reference. Within the limits it is the PNG exactly as before; over them the
+    picture is made to fit: too many pixels -> scaled down (PNG when that is enough - lines and text stay
+    clean); still too big -> an opaque picture goes JPEG quality 95 at full size if that fits, a transparent
+    one stays PNG (rule 12); then scaled down step by step until it fits. The colour profile goes along."""
+    global _seedream_fit_runs
+    import hashlib
+    with Image.open(io.BytesIO(png_bytes)) as probe:
+        w, h = probe.size
+    small_file = _b64_len(len(png_bytes)) <= SEEDREAM_REF_MAX_B64
+    if small_file and w * h <= SEEDREAM_REF_MAX_PX:
+        return "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+    key = hashlib.sha1(png_bytes).hexdigest()
+    with _seedream_ref_lock:
+        hit = _seedream_ref_cache.get(key)
+        if hit:
+            _seedream_ref_cache.move_to_end(key)
+            return hit
+    with _seedream_fit_lock:
+        with _seedream_ref_lock:               # fitted by another picture while this one waited
+            hit = _seedream_ref_cache.get(key)
+            if hit:
+                _seedream_ref_cache.move_to_end(key)
+                return hit
+        _seedream_fit_runs += 1
+        src = Image.open(io.BytesIO(png_bytes))
+        icc = src.info.get("icc_profile")
+        im = _to_display_image(src)
+        alpha = im.mode == "RGBA" and im.getchannel("A").getextrema()[0] < 255
+        if not alpha and im.mode != "RGB":
+            im = _to_rgb_flatten(im)
+        if w * h > SEEDREAM_REF_MAX_PX:
+            f = (SEEDREAM_REF_MAX_PX * 0.98 / float(w * h)) ** 0.5
+            im = im.resize((max(15, int(w * f)), max(15, int(h * f))), Image.LANCZOS)
+
+        def encode(pic, as_png):
+            buf = io.BytesIO()
+            extra = {"icc_profile": icc} if icc else {}
+            if as_png:
+                pic.save(buf, format="PNG", **extra)
+            else:
+                pic.save(buf, format="JPEG", quality=95, subsampling=0, **extra)
+            return buf.getvalue()
+
+        as_png = alpha or small_file           # only too many pixels: a smaller PNG is enough
+        data = encode(im, as_png)
+        if as_png and not alpha and _b64_len(len(data)) > SEEDREAM_REF_MAX_B64:
+            as_png = False
+            data = encode(im, False)
+        while _b64_len(len(data)) > SEEDREAM_REF_MAX_B64 and min(im.size) > 64:
+            f = min(0.95, (SEEDREAM_REF_MAX_B64 / float(_b64_len(len(data)))) ** 0.5 * 0.98)
+            im = im.resize((max(15, int(im.width * f)), max(15, int(im.height * f))), Image.LANCZOS)
+            data = encode(im, as_png)
+        fmt = "png" if as_png else "jpeg"
+        url = "data:image/%s;base64,%s" % (fmt, base64.b64encode(data).decode("ascii"))
+        with _seedream_ref_lock:
+            _seedream_ref_cache[key] = url
+            while len(_seedream_ref_cache) > _SEEDREAM_REF_CACHE_MAX:
+                _seedream_ref_cache.popitem(last=False)
+    if log:
+        log("Seedream ref fitted to the 30 MiB limit: %dx%d PNG %.1f MiB -> %dx%d %s %.1f MiB"
+            % (w, h, len(png_bytes) / 2**20, im.width, im.height, fmt.upper(), len(data) / 2**20))
+    return url
 
 
 def _seedream_prompt(prompt):
@@ -2972,7 +3065,13 @@ class AppState:
         # BytePlus-specific params live in extra_body. Watermark OFF, single image.
         extra = {"watermark": False}
         if refs:
-            uris = ["data:image/png;base64," + base64.b64encode(b).decode("ascii") for b in refs]
+            try:
+                uris = [_seedream_ref_url(b, self.log) for b in refs]
+            except Exception as e:   # nothing was sent: a plain failure, not 'may have been billed'
+                self.log(f"{label} reference could not be prepared: {type(e).__name__}: {str(e)[:200]}")
+                return {"status": "failed", "index": idx, "seed": seed, "elapsed": 0.0,
+                        "error": f"Seedream: a reference image could not be prepared "
+                                 f"({type(e).__name__}: {str(e)[:150]}) - nothing was sent"}
             extra["image"] = uris if len(uris) > 1 else uris[0]
         # 4-5 supports batch; force a single image. pro rejects this param -> omit.
         if model == "seedream-4-5-251128":
@@ -5616,9 +5715,29 @@ def _gen_img_cfg(model, aspect, resolution, quality, custom_w, custom_h, bg_tran
             img_cfg = {"size": "%dx%d" % (cw, ch)}
         else:
             level = resolution if resolution in _SEEDREAM_SIZES.get(model, {}) else _seedream_default_resolution(model)
-            img_cfg = {"size": level}
-            if aspect and aspect != "auto":
-                img_cfg["seedream_aspect"] = aspect
+            if (model, level) in _SEEDREAM_PIXEL_LEVELS:
+                # No preset to send: the table's pixels. 'auto' takes the first filled reference's OWN shape,
+                # as large as the model allows (like GPT's auto - review 11/27: snapping to the nearest table
+                # ratio turned a 4:5 photo into 3:4); no reference -> square.
+                tbl = _SEEDREAM_SIZES[model][level]
+                size = tbl.get(aspect)
+                if size is None:
+                    size = tbl["1:1"]
+                    anchor = next((r for r in (ref_snapshots or []) if r is not None), None)
+                    try:
+                        if anchor is not None and anchor.size[0] > 0 and anchor.size[1] > 0:
+                            aw, ah = anchor.size
+                            maxpx = _SEEDREAM_CUSTOM[model][1]
+                            s = math.sqrt(maxpx / float(aw * ah))
+                            cw, ch, _sn = _seedream_custom_size(model, aw * s, ah * s)
+                            size = "%dx%d" % (cw, ch)
+                    except Exception:
+                        size = tbl["1:1"]
+                img_cfg = {"size": size}
+            else:
+                img_cfg = {"size": level}
+                if aspect and aspect != "auto":
+                    img_cfg["seedream_aspect"] = aspect
         _of = _SEEDREAM_OUTPUT_FORMAT.get(model)
         if _of:
             img_cfg["output_format"] = _of
@@ -5729,7 +5848,7 @@ def _agent_settings_problem(model, aspect, resolution, quality):
             return None
         tiers = _SEEDREAM_SIZES.get(model, {})
         if resolution not in tiers:
-            return {"error": "bad_resolution", "allowed": list(tiers)}   # table order: 1K, 1.5K, 2K
+            return {"error": "bad_resolution", "allowed": list(tiers)}   # table order, lowest first
         if aspect != "auto" and aspect not in tiers[resolution]:
             return {"error": "bad_aspect", "allowed": ["auto", "custom"] + sorted(tiers[resolution])}
         return None

@@ -3,7 +3,7 @@
 멀티 프로바이더 AI 이미지 생성 데스크톱 앱 (Flask + pywebview + PyInstaller).
 이 문서 하나로 **구조 · 원리 · 규칙 · 배포 · 관리**를 파악할 수 있게 씁니다. 낡은 내용을 발견하면 즉시 고칠 것.
 
-> 최종 갱신: 2026-11-24 (2402: 개인판 '내 키' 버튼은 열쇠+개수만, 회사별 키 상태는 오른쪽 위 점이 실시간으로 · 업데이트해도 키가 남는 이름들을 시험으로 고정 §2.5. 2401 개인판 — 같은 소스로 회사와 아무 관련 없는 `NanoBanana-Personal.exe` 를 따로 만들어 공개 저장소로 배포 §2.5·규칙 28~31·§4.6·§7, `_MEI` 청소가 쓰는 중인 폴더를 안 건드림. 1901 — 미니창은 본창이 뜬 뒤 앱이 직접 만든다(pywebview 의 10초 제한 피함) §2.4·규칙 26·§7. 1801: 에이전트 프롬프트는 글자만 · PowerShell 객체로 부푼 프로젝트 파일을 열 때 정리 · 큰 파일은 목록에서 훑기만 §2.2·규칙 27·§7. 1702: 미니창에서 같은 일 여러 번 = 한 줄 ×N §2.4. 1701: 본창과 미니창 둘 중 하나만. 1601: 미니창(작업 상태를 화면 구석에, 시댄스 미니창과 자리 나누기) §2.4·규칙 26, DPI 모니터별 v2. 1301: 묶음 id 를 실행 내내 기억해 두 번 생성 막음 · 레퍼런스 읽는 사이 닫힌 탭엔 생성 안 함 §2.2·규칙 25. 1201: Gemini 512 를 문서 값 "512" 로 §6.1. 1001: 시드림 5.5·투명 배경 §6.1, 재시도 판단을 예외 우선으로 §7)
+> 최종 갱신: 2026-11-27 (2701: 시드림 5.5 4K — API 가 8,294,400px 까지 받는다, 비율마다 정확한 픽셀로 §6.1 ·  시드림 레퍼런스가 30 MiB(base64)·3600만 화소를 넘으면 앱이 맞춰 보낸다 — 다른 PC 의 400 'input image 31.74 MiB exceeds 30 MiB' §6.1·§7. 2402: 개인판 '내 키' 버튼은 열쇠+개수만, 회사별 키 상태는 오른쪽 위 점이 실시간으로 · 업데이트해도 키가 남는 이름들을 시험으로 고정 §2.5. 2401 개인판 — 같은 소스로 회사와 아무 관련 없는 `NanoBanana-Personal.exe` 를 따로 만들어 공개 저장소로 배포 §2.5·규칙 28~31·§4.6·§7, `_MEI` 청소가 쓰는 중인 폴더를 안 건드림. 1901 — 미니창은 본창이 뜬 뒤 앱이 직접 만든다(pywebview 의 10초 제한 피함) §2.4·규칙 26·§7. 1801: 에이전트 프롬프트는 글자만 · PowerShell 객체로 부푼 프로젝트 파일을 열 때 정리 · 큰 파일은 목록에서 훑기만 §2.2·규칙 27·§7. 1702: 미니창에서 같은 일 여러 번 = 한 줄 ×N §2.4. 1701: 본창과 미니창 둘 중 하나만. 1601: 미니창(작업 상태를 화면 구석에, 시댄스 미니창과 자리 나누기) §2.4·규칙 26, DPI 모니터별 v2. 1301: 묶음 id 를 실행 내내 기억해 두 번 생성 막음 · 레퍼런스 읽는 사이 닫힌 탭엔 생성 안 함 §2.2·규칙 25. 1201: Gemini 512 를 문서 값 "512" 로 §6.1. 1001: 시드림 5.5·투명 배경 §6.1, 재시도 판단을 예외 우선으로 §7)
 
 ---
 
@@ -151,7 +151,7 @@ NanoBanana.exe 실행
 | `POST /api/stop {pid}` | 그 탭만 멈춤 |
 | `POST /api/projects/new {title, activate:false}` | 화면을 안 바꾸고 새 탭 (사람이 시켰을 때만). false·0·"false"·"0"·"no"·"off" 다 "안 바꿈" |
 
-- **에이전트 요청에는 앱 설정이 섞이지 않는다** (2026-11-05 사용자 결정 — "MCP 가 medium 에 갇히면 위험"). 탭의 입력값도, 모델 설정의 시작값·스위치도 읽지 않는다. 보낸 값만 쓰고, 빠진 값은 그 모델의 기본: `quality` 맨 위(2.5·2.6 `max`, gpt-image-2 `high`), `resolution` 맨 위, `aspect` `auto`(GPT 는 레퍼런스가 없으면 `1:1` — auto 는 크기를 OpenAI 에 맡겨 해상도가 버려진다), `count` 1, `complexity` `high`, `output_format` `png`, 투명 끔, GIF `512x512`·9·200. `model` 을 비우면 `unknown_model`, Custom 인데 크기를 비우면 `bad_custom_w`. 탭에서 오는 건 과금·저장 폴더·파일 이름·갤러리뿐
+- **에이전트 요청에는 앱 설정이 섞이지 않는다** (2026-11-05 사용자 결정 — "MCP 가 medium 에 갇히면 위험"). 탭의 입력값도, 모델 설정의 시작값·스위치도 읽지 않는다. 보낸 값만 쓰고, 빠진 값은 그 모델의 기본: `quality` 맨 위(2.5·2.6 `max`, gpt-image-2 `high`), `resolution` 맨 위(시드림 5.5 는 2701~ `4K`), `aspect` `auto`(GPT 는 레퍼런스가 없으면 `1:1` — auto 는 크기를 OpenAI 에 맡겨 해상도가 버려진다. 시드림 5.5 4K 도 레퍼런스가 없으면 2880² 정사각 — 4K 엔 모델이 모양을 고르는 이름이 없다. 모양이 있는 프롬프트면 `aspect` 를 보낼 것), `count` 1, `complexity` `high`, `output_format` `png`, 투명 끔, GIF `512x512`·9·200. `model` 을 비우면 `unknown_model`, Custom 인데 크기를 비우면 `bad_custom_w`. 탭에서 오는 건 과금·저장 폴더·파일 이름·갤러리뿐
 - **에이전트가 보낸 값**이 안 맞으면
   고치지 않고 거절: `bad_aspect|bad_resolution|bad_quality|bad_complexity|bad_output_format|bad_gif_size|bad_gif_frames|bad_gif_frame_ms|bad_count|bad_custom_w|bad_custom_h|bad_openai_bg_transparent`
   + `field` + `allowed`. 숫자 칸도 같다(`count` 50 이 10 으로, `"abc"` 가 탭 값으로 바뀌던 것을 2026-11-05 에 막음). 투명 배경을 켜라고 보냈는데 그 모델에 없으면 거절, `"false"`·`"0"` 은 끄기. 화면 메뉴가 막는 값과 같은 기준 (`_agent_settings_problem`). 예전 경로는 모르는 비율을 조용히 빼고 갤러리엔 요청한 비율을 적었다.
@@ -483,7 +483,7 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
 | Google Vertex | gemini-3-pro-image 등 | `VERTEX_SA` (서비스계정 JSON → 앱엔 1시간 토큰만) | `GOOGLE_APPLICATION_CREDENTIALS` + `NANOBANANA_PROJECT_ID` |
 | Google AI Studio | 동일 모델군 | `STUDIO_KEY` | `NANOBANANA_STUDIO_KEY` |
 | OpenAI | gpt-image-2 · gpt-image-2.5-sunburst / -flare · gpt-image-2.6-sunburst / -flare | `OPENAI_KEY` | `OPENAI_API_KEY` |
-| BytePlus | seedream-5-5 / 5-0-pro / 5-0-flash / 4-5 | `ARK_KEY` | `ARK_API_KEY` |
+| BytePlus | seedream-5-5(4K) / 5-0-pro / 5-0-flash / 4-5 | `ARK_KEY` | `ARK_API_KEY` |
 
 - **키 교체(로테이션)**: 콘솔에서 새 키 발급 → `printf '%s' "$NEW" | env -u CLOUDFLARE_API_TOKEN npx wrangler secret put STUDIO_KEY`
   (값이 화면·히스토리에 남지 않게 stdin 으로. 클라우드플레어 대시보드 "변수 및 비밀" 에서 바꿔도 같다) →
@@ -553,9 +553,13 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   BytePlus 는 모델마다 콘솔에서 "활성화"가 필요할 수 있다 — 새 모델은 일부러 틀린 size 로 한 번 보내 보면
   400(크기 오류)=쓸 수 있음 / 404=없음·권한 없음을 **과금 없이** 가를 수 있다
 - **Seedream 5.5** (앱 반영 2026-11-10, 얼리 액세스 문서 2026-11-07 기준): 앱 id `seedream-5-5-261028`, **보내는 id `dola-seedream-5-5-261028`**, 메뉴 `seedream-5-5`(★).
-  크기·비율·레퍼런스 10장은 5.0 Pro 와 같다(`_SEEDREAM_5_SIZES`, 직접 크기 921,600~4,624,220px). **4K 는 안 된다** — 소개 문서(11/10)는 "직접 크기 최대 8.29MP, 3840×2160" 이라 하지만 API 는
-  `"4K"`·3840×2160·2880×1620·2160² 를 "image area must be at most 4624220 pixels" 로 거절한다(2026-11-10 두 번, 생성 없이 확인: 깨진 레퍼런스를 넣으면 크기 검사가 먼저 돌아 과금 없이 가를 수 있다. `background`·`optimize_prompt_options` 는 크기보다 먼저 검사된다).
-  열리면 `_SEEDREAM_CUSTOM`·`_SEEDREAM_CUSTOM_JS`·크기표를 같이 올릴 것 — 같은 탐침(`2880x1620`·`3840x2160`)으로 먼저 확인.
+  비율·레퍼런스 10장은 5.0 Pro 와 같다. **4K (v2026-11-2701~)**: 11/10 엔 API 가 `"4K"`·3840×2160·2880×1620 을 "image area must be at most 4624220 pixels" 로 거절했는데,
+  **2026-11-27 다시 재 보니 5.5 만 921,600~8,294,400px**(3840×2160 = 2880² 이 끝, 2881×2880 거절. 5.0 Pro·Flash 는 그대로 4,624,220). 탐침은 생성 없이 — 깨진 레퍼런스를 넣으면 크기 검사가 먼저 돈다
+  (`background`·`optimize_prompt_options` 는 크기보다 먼저 검사된다). **"4K"·"3K" 이름은 없다**("must be 'WIDTHxHEIGHT' or a supported size preset") → 4K 는 비율마다 정확한 픽셀로 보낸다:
+  `_SEEDREAM_55_4K`(한도 아래 가장 큰 16의 배수 — 16:9 3840×2160, 1:1 2880², 4:3 3264×2448, 3:2 3504×2336, 21:9 4368×1872), `_SEEDREAM_PIXEL_LEVELS` 가 '이름 아닌 픽셀로 보낼 등급' 을 정한다.
+  이때는 프롬프트에 비율 문장을 붙이지 않는다. 비율 '자동' + 4K 는 첫 레퍼런스의 원래 비율 그대로 한도까지 크게(4:5 사진 → 2576×3216, 독립 검토 11/27: 표의 가까운 비율로 자르면 4:5 가 3:4 가 됐다), 레퍼런스가 없으면 1:1 2880² — GPT 의 자동과 같은 방식. 직접 크기 상한도 8,294,400(`_SEEDREAM_CUSTOM`·`_SEEDREAM_CUSTOM_JS`).
+  메뉴 1K/1.5K/2K/4K, 시작은 맨 위 4K(모델 설정의 시작 화질), 에이전트가 해상도를 비우면 4K. 공식 튜토리얼은 아직 1K/1.5K/2K 만 적고 'superseded 8,294,400' 이란 말도 돈다(ComfyUI PR) — 계정에 따라 다를 수 있다.
+  **4K 로 실제 그려 본 확인과 4K 단가는 아직 없다**(생성 시험이 권한에서 막힘, 11/27). 단가가 2K 와 다르면 D1 `prices` 의 5.5 행을 고칠 것
   프롬프트 최적화는 `standard` 만(`fast` 는 400). **투명 배경**: `background` auto(기본)|transparent|opaque, 프롬프트만·레퍼런스 모두 된다(5.0 Pro 는 알파 PNG 1장 편집만이라 안 씀).
   앱은 GPT 의 "투명 배경" 칸(`openai_bg_transparent`, 이름은 그대로)을 같이 쓴다 — 켜면 `transparent`, 끄면 `auto` 를 **명시**해서 보낸다(모델이 프롬프트로 정한다).
   다른 시드림 모델엔 `background` 를 절대 안 보낸다(`SEEDREAM_ALPHA_MODEL_IDS`, 칸이 듣는 모델 전체는 `BG_TRANSPARENT_MODEL_IDS`). 응답의 `data[].background` 를 `background_returned` 로 남겨,
@@ -576,6 +580,13 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   (`_gemini_size_token` → `_gemini_wire_size`). 옛 `"0.5K"` 와 에이전트가 보낸 `"512"` 는 같은 단계로 읽는다. API 는 별칭도 받는다 —
   오류 메시지가 허용값을 "1K, 2K, 4K, 512, 512P, 512PX" 로 밝힌다(2026-11-12, `candidateCount: 2` 를 섞어 생성 없이 확인. 깨진 이미지는 크기보다 먼저 검사돼 이 용도로 못 쓴다)
 - **Gemini 는 앱 순서상 AI Studio 가 먼저**, 실패 시 Vertex (`get_available_providers` = studio, vertex)
+- **시드림 레퍼런스 크기** (v2026-11-2701~, `_seedream_ref_url`): BytePlus 한도는 이미지 한 장에 30 MB · 6000×6000=3600만 화소(가로×세로 곱).
+  레퍼런스는 무손실 PNG 로 다시 만들어 base64 로 보내므로 4K 이상 사진은 PNG 20MB+ · base64 30MB+ 가 되어 요청 전체가 400 이었다(2026-11-26 다른 PC:
+  "the size of the input image (31.74 MiB) exceeds the limit (30 MiB)", 거절이라 청구 없음). 파일과 base64 중 어느 쪽을 재는지 몰라 **base64 를 한도의 97% 안으로** 맞춘다.
+  한도 안이면 예전과 한 바이트도 다르지 않게 PNG. 넘으면: 화소만 넘침 → 줄인 PNG(선·글자 깨끗하게) / 크기 넘침 → 불투명은 JPEG 95(4:4:4, 원래 크기로 되면 원래 크기) ·
+  투명은 PNG 그대로(규칙 12) → 그래도 크면 단계적으로 줄임. 색 프로파일(ICC)은 같이 간다. 묶음의 여러 장이 동시에 돌아도 한 번만 맞춘다(앱 전체 잠금 하나 + 최근 16개 기억 —
+  독립 검토 11/26: 45MP 사진 10장 동시 재인코딩 +4.3GB). 맞추다 실패하면 '아무것도 안 보냄' 으로 실패(값이 나갔을 수 있음 아님). 바꾸면 로그에 'Seedream ref fitted …' 한 줄.
+  **OpenAI 편집·제미나이 레퍼런스도 같은 종류의 검사가 없다**(무손실 PNG 그대로, OpenAI 는 파일당 50MB, 제미나이는 요청 전체 한도) — 아직 안 고침
 
 ### 6.1.1 사용량 기록 = 회사가 청구하는 그대로 (v2026-10-0701~)
 - 앱 `_extract_usage` 가 응답의 사용량을 모달리티별로 옮긴다: 입력 텍스트/이미지, 출력 **이미지**
@@ -653,6 +664,7 @@ GitHub은 릴리스를 만드는 **즉시** `/releases/latest`에 새 태그를 
   같은 파일을 둘이 동시에 열면(켤 때 복원 + 목록에서 열기) 파일마다 잠금으로 한 번만 정리. 이런 글이 없는 큰 파일은 바이트 검색만 하고 아무것도 쓰지 않는다. `Write-Output -NoEnumerate` 꼴(`{'value': [..], 'Count': N}`)도 정리한다.
   남은 한계: 창의 고정 프롬프트 뒤에 붙은 경우(에이전트 그림을 Load setup 한 뒤 창에서 생성)처럼 글 일부만 그런 경우는 안 고친다(드묾, 그 칸의 prompt_sections 는 고쳐진다). 목록은 32MB 넘는 파일을 읽지 않고 훑는다(`_skim_project_file`: 앞 4MB 의 프롬프트·새 그림, 그림 수는 줄 세기, 크기·시각으로 기억). 정상 그림은 한 장 6~11KB(프롬프트 세 벌) — 8,414장이면 90MB 가 정상이다 |
 | `/api/batch` 가 `no_such_batch` | 안 들어갔거나 거절됨, 앱 재시작(집계는 메모리), 또는 그 탭의 최근 50개 밖 | 갤러리 `?batch_id=` 로 찾기. 앱이 그대로면 같은 호출자 id 로 다시 보내도 두 번 안 만든다(1301~ 그림이 지워졌거나 탭이 닫혀도 — `batch_id_run`. 그 전 앱은 50개 밖 + 그림 없음이면 새로 만들었다). 재시작 뒤 그림이 없으면 새로 만들고, 돌던 장은 값이 나갔을 수 있다 — 사람에게 물을 것 (§2.2) |
+| 시드림이 400 `InvalidParameter` 'the size of the input image (31.74 MiB) exceeds the limit (30 MiB)' (2026-11-26 다른 PC, 큰 레퍼런스) | 레퍼런스를 무손실 PNG + base64 로 보내 4K 이상 사진은 30MB 를 넘었다 | v2026-11-2701: `_seedream_ref_url` 이 한도 안으로 맞춰 보낸다(§6.1). 옛 버전에선 레퍼런스를 작게 저장해 넣으면 된다 |
 | 회사판이 켜자마자 조용히 꺼짐 (창이 안 뜸, 2026-11-23 개발 PC) | 5656 이 윈도우 예약 포트 범위 안 — 동적 포트 범위가 1024~ 로 넓혀진 PC 에서 Hyper-V/WSL 이 켤 때 100개씩 예약한다(`netsh int ipv4 show excludedportrange protocol=tcp`). `is_port_in_use` 가 바인드 실패(10013)를 "이미 켜져 있음" 으로 읽고 끝낸다 | 관리자 PowerShell 에서 `net stop winnat` → `net start winnat`, 또는 재부팅. 앱에서는 아직 안 고침(포트를 바꾸면 커넥터가 따라와야 한다) |
 | 회사판과 개인판(또는 두 버전)을 같이 켜면 먼저 켠 쪽 뷰어·미니창이 빈 화면 (11/23 이전 빌드) | 나중에 켠 쪽의 시작 `_MEI` 청소가 남의 폴더를 rmtree — 잠긴 DLL 만 남고 templates/static 이 지워짐 | 2026-11-24 빌드부터 이름 바꾸기로 먼저 확인(규칙 31). 옛 회사판이 개인판 폴더를 지울 수 있으니 회사판도 같이 업데이트 |
 

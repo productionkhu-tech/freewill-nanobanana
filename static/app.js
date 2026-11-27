@@ -1248,16 +1248,17 @@ const MODEL_SPECS = {
     refLimit: 14,
     refHint: "3rd-gen models support up to 14 reference images.",
   },
-  // 5.5 (early access, 2026-11): 5.0 Pro's sizes and limits, plus a transparent background on
-  // text-to-image and with references. Its one-pager mentions 4K; the API refuses it.
+  // 5.5 (early access, 2026-11): 5.0 Pro's sizes plus a transparent background on text-to-image and
+  // with references. 4K since 2026-11-27 (API up to 8,294,400 px = 3840x2160; sent as exact pixels,
+  // there is no "4K" preset - server _SEEDREAM_55_4K). Starts at 4K, the top.
   "seedream-5-5-261028": {
     aspects: ["auto","1:1","4:3","3:4","16:9","9:16","3:2","2:3","21:9","custom"],
-    resolutions: ["1K","1.5K","2K"],
+    resolutions: ["1K","1.5K","2K","4K"],
     counts: ["1","2","3","4","5","6","7","8","9","10"],
     showQuality: false,
     showBackground: true,
-    defaultAspect: "16:9", defaultResolution: "2K",
-    hint: "BytePlus Seedream 5.5 - more realistic, steadier edits. 1K/1.5K/2K, png. Can return a transparent background.",
+    defaultAspect: "16:9", defaultResolution: "4K",
+    hint: "BytePlus Seedream 5.5 - more realistic, steadier edits. 1K/1.5K/2K/4K (4K = 3840x2160 at 16:9), png. Can return a transparent background.",
     refLimit: 10,
     refHint: "Up to 10 reference images. Mention them as 'image 1', 'image 2' in the prompt.",
   },
@@ -2134,7 +2135,7 @@ function _fmtPx(n){ return (n/1e6).toFixed(2) + "M px"; }
 // match app.py _SEEDREAM_CUSTOM so the live preview and "최대 화질" button agree
 // with the server's re-correction.
 const _SEEDREAM_CUSTOM_JS = {
-  "seedream-5-5-261028":       [921600, 4624220],
+  "seedream-5-5-261028":       [921600, 8294400],   // 2026-11-27 (was 4624220)
   "seedream-5-0-pro-260628":   [921600, 4624220],
   "seedream-5-0-flash-260915": [921600, 4624220],
   "seedream-4-5-251128":       [3686400, 16777216],
